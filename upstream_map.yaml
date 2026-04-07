@@ -1,9 +1,9 @@
 upstream_map:
   - source: csrc/quantization/marlin/**
-    target: /root/vllm-0.17.1/csrc/quantization/marlin/**
+    target: csrc/quantization/marlin/**
   - source: csrc/moe/marlin_moe_wna16/**
-    target: /root/vllm-0.17.1/csrc/moe/marlin_moe_wna16/**
+    target: csrc/moe/marlin_moe_wna16/**
   - source: csrc/torch_bindings_marlin.cpp
-    target: /root/vllm-0.17.1/csrc/torch_bindings_marlin.cpp
+    target: csrc/torch_bindings_marlin.cpp
   - source: csrc/moe/torch_bindings_marlin.cpp
-    target: /root/vllm-0.17.1/csrc/moe/torch_bindings_marlin.cpp
+    target: csrc/moe/torch_bindings_marlin.cpp

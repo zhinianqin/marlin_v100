@@ -5,6 +5,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from marlin_v100 import ops
+from tests.helpers import (
+    marlin_make_empty_g_idx,
+    marlin_make_workspace_new,
+    marlin_quantize,
+    scalar_types,
+)
 
 
 def _require_marlin_cuda() -> None:
@@ -48,21 +54,12 @@ def test_marlin_int4_fp8_preprocess_without_zp():
     assert torch.equal(cuda_res, torch_res)
 
 
-def test_marlin_dense_smoke_with_repo_helpers():
+def test_marlin_dense_smoke_local_helpers():
     _require_marlin_cuda()
-    vllm = pytest.importorskip("vllm")
-    _ = vllm
-    scalar_types = pytest.importorskip("vllm.scalar_type").scalar_types
-    marlin_utils = pytest.importorskip(
-        "vllm.model_executor.layers.quantization.utils.marlin_utils"
-    )
-    marlin_utils_test = pytest.importorskip(
-        "vllm.model_executor.layers.quantization.utils.marlin_utils_test"
-    )
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    w_ref, q_w, scales, g_idx, sort_indices, _ = marlin_utils_test.marlin_quantize(
+    _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
         w, scalar_types.uint4b8, 128, False
     )
     output = ops.marlin_gemm(
@@ -73,10 +70,10 @@ def test_marlin_dense_smoke_with_repo_helpers():
         scales,
         None,
         None,
-        marlin_utils.marlin_make_empty_g_idx(a.device),
+        marlin_make_empty_g_idx(a.device),
         g_idx,
         sort_indices,
-        marlin_utils.marlin_make_workspace_new(a.device),
+        marlin_make_workspace_new(a.device),
         scalar_types.uint4b8.id,
         a.shape[0],
         w.shape[1],

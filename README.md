@@ -2,9 +2,11 @@
 
 ## 项目简介
 
-`marlin_v100` 是从 vLLM 主树中抽出的最小 Marlin 开发工作区，用于独立开发和验证 Marlin dense 与 Marlin MoE 两部分能力。
+`marlin_v100` 是从 `vllm-0.17.1` 主树中抽出的最小 Marlin 开发工作区，用于独立开发和验证 Marlin dense 与 Marlin MoE 两部分能力。
 
 这个目录的目标不是复制完整的 vLLM，而是保留 Marlin 相关 CUDA 源码、最小 Python 薄封装、最小测试集合，以及与主树同步所需的映射信息，方便在一个更小的工作区里迭代。
+
+当前项目按“仓库外可用”维护：将 `marlin_v100/` 单独 clone 到父级 vLLM 仓库之外后，仍应可以独立完成构建、扩展导入和测试收集。
 
 当前包名为 `marlin_v100`，构建产物为：
 
@@ -23,8 +25,12 @@
   本地扩展构建入口，调用 CMake + Ninja 完成构建。
 - `CMakeLists.txt`
   最小 CUDA/CMake 构建定义。
+- `cmake/`
+  本地 CMake 辅助宏，不依赖父级 vLLM 仓库。
 - `upstream_map.yaml`
   回写主树时使用的文件映射。
+- `pytest.ini`
+  本地 pytest 配置，确保仓库外运行时 rootdir 指向当前项目。
 
 ## 环境与依赖
 
@@ -100,29 +106,42 @@ PY
 推荐优先执行轻量测试与测试收集检查：
 
 ```bash
-PYTHONPATH=$PWD/python ./.venv/bin/pytest tests/test_marlin_generators.py -q
 PYTHONPATH=$PWD/python ./.venv/bin/pytest --collect-only tests
 
 # 或者使用模块方式
-PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest tests/test_marlin_generators.py -q
 PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 ```
 
-如果只是确认当前机器上的构建链是否完整，到这里通常就足够了。
+如果你处在当前这台 V100 / SM70 机器上，默认验收重点应是：
+
+- `build_ext --inplace` 成功
+- `import marlin_v100`、`import marlin_v100._C`、`import marlin_v100._moe_C` 成功
+- `pytest --collect-only tests` 成功
+- `test_marlin_moe.py` 的逻辑结构和依赖边界清晰，便于后续继续 debug
+
+后续在支持 Marlin 的 SM75 或 SM80+ 机器上，再补下面两类运行验收：
+
+- `tests/test_marlin_generators.py`
+- `tests/test_marlin_dense.py`
+- `tests/test_marlin_moe.py`
 
 ## 当前限制
 
-当前机器是 V100 / SM70，只适合作为构建链和生成脚本验证环境，不适合作为 Marlin 内核运行验收环境。
+当前机器是 V100 / SM70，只适合作为构建链、导入链和测试收集验证环境，不适合作为 Marlin 内核运行验收环境。
 
 这意味着：
 
-- 可以验证目录结构、构建脚本、源码生成、扩展落位、导入与测试收集
+- 可以验证目录结构、构建脚本、扩展落位、导入与测试收集
+- `test_marlin_generators.py` 当前阶段不作为这台机器上的默认通过标准
+- `test_marlin_moe.py` 当前阶段先做逻辑审查与可收集性整理，不把本机运行结果作为最终通过标准
 - 不应把 dense / moe 的数值运行结果作为当前机器上的最终通过标准
 - 真正的 Marlin 运行验证应放到 SM75 或 SM80+ 的机器执行
 
 ## 与主树同步方式
 
 `marlin_v100` 是本地独立开发工作区，不等于主树上游包结构。
+
+当前默认对齐的上游代码基线为 `vllm-0.17.1`，回写和对比时应按这一版本的目录结构理解映射关系。
 
 回写主树时应以 `upstream_map.yaml` 为准，只同步映射中明确列出的上游源码文件。下面这些内容默认不回写主树：
 
@@ -133,12 +152,14 @@ PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 
 回写前建议先做一次 dry-run diff，确认仅覆盖映射内文件。
 
+`upstream_map.yaml` 中的目标路径使用相对描述，表示“相对于上游 vLLM 仓库根目录”的目标位置，而不是某台机器上的绝对路径。
+
 ## Git 初始化建议
 
 本目录设计为可独立纳入 git 管理。推荐初始化步骤：
 
 ```bash
-cd /root/vllm-0.17.1/marlin_v100
+cd marlin_v100
 git init
 git add .
 git status --short

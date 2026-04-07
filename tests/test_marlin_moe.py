@@ -72,6 +72,8 @@ def test_grouped_topk_shapes():
 
 def test_fused_marlin_moe_smoke():
     _require_moe_cuda()
+    # This is a collectable smoke shape check only. Current SM70 machines are
+    # not considered a valid runtime acceptance environment for Marlin MoE.
 
     quant_type_id = 1
     hidden_states = torch.randn((4, 128), device="cuda", dtype=torch.float16)

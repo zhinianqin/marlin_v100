@@ -5,7 +5,7 @@ project(marlin_v100_extensions LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/utils.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
 set(PYTHON_SUPPORTED_VERSIONS "3.10" "3.11" "3.12" "3.13")
 

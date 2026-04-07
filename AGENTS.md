@@ -11,6 +11,8 @@
 
 在这里工作的主要目标是提升 Marlin 重构效率，而不是复制完整的 vLLM 主树能力。
 
+当前项目应保持“仓库外可用”状态：即使脱离父级 vLLM 目录单独存在，也应该能独立构建、独立导入扩展、独立执行 pytest 收集。
+
 ## 目录职责
 
 - `csrc/`
@@ -21,6 +23,8 @@
   放置本地独立测试，不默认回写主树。
 - `upstream_map.yaml`
   放置主树回写映射，是回写时的唯一依据。
+- `cmake/`
+  放置本地最小 CMake 宏，不应重新依赖父级仓库的 `cmake/utils.cmake`。
 - `README.md`、`AGENTS.md`
   放置本地工作区文档，不回写主树。
 
@@ -31,6 +35,7 @@
 - Python 相关命令统一带上：
   `PYTHONPATH=$PWD/python`
 - 不要把本地工作区名 `marlin_v100` 传播到主树的上游 Python 包结构中
+- 不要重新引入对父级 vLLM 仓库路径、pytest 配置或 Python helper 的硬依赖
 - 不要把 `.venv/`、`build/`、`*.so`、`__pycache__/` 纳入版本管理
 - 修改上游可回写源码时，要同步检查 `upstream_map.yaml` 是否仍然准确
 
@@ -66,11 +71,9 @@ PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 推荐轻量验证命令：
 
 ```bash
-PYTHONPATH=$PWD/python ./.venv/bin/pytest tests/test_marlin_generators.py -q
 PYTHONPATH=$PWD/python ./.venv/bin/pytest --collect-only tests
 
 # 或者使用模块方式
-PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest tests/test_marlin_generators.py -q
 PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 ```
 
@@ -85,6 +88,13 @@ PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 - `python/marlin_v100/_C.abi3.so` 是否存在
 - `python/marlin_v100/_moe_C.abi3.so` 是否存在
 - `import marlin_v100`、`import marlin_v100._C`、`import marlin_v100._moe_C` 是否成功
+
+当前阶段的验收分层如下：
+
+- 当前 SM70 机器：
+  只看构建、导入、`pytest --collect-only` 与测试逻辑审查
+- 支持 Marlin 的 SM75 或 SM80+ 机器：
+  再执行 `test_marlin_generators.py`、`test_marlin_dense.py`、`test_marlin_moe.py` 的运行验证
 
 ## 回写主树约定
 
@@ -103,10 +113,13 @@ PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 - 改动确实发生在需要回写的源码范围内
 - 本地工作区专用命名没有误带入主树无关位置
 - 回写 diff 仅覆盖映射文件
+- `upstream_map.yaml` 中的目标路径按“相对于上游仓库根目录”理解，不绑定某台开发机的绝对路径
 
 ## 禁止事项
 
 - 不要把 `.venv/`、`build/`、扩展 `.so` 文件提交到 git
 - 不要在当前 SM70 机器上把 Marlin 运行结果当成最终数值验收
+- 不要把 `test_marlin_generators.py` 当成当前机器的硬性通过标准
+- 不要把 `test_marlin_moe.py` 当前阶段的本机运行结果当成最终验收
 - 不要绕过 `upstream_map.yaml` 直接大范围覆盖主树
 - 不要把本地文档、测试、辅助封装当作上游源码一并回写
