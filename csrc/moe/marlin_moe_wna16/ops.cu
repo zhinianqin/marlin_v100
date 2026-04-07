@@ -435,23 +435,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
-              "marlin kernel only support Turing or newer GPUs.");
-  int stages = 4;
-  if (major_capability == 7 && minor_capability == 5) {
-    stages = 2;
-    TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
-                "Turing only support FP16 or INT8 activation.");
-  }
-  if (a_type == vllm::kFE4M3fn) {
-    TORCH_CHECK(major_capability * 10 + minor_capability >= 89,
-                "FP8 only support Ada Lovelace or newer GPUs.");
-    TORCH_CHECK(
-        major_capability * 10 + minor_capability == 89 ||
-            major_capability * 10 + minor_capability == 120,
-        "Marlin W4A8-FP8 only support SM89 or SM120 device (It is slower than "
-        "Marlin W4A16 on other devices).");
-  }
+  TORCH_CHECK(major_capability == 7 && minor_capability == 5,
+              "marlin moe SM75 build only supports SM75 GPUs.");
+  int stages = 2;
 
   // Set thread config
   exec_config_t exec_cfg;
@@ -606,6 +592,17 @@ torch::Tensor moe_wna16_marlin_gemm(
   vllm::ScalarType c_type = vllm::ScalarType::from_id(c_type_id);
   vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
 
+  TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
+              "SM75 build only supports float16 or int8 activations.");
+  TORCH_CHECK(c_type == vllm::kFloat16,
+              "SM75 build only supports float16 outputs.");
+  TORCH_CHECK(s_type == vllm::kFloat16,
+              "SM75 build only supports float16 scales.");
+  TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
+                  b_type == vllm::kU8B128,
+              "SM75 build only supports uint4, uint4b8, or uint8b128 weights.");
+  TORCH_CHECK(!is_zp_float, "SM75 build does not support float zero-points.");
+
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
 
@@ -756,12 +753,9 @@ torch::Tensor moe_wna16_marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
-                "global_scale can only be used for nvfp4 format.");
+    TORCH_CHECK(false, "SM75 build does not support nvfp4 global_scale.");
   } else {
     global_scale = torch::empty({0}, options);
-    TORCH_CHECK(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
-                "the global_scale parameter must be passed for nvfp4 format.");
   }
 
   bool has_bias = b_bias_or_none.has_value();
@@ -786,22 +780,13 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
-    TORCH_CHECK(
-        b_type == vllm::kU4 || b_type == vllm::kU8,
-        "b_type must be u4 or u8 when has_zp = True. Got = ", b_type.str());
-  } else {
-    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128 ||
-                    b_type == vllm::kS4 || b_type == vllm::kS8 ||
-                    b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
-                "b_type must be uint4b8, uint8b128, int4, int8, "
-                "float8_e4m3fn or float4_e2m1f when has_zp = False. Got = ",
+    TORCH_CHECK(b_type == vllm::kU4,
+                "SM75 build only supports uint4 weights when zero-points are enabled. Got = ",
                 b_type.str());
-  }
-
-  if (has_zp && is_zp_float) {
-    TORCH_CHECK(a.scalar_type() == at::ScalarType::Half,
-                "Computation type must be float16 (half) when using float zero "
-                "points.");
+  } else {
+    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
+                "SM75 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
+                b_type.str());
   }
 
   // Verify b_zeros

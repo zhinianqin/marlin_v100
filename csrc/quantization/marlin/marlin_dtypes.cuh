@@ -69,29 +69,6 @@ class MarlinScalarType<vllm::kBFloat16.id()> {
   using FragS = Vec<nv_bfloat162, 1>;
   using FragS0 = Vec<__nv_fp8x2_e4m3, 1>;
   using FragZP = Vec<nv_bfloat162, 4>;
-
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-  static __device__ float inline num2float(const nv_bfloat16 x) {
-    return __bfloat162float(x);
-  }
-
-  static __device__ nv_bfloat162 inline num2num2(const nv_bfloat16 x) {
-    return __bfloat162bfloat162(x);
-  }
-
-  static __device__ nv_bfloat162 inline nums2num2(const nv_bfloat16 x1,
-                                                  const nv_bfloat16 x2) {
-    return __halves2bfloat162(x1, x2);
-  }
-
-  static __host__ __device__ nv_bfloat16 inline float2num(const float x) {
-    return __float2bfloat16(x);
-  }
-
-  static __host__ __device__ float2 inline num22float2(const nv_bfloat162 x) {
-    return __bfloat1622float2(x);
-  }
-#endif
 };
 
 template <>

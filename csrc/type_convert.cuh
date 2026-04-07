@@ -67,9 +67,7 @@ struct _typeConvert<c10::Half> {
   }
 };
 
-  #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800) || defined(USE_ROCM)
-// CUDA_ARCH < 800 does not have BF16 support
-// ROCm 7.0+ supports bfloat16
+  #if defined(USE_ROCM)
 template <>
 struct _typeConvert<c10::BFloat16> {
   static constexpr bool exists = true;
@@ -89,8 +87,7 @@ struct _typeConvert<c10::BFloat16> {
     return __float22bfloat162_rn(x);
   }
 };
-  #endif  // (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800) ||
-          // defined(USE_ROCM)
+  #endif
 #endif    // defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >=
           // 12000))
 

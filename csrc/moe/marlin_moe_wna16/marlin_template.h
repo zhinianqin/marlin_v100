@@ -293,25 +293,14 @@ __global__ void Marlin(
   // configurations, while requiring as few slow global cross-threadblock
   // reductions as possible.
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
-  // FP8 computation is only supported for Ada Lovelace or newer architectures.
-  if constexpr (a_type_id == vllm::kFE4M3fn.id()) return;
-  #endif
-
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   // Turing TensorCore only supports fp16 and int8
   if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
     return;
-  #endif
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   constexpr bool use_fp16_accum = a_type_id == vllm::kFloat16.id();
-  #else
-  constexpr bool use_fp16_accum = false;
-  #endif
   using Adtype = MarlinScalarType<a_type_id>;
   using Cdtype = MarlinScalarType<c_type_id>;
 

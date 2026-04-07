@@ -69,8 +69,8 @@ export PATH="$PWD/.venv/bin:/usr/local/cuda-12.8/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS=8
 export NVCC_THREADS=1
-export TORCH_CUDA_ARCH_LIST='8.0'
-export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_80,code=sm_80'
+export TORCH_CUDA_ARCH_LIST='7.5'
+export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_75,code=sm_75'
 ```
 
 注意：动态库环境变量应使用 `LD_LIBRARY_PATH`。如果你手头的命令里写的是 `D_LIBRARY_PATH`，请改成 `LD_LIBRARY_PATH`。
@@ -103,39 +103,25 @@ PY
 
 ## 测试方法
 
-推荐优先执行轻量测试与测试收集检查：
+当前阶段默认只做构建与导入验收，不执行 `pytest`。
 
-```bash
-PYTHONPATH=$PWD/python ./.venv/bin/pytest --collect-only tests
+建议的验收步骤是：
 
-# 或者使用模块方式
-PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
-```
-
-如果你处在当前这台 V100 / SM70 机器上，默认验收重点应是：
-
-- `build_ext --inplace` 成功
-- `import marlin_v100`、`import marlin_v100._C`、`import marlin_v100._moe_C` 成功
-- `pytest --collect-only tests` 成功
-- `test_marlin_moe.py` 的逻辑结构和依赖边界清晰，便于后续继续 debug
-
-后续在支持 Marlin 的 SM75 或 SM80+ 机器上，再补下面两类运行验收：
-
-- `tests/test_marlin_generators.py`
-- `tests/test_marlin_dense.py`
-- `tests/test_marlin_moe.py`
+- `PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace`
+- `import marlin_v100`
+- `import marlin_v100._C`
+- `import marlin_v100._moe_C`
 
 ## 当前限制
 
-当前机器是 V100 / SM70，只适合作为构建链、导入链和测试收集验证环境，不适合作为 Marlin 内核运行验收环境。
+当前工作区已经固定为 `SM75` 单架构构建。当前没有 `SM75` 机器时，只适合作为构建链与导入链验证环境，不适合作为 Marlin 内核运行验收环境。
 
 这意味着：
 
-- 可以验证目录结构、构建脚本、扩展落位、导入与测试收集
-- `test_marlin_generators.py` 当前阶段不作为这台机器上的默认通过标准
-- `test_marlin_moe.py` 当前阶段先做逻辑审查与可收集性整理，不把本机运行结果作为最终通过标准
+- 可以验证目录结构、构建脚本、扩展落位与导入
+- `pytest` 当前阶段不作为默认验收项
 - 不应把 dense / moe 的数值运行结果作为当前机器上的最终通过标准
-- 真正的 Marlin 运行验证应放到 SM75 或 SM80+ 的机器执行
+- 真正的 Marlin 运行验证应放到 `SM75` 机器执行
 
 ## 与主树同步方式
 

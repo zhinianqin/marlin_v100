@@ -558,11 +558,6 @@ __global__ void grouped_topk_fused_kernel(
   ptr_u = (ptr_u + 15) & ~static_cast<uintptr_t>(15);  // align to 16B
   T* s_group_scores = reinterpret_cast<T*>(ptr_u);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");  // I think all prolog can be put before
-                                         // acqbulk because it's ptr arithmetic
-#endif
-
   // phase 1: per-group scan
   int32_t const group_offset = warp_id * num_experts_per_group;
   topk_with_k2<T, BiasT, SF>(s_group_scores + warp_id,
@@ -603,9 +598,6 @@ __global__ void grouped_topk_fused_kernel(
       topk_indices[i] = static_cast<IdxT>(i);
       topk_values[i] = 1.0f / static_cast<float>(topk_i32);
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
     return;
   }
 
@@ -664,9 +656,6 @@ __global__ void grouped_topk_fused_kernel(
     topk_values[lane_id] = lane_unbiased * scale;
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
 }
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
@@ -678,9 +667,6 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
     int64_t const topk, int64_t const numExperts,
     int64_t const numExpertsPerGroup, bool const renormalize,
     double const routedScalingFactor) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
-#endif
   // declare shared memory structure
   // number of experts is bounded by number of threads
   __shared__ float __attribute((aligned(128))) smemScoreSigmoid[MaxNumExperts];
@@ -879,9 +865,6 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>

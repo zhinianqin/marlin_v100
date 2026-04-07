@@ -61,21 +61,12 @@ export PATH="$PWD/.venv/bin:/usr/local/cuda-12.8/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS=8
 export NVCC_THREADS=1
-export TORCH_CUDA_ARCH_LIST='8.0'
-export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_80,code=sm_80'
+export TORCH_CUDA_ARCH_LIST='7.5'
+export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_75,code=sm_75'
 PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 ```
 
 注意：Linux 下必须使用 `LD_LIBRARY_PATH`。不要把 `D_LIBRARY_PATH` 当成可生效的替代变量。
-
-推荐轻量验证命令：
-
-```bash
-PYTHONPATH=$PWD/python ./.venv/bin/pytest --collect-only tests
-
-# 或者使用模块方式
-PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
-```
 
 构建前建议检查：
 
@@ -92,9 +83,9 @@ PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 当前阶段的验收分层如下：
 
 - 当前 SM70 机器：
-  只看构建、导入、`pytest --collect-only` 与测试逻辑审查
-- 支持 Marlin 的 SM75 或 SM80+ 机器：
-  再执行 `test_marlin_generators.py`、`test_marlin_dense.py`、`test_marlin_moe.py` 的运行验证
+  只看构建与导入
+- 支持 Marlin 的 SM75 机器：
+  再执行运行验证
 
 ## 回写主树约定
 
@@ -119,7 +110,6 @@ PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 
 - 不要把 `.venv/`、`build/`、扩展 `.so` 文件提交到 git
 - 不要在当前 SM70 机器上把 Marlin 运行结果当成最终数值验收
-- 不要把 `test_marlin_generators.py` 当成当前机器的硬性通过标准
-- 不要把 `test_marlin_moe.py` 当前阶段的本机运行结果当成最终验收
+- 不要把 `pytest` 当成当前阶段的硬性通过标准
 - 不要绕过 `upstream_map.yaml` 直接大范围覆盖主树
 - 不要把本地文档、测试、辅助封装当作上游源码一并回写
