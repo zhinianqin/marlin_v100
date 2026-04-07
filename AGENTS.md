@@ -27,7 +27,7 @@
 ## 开发约定
 
 - 优先使用本目录下的工具链：
-  `./.venv/bin/python`、`./.venv/bin/cmake`、`./.venv/bin/ninja`
+  `./.venv/bin/python`、`./.venv/bin/pytest`、`./.venv/bin/cmake`、`./.venv/bin/ninja`
 - Python 相关命令统一带上：
   `PYTHONPATH=$PWD/python`
 - 不要把本地工作区名 `marlin_v100` 传播到主树的上游 Python 包结构中
@@ -35,6 +35,18 @@
 - 修改上游可回写源码时，要同步检查 `upstream_map.yaml` 是否仍然准确
 
 ## 构建与验证约定
+
+推荐先按下面的方式准备构建环境：
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+
+uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" \
+  "setuptools>=77.0.3,<81.0.0" wheel jinja2 pytest numpy
+
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+```
 
 推荐构建命令：
 
@@ -49,9 +61,15 @@ export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_80,code=sm_80'
 PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 ```
 
+注意：Linux 下必须使用 `LD_LIBRARY_PATH`。不要把 `D_LIBRARY_PATH` 当成可生效的替代变量。
+
 推荐轻量验证命令：
 
 ```bash
+PYTHONPATH=$PWD/python ./.venv/bin/pytest tests/test_marlin_generators.py -q
+PYTHONPATH=$PWD/python ./.venv/bin/pytest --collect-only tests
+
+# 或者使用模块方式
 PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest tests/test_marlin_generators.py -q
 PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 ```

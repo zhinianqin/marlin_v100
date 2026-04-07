@@ -31,18 +31,31 @@
 当前工作区默认依赖本目录下的虚拟环境工具：
 
 - `./.venv/bin/python`
+- `./.venv/bin/pytest`
 - `./.venv/bin/cmake`
 - `./.venv/bin/ninja`
 
-当前已验证过的依赖条件包括：
+推荐先使用 `uv` 创建 Python 3.12 虚拟环境，并安装当前已验证过的最小构建依赖：
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+
+uv pip install "cmake>=3.26.1" ninja "packaging>=24.2" \
+  "setuptools>=77.0.3,<81.0.0" wheel jinja2 pytest numpy
+
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+当前文档按下面这组依赖前提维护：
 
 - 已安装 `torch`
-- 已安装 `numpy`
 - 已安装 `jinja2`
-- `pytest` 可通过 `python -m pytest` 使用
+- 已安装 `pytest`
+- 已安装 `numpy`
 - CUDA 工具链来自 `/usr/local/cuda-12.8`
 
-推荐环境变量：
+构建前推荐设置 CUDA 相关环境变量：
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.8
@@ -53,6 +66,8 @@ export NVCC_THREADS=1
 export TORCH_CUDA_ARCH_LIST='8.0'
 export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_80,code=sm_80'
 ```
+
+注意：动态库环境变量应使用 `LD_LIBRARY_PATH`。如果你手头的命令里写的是 `D_LIBRARY_PATH`，请改成 `LD_LIBRARY_PATH`。
 
 ## 构建方法
 
@@ -85,6 +100,10 @@ PY
 推荐优先执行轻量测试与测试收集检查：
 
 ```bash
+PYTHONPATH=$PWD/python ./.venv/bin/pytest tests/test_marlin_generators.py -q
+PYTHONPATH=$PWD/python ./.venv/bin/pytest --collect-only tests
+
+# 或者使用模块方式
 PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest tests/test_marlin_generators.py -q
 PYTHONPATH=$PWD/python ./.venv/bin/python -m pytest --collect-only tests
 ```
