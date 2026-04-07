@@ -1,0 +1,34 @@
+# Python artifacts
+.venv/
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest*.txt
+compile_commands.json
+*.ninja
+.ninja_*
+
+# Native extension artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+python/marlin_v100/_C*.so
+python/marlin_v100/_moe_C*.so
+
+# Test and generator logs
+.pytest_cache/
+marlin_generation.log
+moe_marlin_generation.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*~
