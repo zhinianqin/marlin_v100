@@ -69,25 +69,42 @@ __device__ inline void cp_async2_ca_pred(void* smem_ptr, const void* glob_ptr,
   }
 }
 
+__device__ __forceinline__ void load_global_cg_u32x4(
+    const void* glob_ptr, uint32_t& r0, uint32_t& r1, uint32_t& r2,
+    uint32_t& r3) {
+  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "l"(glob_ptr));
+}
+
+__device__ __forceinline__ void store_u32x4(void* smem_ptr, uint32_t r0,
+                                            uint32_t r1, uint32_t r2,
+                                            uint32_t r3) {
+  reinterpret_cast<uint4*>(smem_ptr)[0] = make_uint4(r0, r1, r2, r3);
+}
+
 __device__ inline void cp_async4_ca_pred(void* smem_ptr, const void* glob_ptr,
                                          bool pred = true) {
   if (pred) {
-    reinterpret_cast<int4*>(smem_ptr)[0] =
-        reinterpret_cast<const int4*>(glob_ptr)[0];
+    uint32_t r0, r1, r2, r3;
+    load_global_cg_u32x4(glob_ptr, r0, r1, r2, r3);
+    store_u32x4(smem_ptr, r0, r1, r2, r3);
   }
 }
 
 __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr,
                                       bool pred = true) {
   if (pred) {
-    reinterpret_cast<int4*>(smem_ptr)[0] =
-        reinterpret_cast<const int4*>(glob_ptr)[0];
+    uint32_t r0, r1, r2, r3;
+    load_global_cg_u32x4(glob_ptr, r0, r1, r2, r3);
+    store_u32x4(smem_ptr, r0, r1, r2, r3);
   }
 }
 
 __device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
-  reinterpret_cast<int4*>(smem_ptr)[0] =
-      reinterpret_cast<const int4*>(glob_ptr)[0];
+  uint32_t r0, r1, r2, r3;
+  load_global_cg_u32x4(glob_ptr, r0, r1, r2, r3);
+  store_u32x4(smem_ptr, r0, r1, r2, r3);
 }
 
 __device__ inline void cp_async_fence() {}
