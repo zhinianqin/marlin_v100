@@ -61,8 +61,8 @@ export PATH="$PWD/.venv/bin:/usr/local/cuda-12.8/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS=8
 export NVCC_THREADS=1
-export TORCH_CUDA_ARCH_LIST='7.5'
-export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_75,code=sm_75'
+export TORCH_CUDA_ARCH_LIST='7.0'
+export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_70,code=sm_70'
 PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 ```
 
@@ -83,9 +83,9 @@ PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 当前阶段的验收分层如下：
 
 - 当前 SM70 机器：
-  只看构建与导入
-- 支持 Marlin 的 SM75 机器：
-  再执行运行验证
+  已验证可完成构建、导入和本地 pytest 回归
+- 其他机器：
+  如需复用本工作区，应继续按 `SM70-only` 假设处理
 
 ## 回写主树约定
 
@@ -110,6 +110,6 @@ PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 
 - 不要把 `.venv/`、`build/`、扩展 `.so` 文件提交到 git
 - 不要在当前 SM70 机器上把 Marlin 运行结果当成最终数值验收
-- 不要把 `pytest` 当成当前阶段的硬性通过标准
+- 不要忽略 `pytest` 已经覆盖到的行为回归
 - 不要绕过 `upstream_map.yaml` 直接大范围覆盖主树
 - 不要把本地文档、测试、辅助封装当作上游源码一并回写
