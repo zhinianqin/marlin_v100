@@ -223,7 +223,6 @@ __launch_bounds__(TPB) __global__ void moeTopK(
             // Return the unbiased scores for output weights
             output[idx] = inputs_after_softmax[thread_read_offset + expert];
             indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
-            assert(indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
             if (renormalize) {
                 selected_sum += inputs_after_softmax[thread_read_offset + expert];

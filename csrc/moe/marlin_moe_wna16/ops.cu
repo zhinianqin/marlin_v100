@@ -25,6 +25,7 @@
 
 #include "kernel.h"
 #include "core/registration.h"
+#include "quantization/marlin/sm70_cutlass.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -435,8 +436,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability == 7 && minor_capability == 5,
-              "marlin moe SM75 build only supports SM75 GPUs.");
+  TORCH_CHECK(major_capability == 7 && minor_capability == 0,
+              "marlin moe SM70 build only supports SM70 GPUs.");
   int stages = 2;
 
   // Set thread config
@@ -592,16 +593,16 @@ torch::Tensor moe_wna16_marlin_gemm(
   vllm::ScalarType c_type = vllm::ScalarType::from_id(c_type_id);
   vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
 
-  TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
-              "SM75 build only supports float16 or int8 activations.");
+  TORCH_CHECK(a_type == vllm::kFloat16,
+              "SM70 build only supports float16 activations.");
   TORCH_CHECK(c_type == vllm::kFloat16,
-              "SM75 build only supports float16 outputs.");
+              "SM70 build only supports float16 outputs.");
   TORCH_CHECK(s_type == vllm::kFloat16,
-              "SM75 build only supports float16 scales.");
+              "SM70 build only supports float16 scales.");
   TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
                   b_type == vllm::kU8B128,
-              "SM75 build only supports uint4, uint4b8, or uint8b128 weights.");
-  TORCH_CHECK(!is_zp_float, "SM75 build does not support float zero-points.");
+              "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
+  TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
 
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
@@ -753,7 +754,7 @@ torch::Tensor moe_wna16_marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(false, "SM75 build does not support nvfp4 global_scale.");
+    TORCH_CHECK(false, "SM70 build does not support nvfp4 global_scale.");
   } else {
     global_scale = torch::empty({0}, options);
   }
@@ -780,12 +781,13 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
-    TORCH_CHECK(b_type == vllm::kU4,
-                "SM75 build only supports uint4 weights when zero-points are enabled. Got = ",
-                b_type.str());
+    TORCH_CHECK(
+        false,
+        "SM70 MoE build currently does not enable uint4 zero-point kernels; "
+        "use uint4b8 or uint8b128 weights on the GPU Marlin path.");
   } else {
     TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
-                "SM75 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
+                "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
                 b_type.str());
   }
 
@@ -834,6 +836,10 @@ torch::Tensor moe_wna16_marlin_gemm(
         a.scalar_type() == c.scalar_type(),
         "scalar type of a must be the same with c for 16 bit activation");
   }
+
+  // SM70 MoE execution must stay on the real GPU Marlin kernel path.
+  // The removed CUTLASS MoE fallback was a host-orchestrated helper, not a
+  // true GPU MoE kernel implementation.
 
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
