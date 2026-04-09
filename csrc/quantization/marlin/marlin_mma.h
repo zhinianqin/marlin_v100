@@ -1,7 +1,6 @@
 #include "marlin_dtypes.cuh"
 
-#include <cute/atom/mma_atom.hpp>
-#include <cute/atom/mma_traits_sm70.hpp>
+#include <assert.h>
 
 namespace MARLIN_NAMESPACE_NAME {
 
@@ -127,10 +126,8 @@ __device__ inline void scatter_sm70_atoms_to_sm80_fragment(
   }
 }
 
-template <typename Atom>
 __device__ inline void run_sm70_atom(const half* a_vals, const half* b_vals,
                                      float* accum) {
-  using Op = typename Atom::MMA_Op;
   auto pack = [](half x, half y) {
     return static_cast<uint32_t>(__half_as_ushort(x)) |
            (static_cast<uint32_t>(__half_as_ushort(y)) << 16);
@@ -141,23 +138,43 @@ __device__ inline void run_sm70_atom(const half* a_vals, const half* b_vals,
   uint32_t b0 = pack(b_vals[0], b_vals[1]);
   uint32_t b1 = pack(b_vals[2], b_vals[3]);
 
-  float c0 = accum[0];
-  float c1 = accum[1];
-  float c2 = accum[2];
-  float c3 = accum[3];
-  float c4 = accum[4];
-  float c5 = accum[5];
-  float c6 = accum[6];
-  float c7 = accum[7];
+  float d0 = accum[0];
+  float d1 = accum[1];
+  float d2 = accum[2];
+  float d3 = accum[3];
+  float d4 = accum[4];
+  float d5 = accum[5];
+  float d6 = accum[6];
+  float d7 = accum[7];
 
-  Op::fma(accum[0], accum[1], accum[2], accum[3], accum[4], accum[5], accum[6],
-          accum[7], a0, a1, b0, b1, c0, c1, c2, c3, c4, c5, c6, c7);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+  asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32"
+               "{%0, %1, %2, %3, %4, %5, %6, %7},"
+               "{%8, %9},"
+               "{%10, %11},"
+               "{%12, %13, %14, %15, %16, %17, %18, %19};\n"
+               : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4), "=f"(d5),
+                 "=f"(d6), "=f"(d7)
+               : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(accum[0]),
+                 "f"(accum[1]), "f"(accum[2]), "f"(accum[3]), "f"(accum[4]),
+                 "f"(accum[5]), "f"(accum[6]), "f"(accum[7]));
+#else
+  assert(false && "SM70 inline PTX mma requires __CUDA_ARCH__ >= 700");
+#endif
+
+  accum[0] = d0;
+  accum[1] = d1;
+  accum[2] = d2;
+  accum[3] = d3;
+  accum[4] = d4;
+  accum[5] = d5;
+  accum[6] = d6;
+  accum[7] = d7;
 }
 
 template <typename FragA, typename FragB, typename FragC>
 __device__ inline void mma_fp32_sm70(const FragA& a_frag, const FragB& frag_b,
                                      FragC& frag_c) {
-  using Atom = cute::MMA_Atom<cute::SM70_8x8x4_F32F16F16F32_TN>;
   int lane = threadIdx.x & 31;
   int atom_rowcol = sm70_atom_rowcol(lane);
   float accum_lo[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -176,8 +193,8 @@ __device__ inline void mma_fp32_sm70(const FragA& a_frag, const FragB& frag_b,
       a_vals_hi[i] = fetch_sm80_a_value(a_frag, atom_rowcol + 8, k);
     }
 
-    run_sm70_atom<Atom>(a_vals_lo, b_vals, accum_lo);
-    run_sm70_atom<Atom>(a_vals_hi, b_vals, accum_hi);
+    run_sm70_atom(a_vals_lo, b_vals, accum_lo);
+    run_sm70_atom(a_vals_hi, b_vals, accum_hi);
   }
 
   scatter_sm70_atoms_to_sm80_fragment(accum_lo, accum_hi, frag_c);
@@ -188,7 +205,6 @@ __device__ inline void mma_fp32_sm70_trans(const FragA& a_frag,
                                            const FragB& frag_b,
                                            const FragB& frag_b2,
                                            FragC& frag_c) {
-  using Atom = cute::MMA_Atom<cute::SM70_8x8x4_F32F16F16F32_TN>;
   int lane = threadIdx.x & 31;
   int atom_rowcol = sm70_atom_rowcol(lane);
   float accum_lo[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -208,8 +224,8 @@ __device__ inline void mma_fp32_sm70_trans(const FragA& a_frag,
           fetch_sm80_trans_a_value(frag_b, frag_b2, atom_rowcol + 8, k);
     }
 
-    run_sm70_atom<Atom>(a_vals_lo, b_vals, accum_lo);
-    run_sm70_atom<Atom>(a_vals_hi, b_vals, accum_hi);
+    run_sm70_atom(a_vals_lo, b_vals, accum_lo);
+    run_sm70_atom(a_vals_hi, b_vals, accum_hi);
   }
 
   scatter_sm70_atoms_to_sm80_fragment(accum_lo, accum_hi, frag_c);
@@ -229,13 +245,13 @@ __device__ inline void mma(
   static_cast<void>(idx);
   if constexpr (k_size == 16) {
     static_assert(std::is_same<scalar_t, half>::value,
-                  "SM70 CUTLASS atom bridge currently supports fp16 inputs only.");
+                  "SM70 inline PTX mma currently supports fp16 inputs only.");
     static_assert(!use_fp16_accum,
-                  "SM70 CUTLASS atom bridge currently supports fp32 accumulation only.");
+                  "SM70 inline PTX mma currently supports fp32 accumulation only.");
     detail::mma_fp32_sm70(a_frag, frag_b, frag_c);
   } else {
     static_assert(always_false_v<scalar_t>,
-                  "SM70 CUTLASS atom bridge only supports k_size=16.");
+                  "SM70 inline PTX mma only supports k_size=16.");
   }
 }
 
@@ -249,8 +265,8 @@ __device__ inline void mma_trans(
   static_assert(std::is_same<scalar_t, half>::value,
                 "SM70 build only supports fp16 mma kernels.");
   static_assert(!use_fp16_accum,
-                "SM70 CUTLASS atom bridge currently supports fp32 accumulation only.");
-  static_assert(k_size == 16, "SM70 CUTLASS atom bridge only supports k_size=16.");
+                "SM70 inline PTX mma currently supports fp32 accumulation only.");
+  static_assert(k_size == 16, "SM70 inline PTX mma only supports k_size=16.");
   detail::mma_fp32_sm70_trans(a_frag, frag_b, frag_b2, frag_c);
 }
 

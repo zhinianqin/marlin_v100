@@ -25,7 +25,6 @@
 
 #include "kernel.h"
 #include "core/registration.h"
-#include "sm70_cutlass.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -826,13 +825,6 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(
         a.scalar_type() == c.scalar_type(),
         "scalar type of a must be the same with c for 16 bit activation");
-  }
-
-  if (marlin_sm70_cutlass::can_use_dense_cutlass(
-          a, b_q_weight, b_scales, has_bias, has_act_order, has_zp,
-          is_zp_float, b_type_id)) {
-    return marlin_sm70_cutlass::run_dense_cutlass(
-        a, c_or_none, b_q_weight, b_scales, size_m, size_n, size_k);
   }
 
   marlin::marlin_mm(
