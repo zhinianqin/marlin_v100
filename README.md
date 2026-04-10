@@ -40,6 +40,7 @@
 - `./.venv/bin/pytest`
 - `./.venv/bin/cmake`
 - `./.venv/bin/ninja`
+- `./build.sh`
 
 推荐先使用 `uv` 创建 Python 3.12 虚拟环境，并安装当前已验证过的最小构建依赖：
 
@@ -75,9 +76,24 @@ export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_70,code=sm_70'
 
 注意：动态库环境变量应使用 `LD_LIBRARY_PATH`。如果你手头的命令里写的是 `D_LIBRARY_PATH`，请改成 `LD_LIBRARY_PATH`。
 
+如果使用下文的 `./build.sh`，脚本会在现有 `CMAKE_ARGS` 基础上自动补齐 `-Xptxas=-v`，并在未显式设置架构时默认使用 `SM70`。
+
 ## 构建方法
 
-进入目录后，使用下面的命令构建：
+推荐直接使用仓库根目录下的构建脚本：
+
+```bash
+./build.sh
+```
+
+这个脚本会：
+
+- 默认使用 `TORCH_CUDA_ARCH_LIST=7.0`
+- 在 `CMAKE_ARGS` 中自动启用 `-Xptxas=-v`
+- 将 `ptxas` 输出中的非零 `stack frame`、`spill stores`、`spill loads` 标成红色
+- 使用 `LD_LIBRARY_PATH`，不使用无效的 `D_LIBRARY_PATH`
+
+如需手工构建，也可以继续使用下面的命令：
 
 ```bash
 PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
