@@ -37,7 +37,7 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
                                     int const* __restrict__ perm_int_ptr,
@@ -57,7 +57,7 @@ torch::Tensor marlin_gemm(
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
   TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "marlin_gemm(..) requires an SM75 build.");
+                              "marlin_gemm(..) requires an SM70 build.");
   return torch::empty({1, 1});
 }
 
@@ -391,8 +391,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability == 7 && minor_capability == 5,
-              "marlin SM75 build only supports SM75 GPUs.");
+  TORCH_CHECK(major_capability == 7 && minor_capability == 0,
+              "marlin SM70 build only supports SM70 GPUs.");
   int stages = 2;
 
   int max_par = 16;
@@ -586,16 +586,16 @@ torch::Tensor marlin_gemm(
   vllm::ScalarType c_type = vllm::ScalarType::from_id(c_type_id);
   vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
 
-  TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
-              "SM75 build only supports float16 or int8 activations.");
+  TORCH_CHECK(a_type == vllm::kFloat16,
+              "SM70 build only supports float16 activations.");
   TORCH_CHECK(c_type == vllm::kFloat16,
-              "SM75 build only supports float16 outputs.");
+              "SM70 build only supports float16 outputs.");
   TORCH_CHECK(s_type == vllm::kFloat16,
-              "SM75 build only supports float16 scales.");
+              "SM70 build only supports float16 scales.");
   TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
                   b_type == vllm::kU8B128,
-              "SM75 build only supports uint4, uint4b8, or uint8b128 weights.");
-  TORCH_CHECK(!is_zp_float, "SM75 build does not support float zero-points.");
+              "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
+  TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -747,7 +747,7 @@ torch::Tensor marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(false, "SM75 build does not support nvfp4 global_scale.");
+    TORCH_CHECK(false, "SM70 build does not support nvfp4 global_scale.");
   } else {
     global_scale = torch::empty({0}, options);
   }
@@ -775,11 +775,11 @@ torch::Tensor marlin_gemm(
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
     TORCH_CHECK(b_type == vllm::kU4,
-                "SM75 build only supports uint4 weights when zero-points are enabled. Got = ",
+                "SM70 build only supports uint4 weights when zero-points are enabled. Got = ",
                 b_type.str());
   } else {
     TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
-                "SM75 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
+                "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
                 b_type.str());
   }
 

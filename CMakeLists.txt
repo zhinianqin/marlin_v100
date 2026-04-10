@@ -29,9 +29,9 @@ if (NOT NVCC_EXECUTABLE)
   message(FATAL_ERROR "nvcc not found")
 endif()
 
-set(CUDA_ARCHS "7.5")
-set(VLLM_GPU_ARCHES "75")
-set(CUDA_ARCHS_STR "7.5")
+set(CUDA_ARCHS "7.0")
+set(VLLM_GPU_ARCHES "70")
+set(CUDA_ARCHS_STR "7.0")
 message(STATUS "marlin_v100 CUDA target architectures: ${CUDA_ARCHS}")
 message(STATUS "marlin_v100 CMake CUDA architectures: ${VLLM_GPU_ARCHES}")
 
@@ -69,15 +69,15 @@ if (NOT marlin_generation_result EQUAL 0)
   message(FATAL_ERROR "marlin_v100 dense kernel generation failed")
 endif()
 
-file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC "csrc/quantization/marlin/sm75_kernel_*.cu")
+file(GLOB MARLIN_TEMPLATE_SM70_KERNEL_SRC "csrc/quantization/marlin/sm70_kernel_*.cu")
 set_gencode_flags_for_srcs(
-  SRCS "${MARLIN_TEMPLATE_SM75_KERNEL_SRC}"
+  SRCS "${MARLIN_TEMPLATE_SM70_KERNEL_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-  set_source_files_properties(${MARLIN_TEMPLATE_SM75_KERNEL_SRC}
+  set_source_files_properties(${MARLIN_TEMPLATE_SM70_KERNEL_SRC}
     PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
 endif()
-list(APPEND MARLIN_V100_DENSE_SRC ${MARLIN_TEMPLATE_SM75_KERNEL_SRC})
+list(APPEND MARLIN_V100_DENSE_SRC ${MARLIN_TEMPLATE_SM70_KERNEL_SRC})
 
 set(MARLIN_SRCS
    "csrc/quantization/marlin/marlin.cu"
@@ -116,15 +116,15 @@ if (NOT moe_marlin_generation_result EQUAL 0)
   message(FATAL_ERROR "marlin_v100 moe kernel generation failed")
 endif()
 
-file(GLOB MARLIN_MOE_SM75_SRC "csrc/moe/marlin_moe_wna16/sm75_kernel_*.cu")
+file(GLOB MARLIN_MOE_SM70_SRC "csrc/moe/marlin_moe_wna16/sm70_kernel_*.cu")
 set_gencode_flags_for_srcs(
-  SRCS "${MARLIN_MOE_SM75_SRC}"
+  SRCS "${MARLIN_MOE_SM70_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-  set_source_files_properties(${MARLIN_MOE_SM75_SRC}
+  set_source_files_properties(${MARLIN_MOE_SM70_SRC}
     PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
 endif()
-list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM75_SRC})
+list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM70_SRC})
 
 set(MARLIN_MOE_OTHER_SRC "csrc/moe/marlin_moe_wna16/ops.cu")
 set_gencode_flags_for_srcs(

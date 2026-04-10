@@ -36,7 +36,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
@@ -75,31 +75,6 @@ __global__ void Marlin(
 }  // namespace marlin
 
 #else
-
-// Instruction for loading a full 16x16 matrix fragment of operand A from shared
-// memory, directly in tensor core layout.
-template <int count, vllm::ScalarTypeId type_id>
-__device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
-                            const void* smem_ptr) {
-  uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  if constexpr (count == 4) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "r"(smem));
-  } else if constexpr (count == 2) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                 : "=r"(a[0]), "=r"(a[1])
-                 : "r"(smem));
-  } else if constexpr (count == 1) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n"
-                 : "=r"(a[0])
-                 : "r"(smem));
-  } else {
-    static_assert(count == 1 || count == 2 || count == 4, "invalid count");
-  }
-}
 
 // Multiply dequantized values by the corresponding quantization scale; used
 // only for grouped quantization.
@@ -280,11 +255,11 @@ __global__ void Marlin(
   // configurations, while requiring as few slow global cross-threadblock
   // reductions as possible.
 
-  // Turing TensorCore only supports fp16 and int8
-  if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
+  // Volta path only supports fp16 activation fragments.
+  if constexpr (a_type_id != vllm::kFloat16.id())
     return;
 
-  constexpr bool use_fp16_accum = a_type_id == vllm::kFloat16.id();
+  constexpr bool use_fp16_accum = false;
   using Adtype = MarlinScalarType<a_type_id>;
   using Cdtype = MarlinScalarType<c_type_id>;
   const int4* A = A0;
@@ -918,7 +893,7 @@ __global__ void Marlin(
   #pragma unroll
     for (int i = 0; i < thread_m_blocks; i++)
       ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
-          frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+          frag_a[k % 2][i], sh_a_stage, a_sh_rd_trans[k % b_sh_wr_iters][i]);
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 
   #pragma unroll
@@ -1301,12 +1276,14 @@ __global__ void Marlin(
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        mma<a_type_id, false, 32>(
-            frag_a[k2][i], frag_b[0],
-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
-        mma<a_type_id, false, 32>(
-            frag_a[k2][i], frag_b[1],
-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        if constexpr (is_a_8bit) {
+          mma<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[0],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+          mma<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[1],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        }
       }
 
       if constexpr (group_blocks != -1) {
