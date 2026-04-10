@@ -17,13 +17,17 @@ DENSE_WEIGHT_SHAPES: dict[str, list[tuple[int, int]]] = {
 }
 
 DENSE_PRESETS: dict[str, dict[str, list[int] | list[str]]] = {
-    "quick": {
+    "smoke": {
         "models": ["smoke"],
         "batch_sizes": [1, 16, 64],
     },
+    "quick": {
+        "models": ["ideal"],
+        "batch_sizes": [1, 16, 64, 256],
+    },
     "full": {
-        "models": ["smoke", "ideal", "llama2_7b_tp1"],
-        "batch_sizes": [1, 16, 64, 256, 1024],
+        "models": ["ideal", "llama2_7b_tp1"],
+        "batch_sizes": [1, 16, 64, 256, 1024, 4096],
     },
 }
 

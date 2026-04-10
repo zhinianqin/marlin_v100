@@ -23,7 +23,8 @@ def check_cuda_ready() -> None:
     capability = torch.cuda.get_device_capability()
     if capability != (7, 0):
         raise RuntimeError(
-            f"Marlin benchmarks require SM70. Found capability={capability}."
+            "Current Marlin benchmark scripts target the checked-in SM70-only build. "
+            f"Found capability={capability}."
         )
 
 

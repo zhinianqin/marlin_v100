@@ -69,8 +69,8 @@ export PATH="$PWD/.venv/bin:/usr/local/cuda-12.8/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS=8
 export NVCC_THREADS=1
-export TORCH_CUDA_ARCH_LIST='7.5'
-export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_75,code=sm_75'
+export TORCH_CUDA_ARCH_LIST='7.0'
+export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_70,code=sm_70'
 ```
 
 注意：动态库环境变量应使用 `LD_LIBRARY_PATH`。如果你手头的命令里写的是 `D_LIBRARY_PATH`，请改成 `LD_LIBRARY_PATH`。
@@ -114,14 +114,21 @@ PY
 
 ## 当前限制
 
-当前工作区已经固定为 `SM75` 单架构构建。当前没有 `SM75` 机器时，只适合作为构建链与导入链验证环境，不适合作为 Marlin 内核运行验收环境。
+当前仓库里提交的 Marlin dense / MoE kernel 生成与 benchmark 路径是 `SM70` 单架构前提。当前 benchmark 脚本在运行时也会显式检查 `SM70`。
 
 这意味着：
 
-- 可以验证目录结构、构建脚本、扩展落位与导入
+- 可以在当前 `SM70` 机器上验证目录结构、构建脚本、扩展落位、导入与当前实现的实际运行特征
 - `pytest` 当前阶段不作为默认验收项
-- 不应把 dense / moe 的数值运行结果作为当前机器上的最终通过标准
-- 真正的 Marlin 运行验证应放到 `SM75` 机器执行
+- 当前 `SM70` benchmark 结果只代表这份 checked-in build 的现状，不应直接外推成未来 `SM75` 目标实现的最终性能结论
+- 如果后续恢复 `SM75` 目标构建，应在 `SM75` 机器上用同一套 benchmark 脚本重新测量
+
+当前 dense benchmark 默认将性能分析聚焦在 `ideal` 与 `llama2_7b_tp1` 大 shape 上，并额外区分：
+
+- `operator_us`：包含 Python 调度与算子内部临时分配
+- `kernel_like_us`：预分配输出并复用 workspace，用来弱化脚本侧固定开销
+
+`smoke` preset 仅用于冒烟，不适合用来判断真实吞吐。
 
 ## 与主树同步方式
 
