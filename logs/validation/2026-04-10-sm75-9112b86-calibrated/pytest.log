@@ -1,0 +1,3 @@
++ ./.venv/bin/pytest -q
+.....................s....                                               [100%]
+25 passed, 1 skipped in 2.78s

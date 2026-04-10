@@ -1,0 +1,69 @@
++ ./.venv/bin/python setup.py build_ext --inplace
+running build_ext
+cmake version 4.3.1
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+-- Found Python: /home/onecatai/marlin_v100/.venv/bin/python (found version "3.12.3") found components: Interpreter Development.Module Development.SABIModule
+-- Found python matching: /home/onecatai/marlin_v100/.venv/bin/python.
+-- PyTorch: CUDA detected: 12.8
+-- PyTorch: CUDA nvcc is: /usr/local/cuda-12.8/bin/nvcc
+-- PyTorch: CUDA toolkit directory: /usr/local/cuda-12.8
+-- PyTorch: Header version is: 12.8
+-- Found Python: /home/onecatai/marlin_v100/.venv/bin/python (found version "3.12.3") found components: Interpreter
+CMake Warning at .venv/lib/python3.12/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:149 (message):
+  Failed to compute shorthash for libnvrtc.so
+Call Stack (most recent call first):
+  .venv/lib/python3.12/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  .venv/lib/python3.12/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:19 (find_package)
+
+
+-- USE_CUDNN is set to 0. Compiling without cuDNN support
+-- USE_CUSPARSELT is set to 0. Compiling without cuSPARSELt support
+-- USE_CUDSS is set to 0. Compiling without cuDSS support
+-- USE_CUFILE is set to 0. Compiling without cuFile support
+-- Autodetected CUDA architecture(s):  7.5
+CMake Warning at .venv/lib/python3.12/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:332 (message):
+  pytorch is not compatible with `CMAKE_CUDA_ARCHITECTURES` and will ignore
+  its value.  Please configure `TORCH_CUDA_ARCH_LIST` instead.
+Call Stack (most recent call first):
+  .venv/lib/python3.12/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+  .venv/lib/python3.12/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+  CMakeLists.txt:19 (find_package)
+
+
+-- Added CUDA NVCC flags for: -gencode;arch=compute_75,code=sm_75
+CMake Warning at .venv/lib/python3.12/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:22 (message):
+  static library kineto_LIBRARY-NOTFOUND not found.
+Call Stack (most recent call first):
+  .venv/lib/python3.12/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:125 (append_torchlib_if_found)
+  CMakeLists.txt:19 (find_package)
+
+
+-- marlin_v100 CUDA target architectures: 7.5
+-- marlin_v100 CMake CUDA architectures: 75
+-- Configuring done (3.5s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/onecatai/marlin_v100/build/temp.linux-x86_64-cpython-312
+[1/14] Building CUDA object CMakeFiles/_moe_C.dir/csrc/moe/marlin_moe_wna16/ops.cu.o
+[2/14] Building CUDA object CMakeFiles/_C.dir/csrc/quantization/marlin/marlin.cu.o
+[3/14] Building CUDA object CMakeFiles/_C.dir/csrc/quantization/marlin/sm75_kernel_s8_u4b8_float16.cu.o
+[4/14] Building CUDA object CMakeFiles/_moe_C.dir/csrc/moe/marlin_moe_wna16/sm75_kernel_s8_u4_float16.cu.o
+[5/14] Building CUDA object CMakeFiles/_C.dir/csrc/quantization/marlin/sm75_kernel_s8_u4_float16.cu.o
+[6/14] Building CUDA object CMakeFiles/_C.dir/csrc/quantization/marlin/sm75_kernel_float16_u4_float16.cu.o
+[7/14] Building CUDA object CMakeFiles/_moe_C.dir/csrc/moe/marlin_moe_wna16/sm75_kernel_s8_u4b8_float16.cu.o
+[8/14] Building CUDA object CMakeFiles/_C.dir/csrc/quantization/marlin/sm75_kernel_float16_u8b128_float16.cu.o
+[9/14] Building CUDA object CMakeFiles/_C.dir/csrc/quantization/marlin/sm75_kernel_float16_u4b8_float16.cu.o
+[10/14] Linking CXX shared module _C.abi3.so
+[11/14] Building CUDA object CMakeFiles/_moe_C.dir/csrc/moe/marlin_moe_wna16/sm75_kernel_float16_u4_float16.cu.o
+[12/14] Building CUDA object CMakeFiles/_moe_C.dir/csrc/moe/marlin_moe_wna16/sm75_kernel_float16_u4b8_float16.cu.o
+[13/14] Building CUDA object CMakeFiles/_moe_C.dir/csrc/moe/marlin_moe_wna16/sm75_kernel_float16_u8b128_float16.cu.o
+[14/14] Linking CXX shared module _moe_C.abi3.so
+-- Install configuration: ""
+-- Installing: /home/onecatai/marlin_v100/build/lib.linux-x86_64-cpython-312/marlin_v100/_C.abi3.so
+-- Set non-toolchain portion of runtime path of "/home/onecatai/marlin_v100/build/lib.linux-x86_64-cpython-312/marlin_v100/_C.abi3.so" to ""
+-- Install configuration: ""
+-- Installing: /home/onecatai/marlin_v100/build/lib.linux-x86_64-cpython-312/marlin_v100/_moe_C.abi3.so
+-- Set non-toolchain portion of runtime path of "/home/onecatai/marlin_v100/build/lib.linux-x86_64-cpython-312/marlin_v100/_moe_C.abi3.so" to ""
+copying build/lib.linux-x86_64-cpython-312/marlin_v100/_C.abi3.so -> python/marlin_v100
+copying build/lib.linux-x86_64-cpython-312/marlin_v100/_moe_C.abi3.so -> python/marlin_v100

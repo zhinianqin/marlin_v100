@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 
@@ -223,6 +224,34 @@ def marlin_quantize_experts(
             )
         )
     return torch.stack(q_weights), torch.stack(scales), torch.stack(dequantized)
+
+
+def make_moe_model_like_inputs(
+    tokens: int,
+    hidden: int,
+    intermediate: int,
+    experts: int,
+    topk: int,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hidden_states = torch.randn((tokens, hidden), device=device, dtype=dtype)
+    topk_weights = torch.rand((tokens, topk), device=device, dtype=torch.float32)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    topk_ids = torch.empty((tokens, topk), device=device, dtype=torch.int32)
+    for token_idx in range(tokens):
+        for route_idx in range(topk):
+            topk_ids[token_idx, route_idx] = (token_idx + route_idx) % experts
+
+    # Use fan-in-scaled weights so the local MoE benchmark checks resemble the
+    # activation ranges seen in real models instead of overflowing fp16 paths
+    # with unit-variance synthetic weights.
+    w1 = torch.randn((experts, hidden, 2 * intermediate), device=device, dtype=dtype)
+    w1 = w1 * (1.0 / math.sqrt(hidden))
+    w2 = torch.randn((experts, intermediate, hidden), device=device, dtype=dtype)
+    w2 = w2 * (1.0 / math.sqrt(intermediate))
+    return hidden_states, topk_weights, topk_ids, w1, w2
 
 
 def marlin_moe_reference(

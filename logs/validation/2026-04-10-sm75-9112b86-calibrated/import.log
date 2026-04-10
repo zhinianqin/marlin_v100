@@ -1,0 +1,5 @@
++ python - <<'PY'
+imports=ok
+module /home/onecatai/marlin_v100/python/marlin_v100/__init__.py
+_C /home/onecatai/marlin_v100/python/marlin_v100/_C.abi3.so
+_moe_C /home/onecatai/marlin_v100/python/marlin_v100/_moe_C.abi3.so

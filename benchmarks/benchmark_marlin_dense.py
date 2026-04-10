@@ -14,6 +14,15 @@ from common import (
     time_cuda_callable,
     timestamp,
 )
+from marlin_v100.calibration import (
+    architecture_support,
+    format_capability,
+    runtime_capability,
+    supported_dense_group_sizes,
+    supported_dense_quant_type_names,
+    source_target_cuda_arch_arg,
+    source_target_label,
+)
 from marlin_v100 import ops
 from tests.helpers import (
     marlin_make_empty_g_idx,
@@ -22,11 +31,16 @@ from tests.helpers import (
     scalar_types,
 )
 
-
-QUANT_TYPES = {
+_DENSE_QUANT_TYPE_CANDIDATES = {
     "uint4b8": scalar_types.uint4b8,
     "uint8b128": scalar_types.uint8b128,
 }
+QUANT_TYPES = {
+    name: _DENSE_QUANT_TYPE_CANDIDATES[name]
+    for name in supported_dense_quant_type_names(_DENSE_QUANT_TYPE_CANDIDATES)
+}
+GROUP_SIZE_CANDIDATES = (128, -1)
+GROUP_SIZES = supported_dense_group_sizes(GROUP_SIZE_CANDIDATES)
 LAUNCH_DOMINATED_FLOPS = 1_000_000_000
 
 
@@ -61,6 +75,7 @@ def is_launch_dominated(flops: int) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
+    support = architecture_support()
     parser = argparse.ArgumentParser(description="Benchmark local Marlin dense kernels.")
     parser.add_argument(
         "--preset",
@@ -85,14 +100,18 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=sorted(QUANT_TYPES.keys()),
         default=list(QUANT_TYPES.keys()),
-        help="Quantized weight types to benchmark.",
+        help="Quantized weight types to benchmark for the current source target.",
     )
     parser.add_argument(
         "--group-sizes",
         nargs="+",
         type=int,
-        default=[128, -1],
-        help="Group sizes to benchmark.",
+        choices=list(GROUP_SIZES),
+        default=list(GROUP_SIZES),
+        help=(
+            "Group sizes to benchmark for the current source target "
+            f"({source_target_label()}; supported defaults={list(support.dense_group_sizes)})."
+        ),
     )
     parser.add_argument(
         "--reuse-output",
@@ -297,9 +316,9 @@ def main() -> None:
 
     banner(f"Marlin Dense Benchmark ({timestamp()})")
     print(f"device={torch.cuda.get_device_name(0)}")
-    print(f"capability={torch.cuda.get_device_capability(0)}")
-    print("note=current results reflect the checked-in SM70-only build on this machine.")
-    print("note=do not treat these numbers as final SM75-target Marlin performance.")
+    print(f"capability={format_capability(runtime_capability(0))}")
+    print(f"build_target={source_target_label()} ({source_target_cuda_arch_arg()})")
+    print("note=results are only comparable when runtime capability matches the source target build.")
     print(f"preset={args.preset}")
     print(f"models={models}")
     print(f"batch_sizes={batch_sizes}")

@@ -1,0 +1,34 @@
++ python -m compileall benchmarks tests python/marlin_v100
+Listing 'benchmarks'...
+Listing 'tests'...
+Listing 'python/marlin_v100'...
+
++ pytest --collect-only -q
+tests/test_calibration.py::test_sm70_support_matrix_filters_out_fp8_family_candidates
+tests/test_calibration.py::test_sm75_support_matrix_keeps_current_workspace_quant_candidates
+tests/test_marlin_dense.py::test_marlin_dense_symbols_available
+tests/test_marlin_dense.py::test_marlin_int4_fp8_preprocess_without_zp
+tests/test_marlin_dense.py::test_marlin_dense_smoke_local_helpers
+tests/test_marlin_dense.py::test_marlin_dense_uint4b8_accuracy
+tests/test_marlin_dense.py::test_marlin_dense_uint8b128_accuracy
+tests/test_marlin_dense.py::test_marlin_dense_rejects_non_sm75_or_unsupported_dtypes
+tests/test_marlin_dense.py::test_marlin_dense_uint8b128_rejects_unsupported_dtypes
+tests/test_marlin_generators.py::test_dense_generator_outputs_are_stable
+tests/test_marlin_generators.py::test_moe_generator_outputs_are_stable
+tests/test_marlin_helpers.py::test_marlin_quantize_round_trip_matches_original_weight[uint4b8]
+tests/test_marlin_helpers.py::test_marlin_quantize_round_trip_matches_original_weight[uint8b128]
+tests/test_marlin_helpers.py::test_marlin_quantize_experts_round_trip_matches_original_weights[uint4b8]
+tests/test_marlin_helpers.py::test_marlin_quantize_experts_round_trip_matches_original_weights[uint8b128]
+tests/test_marlin_moe.py::test_marlin_moe_symbols_available
+tests/test_marlin_moe.py::test_topk_softmax_and_align_block_size_shapes
+tests/test_marlin_moe.py::test_topk_softmax_matches_reference
+tests/test_marlin_moe.py::test_moe_align_block_size_matches_reference
+tests/test_marlin_moe.py::test_grouped_topk_shapes
+tests/test_marlin_moe.py::test_grouped_topk_matches_reference
+tests/test_marlin_moe.py::test_fused_marlin_moe_smoke
+tests/test_marlin_moe.py::test_fused_marlin_moe_uint4b8_accuracy
+tests/test_marlin_moe.py::test_fused_marlin_moe_uint8b128_accuracy
+tests/test_marlin_moe.py::test_moe_wna16_uint8b128_stage1_kernel_is_finite
+tests/test_marlin_moe.py::test_marlin_moe_rejects_non_sm75_or_unsupported_dtypes
+
+26 tests collected in 0.71s

@@ -13,17 +13,28 @@ from common import (
     time_cuda_callable,
     timestamp,
 )
+from marlin_v100.calibration import (
+    format_capability,
+    runtime_capability,
+    supported_moe_quant_type_names,
+    source_target_cuda_arch_arg,
+    source_target_label,
+)
 from marlin_v100 import moe, ops
 from tests.helpers import (
+    make_moe_model_like_inputs,
     marlin_moe_reference,
     marlin_quantize_experts,
     scalar_types,
 )
 
-
-QUANT_TYPES = {
+_MOE_QUANT_TYPE_CANDIDATES = {
     "uint4b8": scalar_types.uint4b8,
     "uint8b128": scalar_types.uint8b128,
+}
+QUANT_TYPES = {
+    name: _MOE_QUANT_TYPE_CANDIDATES[name]
+    for name in supported_moe_quant_type_names(_MOE_QUANT_TYPE_CANDIDATES)
 }
 
 
@@ -52,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=sorted(QUANT_TYPES.keys()),
         default=list(QUANT_TYPES.keys()),
-        help="Quantized weight types to benchmark.",
+        help="Quantized weight types to benchmark for the current source target.",
     )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
@@ -62,18 +73,6 @@ def parse_args() -> argparse.Namespace:
         help="Run a small correctness sanity check before timing each case.",
     )
     return parser.parse_args()
-
-
-def make_routing(tokens: int, experts: int, topk: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    topk_ids = torch.empty((tokens, topk), dtype=torch.int32, device=device)
-    for token in range(tokens):
-        for route in range(topk):
-            topk_ids[token, route] = (token + route) % experts
-    topk_weights = torch.tensor([0.6, 0.4], device=device, dtype=torch.float32)
-    topk_weights = topk_weights.repeat(tokens, 1)
-    topk_weights = topk_weights[:, :topk]
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    return topk_ids, topk_weights
 
 
 def run_case(
@@ -92,11 +91,14 @@ def run_case(
 
     quant_type = QUANT_TYPES[quant_name]
     device = torch.device("cuda")
-    hidden_states = torch.randn((tokens, hidden), device=device, dtype=torch.float16)
-    topk_ids, topk_weights = make_routing(tokens, experts, topk, device)
-
-    w1 = torch.randn((experts, hidden, 2 * intermediate), device=device, dtype=torch.float16)
-    w2 = torch.randn((experts, intermediate, hidden), device=device, dtype=torch.float16)
+    hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        device=device,
+    )
     w1_q, w1_scales, w1_dequant = marlin_quantize_experts(w1, quant_type, 128, False)
     w2_q, w2_scales, w2_dequant = marlin_quantize_experts(w2, quant_type, 128, False)
 
@@ -113,6 +115,12 @@ def run_case(
             is_k_full=True,
         )
 
+    status = "unchecked"
+    all_finite = "n/a"
+    check_pass = "n/a"
+    max_abs_err = "n/a"
+    error = ""
+
     if check:
         output = run_marlin()
         reference = marlin_moe_reference(
@@ -122,9 +130,35 @@ def run_case(
             topk_weights,
             topk_ids,
         ).to(torch.float16)
-        torch.testing.assert_close(output, reference, rtol=8e-2, atol=1.1)
+        finite = bool(torch.isfinite(output).all().item())
+        all_finite = "yes" if finite else "no"
+        if finite:
+            diff = (output - reference).abs().to(torch.float32)
+            max_abs_err = format_float(float(diff.max().item()))
+            try:
+                torch.testing.assert_close(output, reference, rtol=7e-2, atol=1e-2)
+                status = "ok"
+                check_pass = "yes"
+            except AssertionError as exc:
+                status = "mismatch"
+                check_pass = "no"
+                error = str(exc).splitlines()[0]
+        else:
+            status = "non_finite"
+            check_pass = "no"
+            max_abs_err = "inf"
 
-    stats = time_cuda_callable(run_marlin, warmup_iters=warmup_iters, iters=iters)
+    try:
+        stats = time_cuda_callable(run_marlin, warmup_iters=warmup_iters, iters=iters)
+        marlin_us = format_float(stats["median_us"])
+    except Exception as exc:
+        status = "error"
+        all_finite = "n/a" if not check else all_finite
+        check_pass = "n/a" if not check else check_pass
+        max_abs_err = "n/a" if not check else max_abs_err
+        marlin_us = "ERR"
+        error = str(exc).splitlines()[0]
+
     return [
         case_name,
         quant_name,
@@ -132,7 +166,12 @@ def run_case(
         str(experts),
         str(hidden),
         str(intermediate),
-        format_float(stats["median_us"]),
+        marlin_us,
+        status,
+        all_finite,
+        check_pass,
+        max_abs_err,
+        error,
     ]
 
 
@@ -146,6 +185,9 @@ def main() -> None:
     tokens_list = args.tokens or list(preset["tokens"])
 
     banner(f"Marlin MoE Benchmark ({timestamp()})")
+    print(f"device={torch.cuda.get_device_name(0)}")
+    print(f"capability={format_capability(runtime_capability(0))}")
+    print(f"build_target={source_target_label()} ({source_target_cuda_arch_arg()})")
     print(f"preset={args.preset}")
     print(f"cases={cases}")
     print(f"tokens={tokens_list}")
@@ -177,6 +219,11 @@ def main() -> None:
             "hidden",
             "intermediate",
             "marlin_us",
+            "status",
+            "all_finite",
+            "check_pass",
+            "max_abs_err",
+            "error",
         ],
         rows=rows,
     )

@@ -8,6 +8,13 @@ from typing import Callable, Iterable
 
 import torch
 
+from marlin_v100.calibration import (
+    format_capability,
+    runtime_capability,
+    source_target_capability,
+    source_target_label,
+)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON_DIR = ROOT / "python"
@@ -20,11 +27,13 @@ if str(PYTHON_DIR) not in sys.path:
 def check_cuda_ready() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for Marlin benchmarks.")
-    capability = torch.cuda.get_device_capability()
-    if capability != (7, 0):
+    capability = runtime_capability()
+    target = source_target_capability()
+    if capability != target:
         raise RuntimeError(
-            "Current Marlin benchmark scripts target the checked-in SM70-only build. "
-            f"Found capability={capability}."
+            "Current Marlin benchmark scripts require a runtime GPU that matches the "
+            f"checked-in {source_target_label()} build. Found capability="
+            f"{format_capability(capability)}."
         )
 
 

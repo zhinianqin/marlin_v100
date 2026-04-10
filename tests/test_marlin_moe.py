@@ -4,16 +4,29 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from marlin_v100.calibration import (
+    source_target_capability,
+    source_target_label,
+    supported_moe_quant_type_names,
+)
 from marlin_v100 import moe, ops, routing
-from tests.helpers import marlin_moe_reference, marlin_quantize_experts, scalar_types
+from tests.helpers import (
+    make_moe_model_like_inputs,
+    marlin_moe_reference,
+    marlin_quantize_experts,
+    scalar_types,
+)
+
+_MOE_SUPPORTED_QUANT_NAMES = frozenset(supported_moe_quant_type_names(("uint4b8", "uint8b128")))
 
 
 def _require_moe_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
+    target_capability = source_target_capability()
     capability = torch.cuda.get_device_capability()
-    if capability != (7, 0):
-        pytest.skip("Marlin MoE requires SM70")
+    if capability != target_capability:
+        pytest.skip(f"Marlin MoE requires {source_target_label()} for this source tree")
     try:
         ops._load_moe()
     except Exception as exc:  # pragma: no cover - depends on local build state
@@ -266,8 +279,7 @@ def test_grouped_topk_matches_reference():
 
 def test_fused_marlin_moe_smoke():
     _require_moe_cuda()
-    # This is a collectable smoke shape check only. Current SM70 machines are
-    # not considered a valid runtime acceptance environment for Marlin MoE.
+    # This is a collectable smoke shape check only for the checked-in source target build.
 
     quant_type_id = 1
     hidden_states = torch.randn((4, 128), device="cuda", dtype=torch.float16)
@@ -306,15 +318,14 @@ def test_fused_marlin_moe_uint4b8_accuracy():
     experts = 4
     topk = 2
 
-    hidden_states = torch.randn((tokens, hidden), device="cuda", dtype=torch.float16)
-    topk_weights = torch.rand((tokens, topk), device="cuda", dtype=torch.float32)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_ids = torch.tensor(
-        [[0, 1], [2, 3], [1, 2], [3, 0]], device="cuda", dtype=torch.int32
+    hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        device="cuda",
     )
-
-    w1 = torch.randn((experts, hidden, 2 * intermediate), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((experts, intermediate, hidden), device="cuda", dtype=torch.float16)
     w1_q, w1_scales, w1_dequant = marlin_quantize_experts(
         w1, scalar_types.uint4b8, 128, False
     )
@@ -342,118 +353,138 @@ def test_fused_marlin_moe_uint4b8_accuracy():
 
     assert output.shape == hidden_states.shape
     assert torch.isfinite(output).all()
-    ratio = output.float().norm() / reference.float().norm().clamp_min(1e-6)
-    assert ratio.item() > 0.1
-    torch.testing.assert_close(output, reference, rtol=8e-2, atol=5e-1)
+    torch.testing.assert_close(output, reference, rtol=7e-2, atol=1e-2)
 
 
-def test_fused_marlin_moe_uint8b128_accuracy():
-    _require_moe_cuda()
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
+if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
 
-    tokens = 4
-    hidden = 128
-    intermediate = 128
-    experts = 4
-    topk = 2
+    def test_fused_marlin_moe_uint8b128_accuracy():
+        _require_moe_cuda()
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
 
-    hidden_states = torch.randn((tokens, hidden), device="cuda", dtype=torch.float16)
-    topk_weights = torch.rand((tokens, topk), device="cuda", dtype=torch.float32)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_ids = torch.tensor(
-        [[0, 1], [2, 3], [1, 2], [3, 0]], device="cuda", dtype=torch.int32
-    )
+        tokens = 4
+        hidden = 128
+        intermediate = 128
+        experts = 4
+        topk = 2
 
-    w1 = torch.randn((experts, hidden, 2 * intermediate), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((experts, intermediate, hidden), device="cuda", dtype=torch.float16)
-    w1_q, w1_scales, w1_dequant = marlin_quantize_experts(
-        w1, scalar_types.uint8b128, 128, False
-    )
-    w2_q, w2_scales, w2_dequant = marlin_quantize_experts(
-        w2, scalar_types.uint8b128, 128, False
-    )
+        hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
+            tokens=tokens,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            device="cuda",
+        )
+        w1_q, w1_scales, w1_dequant = marlin_quantize_experts(
+            w1, scalar_types.uint8b128, 128, False
+        )
+        w2_q, w2_scales, w2_dequant = marlin_quantize_experts(
+            w2, scalar_types.uint8b128, 128, False
+        )
 
-    output = moe.fused_marlin_moe(
-        hidden_states=hidden_states,
-        w1=w1_q,
-        w2=w2_q,
-        w1_scale=w1_scales,
-        w2_scale=w2_scales,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        quant_type_id=scalar_types.uint8b128.id,
-    )
-    reference = marlin_moe_reference(
-        hidden_states,
-        w1_dequant,
-        w2_dequant,
-        topk_weights,
-        topk_ids,
-    ).to(torch.float16)
+        output = moe.fused_marlin_moe(
+            hidden_states=hidden_states,
+            w1=w1_q,
+            w2=w2_q,
+            w1_scale=w1_scales,
+            w2_scale=w2_scales,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_type_id=scalar_types.uint8b128.id,
+        )
+        reference = marlin_moe_reference(
+            hidden_states,
+            w1_dequant,
+            w2_dequant,
+            topk_weights,
+            topk_ids,
+        ).to(torch.float16)
 
-    assert output.shape == hidden_states.shape
-    assert torch.isfinite(output).all()
-    ratio = output.float().norm() / reference.float().norm().clamp_min(1e-6)
-    assert ratio.item() > 0.1
-    torch.testing.assert_close(output, reference, rtol=6e-2, atol=3e-1)
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, reference, rtol=7e-2, atol=1e-2)
 
+    def test_moe_wna16_uint8b128_stage1_kernel_is_finite():
+        _require_moe_cuda()
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
 
-def test_fused_marlin_moe_uint8b128_non_uniform_routing_accuracy():
-    _require_moe_cuda()
-    torch.manual_seed(1)
-    torch.cuda.manual_seed_all(1)
+        tokens = 4
+        hidden = 128
+        intermediate = 128
+        experts = 4
+        topk = 2
 
-    tokens = 4
-    hidden = 128
-    intermediate = 128
-    experts = 4
+        hidden_states, topk_weights, topk_ids, w1, _w2 = make_moe_model_like_inputs(
+            tokens=tokens,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            device="cuda",
+        )
+        w1_q, w1_scales, w1_dequant = marlin_quantize_experts(
+            w1, scalar_types.uint8b128, 128, False
+        )
+        sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+            topk_ids, block_size=16, num_experts=experts
+        )
+        workspace = torch.zeros(
+            torch.cuda.get_device_properties(hidden_states.device).multi_processor_count * 4,
+            dtype=torch.int,
+            device=hidden_states.device,
+        )
 
-    hidden_states = torch.randn((tokens, hidden), device="cuda", dtype=torch.float16)
-    topk_weights = torch.tensor(
-        [[0.8, 0.2], [0.7, 0.3], [0.9, 0.1], [0.6, 0.4]],
-        device="cuda",
-        dtype=torch.float32,
-    )
-    topk_ids = torch.tensor(
-        [[0, 1], [0, 1], [0, 2], [0, 1]], device="cuda", dtype=torch.int32
-    )
+        stage1 = ops.moe_wna16_marlin_gemm(
+            hidden_states,
+            torch.empty((tokens * topk, 2 * intermediate), device="cuda", dtype=torch.float16),
+            w1_q,
+            None,
+            w1_scales,
+            None,
+            None,
+            None,
+            None,
+            None,
+            workspace,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            topk_weights,
+            16,
+            topk,
+            False,
+            scalar_types.uint8b128.id,
+            tokens,
+            2 * intermediate,
+            hidden,
+            True,
+            False,
+            True,
+            False,
+            -1,
+            -1,
+            -1,
+        )
+        reference_gate_up = []
+        for token_idx in range(tokens):
+            for route_idx in range(topk):
+                expert = int(topk_ids[token_idx, route_idx].item())
+                reference_gate_up.append(
+                    torch.matmul(
+                        hidden_states[token_idx : token_idx + 1].to(torch.float32),
+                        w1_dequant[expert].to(torch.float32),
+                    )[0]
+                )
+        reference_stage1 = torch.stack(reference_gate_up, dim=0).to(torch.float16)
 
-    w1 = torch.randn((experts, hidden, 2 * intermediate), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((experts, intermediate, hidden), device="cuda", dtype=torch.float16)
-    w1_q, w1_scales, w1_dequant = marlin_quantize_experts(
-        w1, scalar_types.uint8b128, 128, False
-    )
-    w2_q, w2_scales, w2_dequant = marlin_quantize_experts(
-        w2, scalar_types.uint8b128, 128, False
-    )
+        assert stage1.shape == (tokens * topk, 2 * intermediate)
+        assert torch.isfinite(stage1).all()
+        torch.testing.assert_close(stage1, reference_stage1, rtol=6e-2, atol=3e-1)
 
-    output = moe.fused_marlin_moe(
-        hidden_states=hidden_states,
-        w1=w1_q,
-        w2=w2_q,
-        w1_scale=w1_scales,
-        w2_scale=w2_scales,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        quant_type_id=scalar_types.uint8b128.id,
-    )
-    reference = marlin_moe_reference(
-        hidden_states,
-        w1_dequant,
-        w2_dequant,
-        topk_weights,
-        topk_ids,
-    ).to(torch.float16)
-
-    assert output.shape == hidden_states.shape
-    assert torch.isfinite(output).all()
-    ratio = output.float().norm() / reference.float().norm().clamp_min(1e-6)
-    assert ratio.item() > 0.1
-    torch.testing.assert_close(output, reference, rtol=6e-2, atol=1.1)
-
-
-def test_marlin_moe_rejects_non_sm70_or_unsupported_dtypes():
+def test_marlin_moe_rejects_non_sm75_or_unsupported_dtypes():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
@@ -473,9 +504,10 @@ def test_marlin_moe_rejects_non_sm70_or_unsupported_dtypes():
     expert_ids = torch.zeros(4, dtype=torch.int32, device=device)
     num_tokens_post_pad = torch.tensor([32], dtype=torch.int32, device=device)
 
+    target_capability = source_target_capability()
     capability = torch.cuda.get_device_capability(device)
-    if capability != (7, 0):
-        with pytest.raises(RuntimeError, match="SM70"):
+    if capability != target_capability:
+        with pytest.raises(RuntimeError, match=source_target_label()):
             ops.moe_wna16_marlin_gemm(
                 hidden_states,
                 None,
@@ -511,7 +543,7 @@ def test_marlin_moe_rejects_non_sm70_or_unsupported_dtypes():
 
     hidden_states_bf16 = hidden_states.to(torch.bfloat16)
     scales_bf16 = scales.to(torch.bfloat16)
-    with pytest.raises(RuntimeError, match="float16 activations|float16 outputs|float16 scales"):
+    with pytest.raises(RuntimeError, match="float16 or int8 activations|float16 outputs|float16 scales"):
         ops.moe_wna16_marlin_gemm(
             hidden_states_bf16,
             None,

@@ -53,13 +53,6 @@ def fused_marlin_moe(
 ) -> torch.Tensor:
     m, k = hidden_states.shape
     topk = topk_ids.shape[1]
-    intermediate_size = w1_scale.shape[2]
-    n = intermediate_size // 2
-    output_size = w2_scale.shape[2]
-    if intermediate_size % 2 != 0:
-        raise ValueError(
-            f"Expected first-layer MoE scale width to be even, got {intermediate_size}."
-        )
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
     )
@@ -67,11 +60,10 @@ def fused_marlin_moe(
         sms = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
         workspace = torch.zeros(sms * 4, dtype=torch.int, device=hidden_states.device)
 
-    intermediate = torch.empty(
-        (m * topk, intermediate_size),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
+    # Local quantized expert helpers preserve the logical output width in the
+    # scale tensors, which is the most reliable source for the dense width here.
+    n = w2_scale.shape[-1]
+    intermediate = torch.empty((m * topk, 2 * n), dtype=hidden_states.dtype, device=hidden_states.device)
     intermediate = ops.moe_wna16_marlin_gemm(
         hidden_states,
         intermediate,
@@ -93,7 +85,7 @@ def fused_marlin_moe(
         False,
         quant_type_id,
         m,
-        intermediate_size,
+        2 * n,
         k,
         is_k_full,
         False,
@@ -103,11 +95,9 @@ def fused_marlin_moe(
         -1,
         -1,
     )
-    gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
+    gate, up = intermediate.view(m * topk, 2 * n).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
-    output = torch.empty(
-        (m * topk, output_size), dtype=hidden_states.dtype, device=hidden_states.device
-    )
+    output = torch.empty((m * topk, k), dtype=hidden_states.dtype, device=hidden_states.device)
     output = ops.moe_wna16_marlin_gemm(
         activated,
         output,
@@ -129,7 +119,7 @@ def fused_marlin_moe(
         True,
         quant_type_id,
         m * topk,
-        output_size,
+        k,
         n,
         is_k_full,
         False,
@@ -139,4 +129,4 @@ def fused_marlin_moe(
         -1,
         -1,
     )
-    return output.view(m, topk, output_size).sum(dim=1)
+    return output.view(m, topk, k).sum(dim=1)

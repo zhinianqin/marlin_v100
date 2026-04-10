@@ -1,0 +1,40 @@
++ ./.venv/bin/python benchmarks/benchmark_marlin_moe.py --preset full --check
+
+==========================================
+Marlin MoE Benchmark (2026-04-10 17:11:58)
+==========================================
+device=NVIDIA GeForce RTX 2080 Ti
+capability=sm75 (7.5)
+build_target=SM75 (7.5)
+preset=full
+cases=['smoke', 'medium', 'large']
+tokens=[4, 16, 64, 128]
+quant_types=['uint4b8', 'uint8b128']
+warmup_iters=10, iters=50, check=True
+
+case   | quant     | tokens | experts | hidden | intermediate | marlin_us | status | all_finite | check_pass | max_abs_err | error
+-------+-----------+--------+---------+--------+--------------+-----------+--------+------------+------------+-------------+------
+smoke  | uint4b8   | 4      | 4       | 128    | 128          | 161.87    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint8b128 | 4      | 4       | 128    | 128          | 168.27    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint4b8   | 16     | 4       | 128    | 128          | 161.78    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint8b128 | 16     | 4       | 128    | 128          | 168.24    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint4b8   | 64     | 4       | 128    | 128          | 159.74    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint8b128 | 64     | 4       | 128    | 128          | 169.10    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint4b8   | 128    | 4       | 128    | 128          | 160.22    | ok     | yes        | yes        | 0.00        |      
+smoke  | uint8b128 | 128    | 4       | 128    | 128          | 170.86    | ok     | yes        | yes        | 0.00        |      
+medium | uint4b8   | 4      | 8       | 512    | 512          | 176.67    | ok     | yes        | yes        | 0.00        |      
+medium | uint8b128 | 4      | 8       | 512    | 512          | 184.18    | ok     | yes        | yes        | 0.00        |      
+medium | uint4b8   | 16     | 8       | 512    | 512          | 177.46    | ok     | yes        | yes        | 0.00        |      
+medium | uint8b128 | 16     | 8       | 512    | 512          | 184.30    | ok     | yes        | yes        | 0.00        |      
+medium | uint4b8   | 64     | 8       | 512    | 512          | 176.86    | ok     | yes        | yes        | 0.00        |      
+medium | uint8b128 | 64     | 8       | 512    | 512          | 184.78    | ok     | yes        | yes        | 0.00        |      
+medium | uint4b8   | 128    | 8       | 512    | 512          | 176.61    | ok     | yes        | yes        | 0.00        |      
+medium | uint8b128 | 128    | 8       | 512    | 512          | 184.74    | ok     | yes        | yes        | 0.00        |      
+large  | uint4b8   | 4      | 8       | 1024   | 1024         | 177.86    | ok     | yes        | yes        | 0.00        |      
+large  | uint8b128 | 4      | 8       | 1024   | 1024         | 184.45    | ok     | yes        | yes        | 0.00        |      
+large  | uint4b8   | 16     | 8       | 1024   | 1024         | 178.53    | ok     | yes        | yes        | 0.00        |      
+large  | uint8b128 | 16     | 8       | 1024   | 1024         | 186.48    | ok     | yes        | yes        | 0.00        |      
+large  | uint4b8   | 64     | 8       | 1024   | 1024         | 178.19    | ok     | yes        | yes        | 0.00        |      
+large  | uint8b128 | 64     | 8       | 1024   | 1024         | 190.19    | ok     | yes        | yes        | 0.00        |      
+large  | uint4b8   | 128    | 8       | 1024   | 1024         | 183.65    | ok     | yes        | yes        | 0.01        |      
+large  | uint8b128 | 128    | 8       | 1024   | 1024         | 195.58    | ok     | yes        | yes        | 0.01        |      
