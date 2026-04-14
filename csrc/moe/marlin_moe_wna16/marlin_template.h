@@ -36,7 +36,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
@@ -469,7 +469,7 @@ __global__ void Marlin(
         }
       }
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
 
       if constexpr (moe_block_size >= 16)
         local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
