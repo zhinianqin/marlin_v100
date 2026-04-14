@@ -69,7 +69,7 @@ if (NOT marlin_generation_result EQUAL 0)
   message(FATAL_ERROR "marlin_v100 dense kernel generation failed")
 endif()
 
-file(GLOB MARLIN_TEMPLATE_SM70_KERNEL_SRC "csrc/quantization/marlin/sm75_kernel_*.cu")
+file(GLOB MARLIN_TEMPLATE_SM70_KERNEL_SRC "csrc/quantization/marlin/sm70_kernel_*.cu")
 set_gencode_flags_for_srcs(
   SRCS "${MARLIN_TEMPLATE_SM70_KERNEL_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
@@ -116,7 +116,7 @@ if (NOT moe_marlin_generation_result EQUAL 0)
   message(FATAL_ERROR "marlin_v100 moe kernel generation failed")
 endif()
 
-file(GLOB MARLIN_MOE_SM70_SRC "csrc/moe/marlin_moe_wna16/sm75_kernel_*.cu")
+file(GLOB MARLIN_MOE_SM70_SRC "csrc/moe/marlin_moe_wna16/sm70_kernel_*.cu")
 set_gencode_flags_for_srcs(
   SRCS "${MARLIN_MOE_SM70_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
