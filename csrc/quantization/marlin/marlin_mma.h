@@ -17,9 +17,14 @@ __device__ inline void mma(
   }
 
   if constexpr (k_size == 16) {
+    static_assert(std::is_same<scalar_t, half>::value,
+                  "SM70 inline PTX mma currently supports fp16 inputs only.");
+    static_assert(!use_fp16_accum,
+                  "SM70 inline PTX mma currently supports fp32 accumulation only.");
+
     if constexpr (std::is_same<scalar_t, half>::value && !use_fp16_accum) {
       float* c = reinterpret_cast<float*>(&frag_c);
-      asm volatile(
+      /*asm volatile(
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
           "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
           : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
@@ -30,8 +35,9 @@ __device__ inline void mma(
           "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
           : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
           : "r"(a[2]), "r"(a[3]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]),
-            "f"(c[3]));
-    } else if constexpr (std::is_same<scalar_t, half>::value &&
+            "f"(c[3]));*/
+
+    } /*else if constexpr (std::is_same<scalar_t, half>::value &&
                          use_fp16_accum) {
       uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
       asm volatile(
@@ -52,8 +58,8 @@ __device__ inline void mma(
           : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
           : "r"(a[idx * 2]), "r"(a[idx * 2 + 1]), "r"(b[idx]), "r"(c[0]),
             "r"(c[1]), "r"(c[2]), "r"(c[3]));
-    }
-  } else if (k_size == 32) {
+    }*/
+  } /*else if (k_size == 32) {
     if constexpr (std::is_same<scalar_t, int8_t>::value) {
       int32_t* c = reinterpret_cast<int32_t*>(&frag_c);
       asm volatile(
@@ -77,7 +83,7 @@ __device__ inline void mma(
           : "=r"(c[2]), "=r"(c[3])
           : "r"(a[3]), "r"(b[1]), "r"(c[2]), "r"(c[3]));
     }
-  }
+  }*/
 }
 
 template <vllm::ScalarTypeId type_id, bool use_fp16_accum, int k_size = 16>
@@ -96,9 +102,13 @@ __device__ inline void mma_trans(
   }
 
   if constexpr (k_size == 16) {
+    static_assert(std::is_same<scalar_t, half>::value,
+                  "SM70 inline PTX mma currently supports fp16 inputs only.");
+    static_assert(!use_fp16_accum,
+                  "SM70 inline PTX mma currently supports fp32 accumulation only.");
     if constexpr (std::is_same<scalar_t, half>::value && !use_fp16_accum) {
       float* c = reinterpret_cast<float*>(&frag_c);
-      asm volatile(
+      /*asm volatile(
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
           "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
           : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
@@ -109,8 +119,9 @@ __device__ inline void mma_trans(
           "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
           : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
           : "r"(b[1]), "r"(b2[1]), "r"(a[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]),
-            "f"(c[3]));
-    } else if constexpr (std::is_same<scalar_t, half>::value &&
+            "f"(c[3]));*/
+
+    } /*else if constexpr (std::is_same<scalar_t, half>::value &&
                          use_fp16_accum) {
       uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
       asm volatile(
@@ -131,8 +142,8 @@ __device__ inline void mma_trans(
           : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
           : "r"(b[0]), "r"(b2[0]), "r"(a[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]),
             "r"(c[3]));
-    }
-  } else {
+    }*/
+  } /*else {
     if constexpr (std::is_same<scalar_t, int8_t>::value) {
       int32_t* c = reinterpret_cast<int32_t*>(&frag_c);
       asm volatile(
@@ -156,7 +167,7 @@ __device__ inline void mma_trans(
           : "=r"(c[2]), "=r"(c[3])
           : "r"(b2[1]), "r"(a[1]), "r"(c[2]), "r"(c[3]));
     }
-  }
+  }*/
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME
