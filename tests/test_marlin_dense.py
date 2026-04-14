@@ -4,21 +4,41 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from marlin_v100.calibration import (
+    source_target_capability,
+    source_target_label,
+    supported_dense_quant_type_names,
+)
 from marlin_v100 import ops
 from tests.helpers import (
+    marlin_dense_reference,
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
     marlin_quantize,
     scalar_types,
 )
 
+_DENSE_SUPPORTED_QUANT_NAMES = frozenset(
+    supported_dense_quant_type_names(("uint4b8", "uint8b128"))
+)
+_GROUP_SIZES = (-1, 32, 64, 128)
+_FLOAT16_ACTIVATION_ERROR = (
+    rf"{source_target_label()} build only supports float16 activations\."
+)
+_FLOAT16_DTYPE_ERROR = (
+    rf"{source_target_label()} build only supports float16 activations\."
+    rf"|{source_target_label()} build only supports float16 outputs\."
+    rf"|{source_target_label()} build only supports float16 scales\."
+)
+
 
 def _require_marlin_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
+    target_capability = source_target_capability()
     capability = torch.cuda.get_device_capability()
-    if capability[0] < 7 or (capability[0] == 7 and capability[1] < 5):
-        pytest.skip("Marlin requires SM75 or newer")
+    if capability != target_capability:
+        pytest.skip(f"Marlin requires {source_target_label()} for this source tree")
     try:
         ops._load_dense()
     except Exception as exc:  # pragma: no cover - depends on local build state
@@ -85,3 +105,408 @@ def test_marlin_dense_smoke_local_helpers():
     )
     assert output.shape == (a.shape[0], w.shape[1])
     assert torch.isfinite(output).all()
+
+
+def _run_dense_accuracy_case(
+    quant_type,
+    *,
+    group_size: int,
+    act_order: bool,
+    is_k_full: bool,
+    rtol: float,
+    atol: float,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+) -> None:
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+        w, quant_type, group_size, act_order
+    )
+    output = ops.marlin_gemm(
+        a,
+        None,
+        q_w,
+        None,
+        scales,
+        None,
+        None,
+        marlin_make_empty_g_idx(a.device),
+        g_idx,
+        sort_indices,
+        marlin_make_workspace_new(a.device),
+        quant_type.id,
+        a.shape[0],
+        w.shape[1],
+        w.shape[0],
+        is_k_full,
+        False,
+        True,
+        False,
+    )
+    reference = marlin_dense_reference(
+        a,
+        q_w,
+        scales,
+        size_k=w.shape[0],
+        size_n=w.shape[1],
+        group_size=group_size,
+        quant_type=quant_type,
+        perm=sort_indices,
+    ).to(torch.float16)
+
+    assert torch.isfinite(output).all()
+    assert not torch.all(output == 0)
+    assert output.float().std().item() > 0
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+def test_marlin_dense_uint4b8_accuracy(group_size: int):
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=group_size,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+    )
+
+
+@pytest.mark.parametrize("is_k_full", (True, False))
+def test_marlin_dense_uint4b8_act_order_accuracy(is_k_full: bool):
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=64,
+        act_order=True,
+        is_k_full=is_k_full,
+        rtol=5e-2,
+        atol=2.5e-1,
+    )
+
+
+def test_marlin_dense_uint4b8_8_row_bucket_matches_reference():
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=128,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=256,
+    )
+
+
+@pytest.mark.parametrize("group_size", (-1, 128))
+def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
+    group_size: int,
+):
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=group_size,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=128,
+        size_n=128,
+    )
+
+
+def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference():
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=64,
+        act_order=True,
+        is_k_full=False,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=128,
+        size_n=128,
+    )
+
+
+def test_marlin_dense_uint4b8_size_m_24_uses_32_row_bucket_matches_reference():
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=128,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=24,
+        size_k=256,
+        size_n=256,
+    )
+
+
+if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
+
+    @pytest.mark.parametrize("group_size", _GROUP_SIZES)
+    def test_marlin_dense_uint8b128_accuracy(group_size: int):
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            rtol=4e-2,
+            atol=2e-1,
+        )
+
+    @pytest.mark.parametrize("is_k_full", (True, False))
+    def test_marlin_dense_uint8b128_act_order_accuracy(is_k_full: bool):
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            group_size=64,
+            act_order=True,
+            is_k_full=is_k_full,
+            rtol=4e-2,
+            atol=2e-1,
+        )
+
+    def test_marlin_dense_uint8b128_act_order_single_group_small_k_matches_reference():
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            group_size=128,
+            act_order=True,
+            is_k_full=False,
+            rtol=4e-2,
+            atol=2e-1,
+            size_m=1,
+            size_k=128,
+            size_n=256,
+        )
+
+    def test_marlin_dense_uint8b128_8_row_bucket_matches_reference():
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            group_size=128,
+            act_order=False,
+            is_k_full=True,
+            rtol=4e-2,
+            atol=2e-1,
+            size_m=8,
+            size_k=256,
+            size_n=256,
+        )
+
+    @pytest.mark.parametrize("group_size", (-1, 128))
+    def test_marlin_dense_uint8b128_sm70_scale_zp_math_consistency_matches_reference(
+        group_size: int,
+    ):
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            rtol=4e-2,
+            atol=2e-1,
+            size_m=8,
+            size_k=128,
+            size_n=128,
+        )
+
+
+def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
+    try:
+        ops._load_dense()
+    except Exception as exc:  # pragma: no cover - depends on local build state
+        pytest.skip(f"marlin dense extension is not available: {exc}")
+
+    device = torch.device("cuda")
+    a = torch.randn((16, 256), device=device, dtype=torch.float16)
+    w = torch.randn((256, 256), device=device, dtype=torch.float16)
+    _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+        w, scalar_types.uint4b8, 128, False
+    )
+    workspace = marlin_make_workspace_new(device)
+
+    target_capability = source_target_capability()
+    capability = torch.cuda.get_device_capability(device)
+    if capability != target_capability:
+        with pytest.raises(RuntimeError, match=source_target_label()):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                None,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.uint4b8.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+        return
+
+    a_bf16 = a.to(torch.bfloat16)
+    with pytest.raises(RuntimeError, match=_FLOAT16_ACTIVATION_ERROR):
+        ops.marlin_gemm(
+            a_bf16,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.uint4b8.id,
+            a_bf16.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            False,
+        )
+
+
+if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
+
+    def test_marlin_dense_uint8b128_rejects_unsupported_dtypes():
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+
+        try:
+            ops._load_dense()
+        except Exception as exc:  # pragma: no cover - depends on local build state
+            pytest.skip(f"marlin dense extension is not available: {exc}")
+
+        device = torch.device("cuda")
+        a = torch.randn((16, 256), device=device, dtype=torch.float16)
+        w = torch.randn((256, 256), device=device, dtype=torch.float16)
+        _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+            w, scalar_types.uint8b128, 128, False
+        )
+        workspace = marlin_make_workspace_new(device)
+
+        target_capability = source_target_capability()
+        capability = torch.cuda.get_device_capability(device)
+        if capability != target_capability:
+            with pytest.raises(RuntimeError, match=source_target_label()):
+                ops.marlin_gemm(
+                    a,
+                    None,
+                    q_w,
+                    None,
+                    scales,
+                    None,
+                    None,
+                    None,
+                    g_idx,
+                    sort_indices,
+                    workspace,
+                    scalar_types.uint8b128.id,
+                    a.shape[0],
+                    w.shape[1],
+                    w.shape[0],
+                    True,
+                    False,
+                    True,
+                    False,
+                )
+            return
+
+        a_bf16 = a.to(torch.bfloat16)
+        with pytest.raises(RuntimeError, match=_FLOAT16_ACTIVATION_ERROR):
+            ops.marlin_gemm(
+                a_bf16,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                None,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.uint8b128.id,
+                a_bf16.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        a_bf16 = a.to(torch.bfloat16)
+        scales_bf16 = scales.to(torch.bfloat16)
+        with pytest.raises(
+            RuntimeError,
+            match=_FLOAT16_DTYPE_ERROR,
+        ):
+            ops.marlin_gemm(
+                a_bf16,
+                None,
+                q_w,
+                None,
+                scales_bf16,
+                None,
+                None,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.uint8b128.id,
+                a_bf16.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        a_bf16 = a.to(torch.bfloat16)
+        scales_bf16 = scales.to(torch.bfloat16)
+        with pytest.raises(
+            RuntimeError,
+            match=_FLOAT16_DTYPE_ERROR,
+        ):
+            ops.marlin_gemm(
+                a_bf16,
+                None,
+                q_w,
+                None,
+                scales_bf16,
+                None,
+                None,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.uint4b8.id,
+                a_bf16.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )

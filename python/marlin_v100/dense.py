@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from . import ops
+from .calibration import validate_dense_marlin_call
 
 
 def get_scale_perms() -> tuple[list[int], list[int]]:
@@ -67,6 +68,14 @@ def run_marlin_gemm(
 ) -> torch.Tensor:
     if workspace is None:
         workspace = marlin_make_workspace(a.device)
+    validate_dense_marlin_call(
+        b_type_id=b_type_id,
+        size_k=size_k,
+        num_groups=int(b_scales.size(0)),
+        g_idx=g_idx,
+        perm=perm,
+        is_k_full=is_k_full,
+    )
 
     return ops.marlin_gemm(
         a,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from . import ops
+from .calibration import validate_moe_marlin_call
 
 
 def moe_align_block_size(
@@ -53,13 +54,32 @@ def fused_marlin_moe(
 ) -> torch.Tensor:
     m, k = hidden_states.shape
     topk = topk_ids.shape[1]
+    validate_moe_marlin_call(
+        b_type_id=quant_type_id,
+        size_k=k,
+        num_groups=int(w1_scale.size(1)),
+        g_idx=g_idx1,
+        perm=sort_indices1,
+        is_k_full=is_k_full,
+    )
+    validate_moe_marlin_call(
+        b_type_id=quant_type_id,
+        size_k=int(w2.shape[1] * 16),
+        num_groups=int(w2_scale.size(1)),
+        g_idx=g_idx2,
+        perm=sort_indices2,
+        is_k_full=is_k_full,
+    )
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
     )
     if workspace is None:
-        workspace = torch.zeros(1, dtype=torch.int, device=hidden_states.device)
+        sms = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
+        workspace = torch.zeros(sms * 4, dtype=torch.int, device=hidden_states.device)
 
-    n = w2.shape[2] * 16
+    # Local quantized expert helpers preserve the logical output width in the
+    # scale tensors, which is the most reliable source for the dense width here.
+    n = w2_scale.shape[-1]
     intermediate = torch.empty((m * topk, 2 * n), dtype=hidden_states.dtype, device=hidden_states.device)
     intermediate = ops.moe_wna16_marlin_gemm(
         hidden_states,

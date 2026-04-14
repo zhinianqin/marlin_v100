@@ -23,6 +23,7 @@ def _load_moe() -> None:
 
 
 def marlin_gemm(*args, **kwargs) -> torch.Tensor:
+    """Low-level dense binding without Python-side support-matrix validation."""
     _load_dense()
     return torch.ops._C.marlin_gemm(*args, **kwargs)
 
@@ -68,5 +69,6 @@ def batched_moe_align_block_size(*args, **kwargs) -> None:
 
 
 def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
+    """Low-level MoE binding without Python-side support-matrix validation."""
     _load_moe()
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)
