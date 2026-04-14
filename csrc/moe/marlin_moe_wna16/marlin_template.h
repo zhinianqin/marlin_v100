@@ -91,6 +91,8 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+
+  // 以下代码中注释部分是sm75的正确实现，ld.shared 调用是占位和约束使用的
   if constexpr (count == 4) {
     /*asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
