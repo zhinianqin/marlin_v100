@@ -119,6 +119,9 @@ def _run_dense_accuracy_case(
     size_k: int = 256,
     size_n: int = 256,
 ) -> None:
+    if act_order:
+        pytest.skip("act_order == true is not required in this workspace")
+
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)

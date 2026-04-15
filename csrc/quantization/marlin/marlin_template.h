@@ -83,33 +83,41 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  constexpr uint32_t kFullWarpMask = 0xffffffffu;
+  int lane = threadIdx.x & 31;
+  int lane_group = lane >> 2;
+  uint32_t word_byte_offset =
+      static_cast<uint32_t>((lane & 0x3) * sizeof(uint32_t));
 
-  // 以下代码中注释部分是sm75的正确实现，ld.shared 调用是占位和约束使用的
+  a[0] = 0;
+  a[1] = 0;
+  a[2] = 0;
+  a[3] = 0;
+
   if constexpr (count == 4) {
-    /*asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "r"(smem));*/
-    asm volatile(
-        "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-        : "r"(smem));
+    uint32_t smem0 = __shfl_sync(kFullWarpMask, smem, lane_group) +
+                     word_byte_offset;
+    uint32_t smem1 = __shfl_sync(kFullWarpMask, smem, 8 + lane_group) +
+                     word_byte_offset;
+    uint32_t smem2 = __shfl_sync(kFullWarpMask, smem, 16 + lane_group) +
+                     word_byte_offset;
+    uint32_t smem3 = __shfl_sync(kFullWarpMask, smem, 24 + lane_group) +
+                     word_byte_offset;
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[0]) : "r"(smem0));
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[1]) : "r"(smem1));
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[2]) : "r"(smem2));
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[3]) : "r"(smem3));
   } else if constexpr (count == 2) {
-    /*asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                 : "=r"(a[0]), "=r"(a[1])
-                 : "r"(smem));*/
-    asm volatile(
-            "ld.shared.v2.u32 {%0, %1}, [%2];\n"
-            : "=r"(a[0]), "=r"(a[1])
-            : "r"(smem));
+    uint32_t smem0 = __shfl_sync(kFullWarpMask, smem, lane_group) +
+                     word_byte_offset;
+    uint32_t smem1 = __shfl_sync(kFullWarpMask, smem, 8 + lane_group) +
+                     word_byte_offset;
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[0]) : "r"(smem0));
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[1]) : "r"(smem1));
   } else if constexpr (count == 1) {
-    /*asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n"
-                 : "=r"(a[0])
-                 : "r"(smem));*/
-    asm volatile(
-            "ld.shared.u32 %0, [%1];\n"
-            : "=r"(a[0])
-            : "r"(smem));
+    uint32_t smem0 = __shfl_sync(kFullWarpMask, smem, lane_group) +
+                     word_byte_offset;
+    asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(a[0]) : "r"(smem0));
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
