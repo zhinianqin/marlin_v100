@@ -31,6 +31,7 @@ class ArchitectureSupport:
     allow_fp8_kernels: bool
     allow_nvfp4_global_scale: bool
     allow_mxfp4: bool
+    allow_act_order: bool = False
 
 
 QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
@@ -66,10 +67,12 @@ _ARCHITECTURE_SUPPORT: dict[tuple[int, int], ArchitectureSupport] = {
         allow_fp8_kernels=False,
         allow_nvfp4_global_scale=False,
         allow_mxfp4=False,
+        allow_act_order=False,
     ),
 }
 
 _ACT_ORDER_SUPPORTED_QUANT_NAMES = ("uint4b8", "uint8b128")
+_ACT_ORDER_UNSUPPORTED_ERROR = "act_order is not supported for this SM70 Marlin build."
 
 
 def _encode_scalar_type_id(
@@ -139,6 +142,7 @@ def architecture_support(
             allow_fp8_kernels=False,
             allow_nvfp4_global_scale=False,
             allow_mxfp4=False,
+            allow_act_order=False,
         ),
     )
 
@@ -206,6 +210,8 @@ def supported_act_order_quant_type_names(
     candidates: Iterable[str] | Mapping[str, object],
     target_capability: tuple[int, int] | None = None,
 ) -> tuple[str, ...]:
+    if not architecture_support(target_capability).allow_act_order:
+        return ()
     dense_supported = set(supported_dense_quant_type_names(candidates, target_capability))
     moe_supported = set(supported_moe_quant_type_names(candidates, target_capability))
     return tuple(
@@ -246,6 +252,8 @@ def resolve_dense_runtime_group_size(
     target_capability: tuple[int, int] | None = None,
 ) -> int:
     validate_dense_group_size(group_size, target_capability)
+    if act_order and not architecture_support(target_capability).allow_act_order:
+        raise ValueError(_ACT_ORDER_UNSUPPORTED_ERROR)
     if act_order and not is_k_full:
         return 0
     return group_size

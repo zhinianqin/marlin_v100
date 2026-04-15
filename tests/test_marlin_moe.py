@@ -373,7 +373,7 @@ def _run_fused_moe_accuracy_case(
     moe_block_size: int = 16,
 ) -> None:
     if act_order:
-        pytest.skip("act_order == true is not required in this workspace")
+        raise AssertionError("act_order accuracy coverage was replaced by explicit rejection tests")
     if moe_block_size != 8 and moe_block_size % 16 != 0:
         pytest.skip("current SM70 MoE kernel only supports block size 8 or multiples of 16")
 
@@ -415,6 +415,75 @@ def _run_fused_moe_accuracy_case(
     assert output.shape == inputs["hidden_states"].shape
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output, reference, rtol=7e-2, atol=1e-2)
+
+
+def _assert_moe_backend_rejects_act_order(
+    quant_type,
+    *,
+    group_size: int,
+    is_k_full: bool,
+    tokens: int = 4,
+    moe_block_size: int = 16,
+) -> None:
+    if moe_block_size != 8 and moe_block_size % 16 != 0:
+        pytest.skip("current SM70 MoE kernel only supports block size 8 or multiples of 16")
+
+    _require_moe_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    inputs = _make_moe_accuracy_inputs(
+        quant_type,
+        group_size=group_size,
+        act_order=True,
+        tokens=tokens,
+    )
+    hidden_states = inputs["hidden_states"]
+    workspace = torch.zeros(
+        torch.cuda.get_device_properties(hidden_states.device).multi_processor_count * 4,
+        dtype=torch.int,
+        device=hidden_states.device,
+    )
+    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+        inputs["topk_ids"], block_size=moe_block_size, num_experts=inputs["experts"]
+    )
+
+    with pytest.raises(RuntimeError, match="act_order is not supported"):
+        ops.moe_wna16_marlin_gemm(
+            hidden_states,
+            torch.empty(
+                (inputs["tokens"] * inputs["topk"], 2 * inputs["intermediate"]),
+                device="cuda",
+                dtype=torch.float16,
+            ),
+            inputs["w1_q"],
+            None,
+            inputs["w1_scales"],
+            None,
+            None,
+            None,
+            inputs["w1_g_idx"],
+            inputs["w1_perm"],
+            workspace,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            inputs["topk_weights"],
+            moe_block_size,
+            inputs["topk"],
+            False,
+            quant_type.id,
+            inputs["tokens"],
+            2 * inputs["intermediate"],
+            hidden_states.shape[1],
+            is_k_full,
+            False,
+            True,
+            False,
+            -1,
+            -1,
+            -1,
+        )
 
 
 def test_fused_marlin_moe_uint4b8_topk_weight_fusion_order_matches_reference():
@@ -473,10 +542,9 @@ def test_fused_marlin_moe_uint4b8_accuracy(group_size: int):
 
 @pytest.mark.parametrize("is_k_full", (True, False))
 def test_fused_marlin_moe_uint4b8_act_order_accuracy(is_k_full: bool):
-    _run_fused_moe_accuracy_case(
+    _assert_moe_backend_rejects_act_order(
         scalar_types.uint4b8,
         group_size=64,
-        act_order=True,
         is_k_full=is_k_full,
         moe_block_size=16,
     )
@@ -534,7 +602,7 @@ def _run_stage1_kernel_case(
     moe_block_size: int = 16,
 ) -> None:
     if act_order:
-        pytest.skip("act_order == true is not required in this workspace")
+        raise AssertionError("act_order stage1 coverage was replaced by explicit rejection tests")
     if moe_block_size != 8 and moe_block_size % 16 != 0:
         pytest.skip("current SM70 MoE kernel only supports block size 8 or multiples of 16")
 
@@ -646,10 +714,9 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
 
     @pytest.mark.parametrize("is_k_full", (True, False))
     def test_fused_marlin_moe_uint8b128_act_order_accuracy(is_k_full: bool):
-        _run_fused_moe_accuracy_case(
+        _assert_moe_backend_rejects_act_order(
             scalar_types.uint8b128,
             group_size=64,
-            act_order=True,
             is_k_full=is_k_full,
             moe_block_size=16,
         )
@@ -685,19 +752,17 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
 
     @pytest.mark.parametrize("is_k_full", (True, False))
     def test_moe_wna16_uint8b128_stage1_act_order_kernel_is_finite(is_k_full: bool):
-        _run_stage1_kernel_case(
+        _assert_moe_backend_rejects_act_order(
             scalar_types.uint8b128,
             group_size=64,
-            act_order=True,
             is_k_full=is_k_full,
             moe_block_size=16,
         )
 
     def test_moe_wna16_uint8b128_stage1_single_group_act_order_matches_reference():
-        _run_stage1_kernel_case(
+        _assert_moe_backend_rejects_act_order(
             scalar_types.uint8b128,
             group_size=128,
-            act_order=True,
             is_k_full=False,
             moe_block_size=16,
         )

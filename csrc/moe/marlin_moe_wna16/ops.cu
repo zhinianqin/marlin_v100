@@ -726,6 +726,8 @@ torch::Tensor moe_wna16_marlin_gemm(
     a_tmp = torch::empty({0}, options);
   }
   bool has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
+  TORCH_CHECK(!has_act_order,
+              "act_order is not supported for this SM70 Marlin build.");
 
   if (has_act_order) {
     a_tmp = torch::empty({size_m * top_k, size_k}, options);

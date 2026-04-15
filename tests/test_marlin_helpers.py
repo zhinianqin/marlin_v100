@@ -7,9 +7,11 @@ torch = pytest.importorskip("torch")
 from marlin_v100 import dense, moe
 from marlin_v100.calibration import supported_dense_quant_type_names
 from tests.helpers import (
+    make_moe_model_like_inputs,
     marlin_dequantize,
     marlin_quantize,
     marlin_quantize_experts,
+    marlin_quantize_experts_with_metadata,
     scalar_types,
 )
 
@@ -144,6 +146,30 @@ def test_dense_wrapper_rejects_incomplete_act_order_metadata_before_loading_exte
         )
 
 
+def test_dense_wrapper_rejects_act_order_metadata_before_loading_extension():
+    a = torch.randn((4, 128), dtype=torch.float16)
+    weight = torch.randn((128, 256), dtype=torch.float16)
+    _, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
+        weight, scalar_types.uint4b8, 64, True
+    )
+    workspace = torch.zeros((1,), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="act_order is not supported"):
+        dense.run_marlin_gemm(
+            a,
+            q_weight,
+            scales,
+            scalar_types.uint4b8.id,
+            size_m=a.shape[0],
+            size_n=weight.shape[1],
+            size_k=weight.shape[0],
+            workspace=workspace,
+            g_idx=g_idx,
+            perm=sort_indices,
+            is_k_full=True,
+        )
+
+
 def test_moe_wrapper_rejects_incomplete_act_order_metadata_before_loading_extension():
     hidden_states = torch.randn((4, 128), dtype=torch.float16)
     w1 = torch.zeros((2, 8, 256), dtype=torch.int32)
@@ -166,4 +192,38 @@ def test_moe_wrapper_rejects_incomplete_act_order_metadata_before_loading_extens
             quant_type_id=scalar_types.uint4b8.id,
             g_idx1=g_idx,
             sort_indices1=None,
+        )
+
+
+def test_moe_wrapper_rejects_act_order_metadata_before_loading_extension():
+    hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
+        tokens=4,
+        hidden=128,
+        intermediate=128,
+        experts=2,
+        topk=2,
+        device="cpu",
+    )
+    w1_q, w1_scale, _w1_dequant, g_idx1, sort_indices1 = marlin_quantize_experts_with_metadata(
+        w1, scalar_types.uint4b8, 64, True
+    )
+    w2_q, w2_scale, _w2_dequant, _g_idx2, _sort_indices2 = marlin_quantize_experts_with_metadata(
+        w2, scalar_types.uint4b8, 64, False
+    )
+
+    with pytest.raises(ValueError, match="act_order is not supported"):
+        moe.fused_marlin_moe(
+            hidden_states=hidden_states,
+            w1=w1_q,
+            w2=w2_q,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_type_id=scalar_types.uint4b8.id,
+            g_idx1=g_idx1,
+            g_idx2=None,
+            sort_indices1=sort_indices1,
+            sort_indices2=None,
+            is_k_full=True,
         )

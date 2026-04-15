@@ -120,7 +120,7 @@ def _run_dense_accuracy_case(
     size_n: int = 256,
 ) -> None:
     if act_order:
-        pytest.skip("act_order == true is not required in this workspace")
+        raise AssertionError("act_order accuracy coverage was replaced by explicit rejection tests")
 
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -169,6 +169,47 @@ def _run_dense_accuracy_case(
     torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
 
 
+def _assert_dense_backend_rejects_act_order(
+    quant_type,
+    *,
+    group_size: int,
+    is_k_full: bool,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+) -> None:
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(w, quant_type, group_size, True)
+
+    with pytest.raises(RuntimeError, match="act_order is not supported"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            marlin_make_workspace_new(a.device),
+            quant_type.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            is_k_full,
+            False,
+            True,
+            False,
+        )
+
+
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 def test_marlin_dense_uint4b8_accuracy(group_size: int):
     _run_dense_accuracy_case(
@@ -183,13 +224,10 @@ def test_marlin_dense_uint4b8_accuracy(group_size: int):
 
 @pytest.mark.parametrize("is_k_full", (True, False))
 def test_marlin_dense_uint4b8_act_order_accuracy(is_k_full: bool):
-    _run_dense_accuracy_case(
+    _assert_dense_backend_rejects_act_order(
         scalar_types.uint4b8,
         group_size=64,
-        act_order=True,
         is_k_full=is_k_full,
-        rtol=5e-2,
-        atol=2.5e-1,
     )
 
 
@@ -225,13 +263,10 @@ def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
 
 
 def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference():
-    _run_dense_accuracy_case(
+    _assert_dense_backend_rejects_act_order(
         scalar_types.uint4b8,
         group_size=64,
-        act_order=True,
         is_k_full=False,
-        rtol=5e-2,
-        atol=2.5e-1,
         size_m=8,
         size_k=128,
         size_n=128,
@@ -267,23 +302,17 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
 
     @pytest.mark.parametrize("is_k_full", (True, False))
     def test_marlin_dense_uint8b128_act_order_accuracy(is_k_full: bool):
-        _run_dense_accuracy_case(
+        _assert_dense_backend_rejects_act_order(
             scalar_types.uint8b128,
             group_size=64,
-            act_order=True,
             is_k_full=is_k_full,
-            rtol=4e-2,
-            atol=2e-1,
         )
 
     def test_marlin_dense_uint8b128_act_order_single_group_small_k_matches_reference():
-        _run_dense_accuracy_case(
+        _assert_dense_backend_rejects_act_order(
             scalar_types.uint8b128,
             group_size=128,
-            act_order=True,
             is_k_full=False,
-            rtol=4e-2,
-            atol=2e-1,
             size_m=1,
             size_k=128,
             size_n=256,
