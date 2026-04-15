@@ -314,7 +314,7 @@ __global__ void Marlin(
   using c_scalar_t = typename MarlinScalarType<c_type_id>::scalar_t;
   using c_scalar_t2 = typename MarlinScalarType<c_type_id>::scalar_t2;
 
-  using FragA = typename MarlinScalarType<a_type_id>::FragA;
+  using Sm70FragA = detail::Sm70DirectAFragment<m_block_size_8 ? 1 : 2>;
   using FragB = typename MarlinScalarType<a_type_id>::FragB;
   using FragC = typename MarlinScalarType<a_type_id>::FragC;
   using FragS = typename MarlinScalarType<c_type_id>::FragS;
@@ -634,8 +634,6 @@ __global__ void Marlin(
   int a_gl_rd_delta_i = a_gl_stride * (threads / a_gl_rd_delta_o);
   // between shared memory writes
   constexpr int a_sh_wr_delta = a_sh_stride * (threads / a_gl_rd_delta_o);
-  // within a shared memory tile
-  constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
   // overall size of a tile
   constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
   // number of shared write iterations for a tile
@@ -680,12 +678,6 @@ __global__ void Marlin(
   // Shared write index of current thread.
   int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) +
                 (threadIdx.x % a_gl_rd_delta_o);
-  // Shared read index.
-  int a_sh_rd =
-      a_sh_stride * ((threadIdx.x % 32) % (16 / (m_block_size_8 ? 2 : 1))) +
-      (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
-  a_sh_rd += 2 * ((threadIdx.x / 32) / tb_n_warps) * b_sh_wr_iters;
-
   int b_gl_rd;
   if (threads <= b_sh_stride) {
     b_gl_rd = threadIdx.x;
@@ -781,6 +773,11 @@ __global__ void Marlin(
     int row = i / a_gl_rd_delta_o;
     return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
   };
+  constexpr int sm70_m_halves = m_block_size_8 ? 1 : 2;
+  int warp_id = threadIdx.x / 32;
+  int warp_row = warp_id / tb_n_warps;
+  int lane = threadIdx.x & 31;
+  int sm70_lane_row = detail::sm70_atom_rowcol(lane);
   // Since the computation of this remapping is non-trivial and, due to our main
   // loop unrolls, all shared memory accesses are static, we simply precompute
   // both transformed reads and writes.
@@ -788,12 +785,31 @@ __global__ void Marlin(
   #pragma unroll
   for (int i = 0; i < a_sh_wr_iters; i++)
     a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
-  int a_sh_rd_trans[b_sh_wr_iters][thread_m_blocks];
+  int a_sh_rd_direct_bytes[b_sh_wr_iters][thread_m_blocks][2][sm70_m_halves][2][2];
   #pragma unroll
   for (int i = 0; i < b_sh_wr_iters; i++) {
   #pragma unroll
-    for (int j = 0; j < thread_m_blocks; j++)
-      a_sh_rd_trans[i][j] = transform_a(2 * i + a_sh_rd_delta_i * j + a_sh_rd);
+    for (int j = 0; j < thread_m_blocks; j++) {
+    #pragma unroll
+      for (int k_block = 0; k_block < 2; ++k_block) {
+      #pragma unroll
+        for (int m_half = 0; m_half < sm70_m_halves; ++m_half) {
+          int row = 16 * j + 8 * m_half + sm70_lane_row;
+        #pragma unroll
+          for (int k_slice = 0; k_slice < 2; ++k_slice) {
+        #pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+              int col = 16 * (warp_row * b_sh_wr_iters + i) + 8 * k_block +
+                        4 * k_slice + 2 * pair;
+              int chunk = transform_a(row * a_sh_stride + col / 8);
+              a_sh_rd_direct_bytes[i][j][k_block][m_half][k_slice][pair] =
+                  chunk * sizeof(int4) +
+                  ((col & 0x7) / 2) * sizeof(uint32_t);
+            }
+          }
+        }
+      }
+    }
   }
 
   // Since B-accesses have non-constant stride they have to be computed at
@@ -824,7 +840,7 @@ __global__ void Marlin(
   int4* sh_a = sh_s + sh_s_size;
 
   // Register storage for double buffer of shared memory reads.
-  FragA frag_a[2][thread_m_blocks];
+  Sm70FragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2][b_thread_vecs];
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];
@@ -927,9 +943,11 @@ __global__ void Marlin(
   auto fetch_to_registers = [&](int k, int pipe) {
     int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
   #pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++)
-      ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
-          frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+    for (int i = 0; i < thread_m_blocks; i++) {
+      detail::load_sm70_direct_a<sm70_m_halves>(
+          frag_a[k % 2][i], sh_a_stage,
+          a_sh_rd_direct_bytes[k % b_sh_wr_iters][i]);
+    }
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 
   #pragma unroll
@@ -1164,11 +1182,11 @@ __global__ void Marlin(
         scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
       }
 
-  #pragma unroll
+      #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
         if constexpr (m_block_size_8) {
-          mma_trans<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0, frag_b1,
-                                               frag_c[i][j][0]);
+          mma_m8<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0, frag_b1,
+                                            frag_c[i][j][0]);
         } else {
           mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0,
                                          frag_c[i][j][0]);
