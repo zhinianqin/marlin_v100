@@ -42,6 +42,12 @@ __device__ __forceinline__ int sm70_atom_c_dst_n(int lane, int vid) {
   return (vid & 0x1) + 2 * ((lane >> 1) & 0x1) + 4 * ((vid >> 2) & 0x1);
 }
 
+template <int stride>
+__device__ __forceinline__ int sm70_transform_a_index(int idx) {
+  int row = idx / stride;
+  return stride * row + ((idx % stride) ^ (row % 8));
+}
+
 __device__ __forceinline__ void run_sm70_atom_packed(uint32_t a0, uint32_t a1,
                                                      uint32_t b0, uint32_t b1,
                                                      float* accum) {
@@ -104,37 +110,57 @@ __device__ __forceinline__ uint32_t load_sm70_shared_u32(const void* smem_ptr,
   return value;
 }
 
-template <int m_halves>
-__device__ __forceinline__ void load_sm70_direct_a(
-    Sm70DirectAFragment<m_halves>& frag_a, const void* smem_ptr,
-    const int byte_offsets[2][m_halves][2][2]) {
+template <int m_halves, int b_sh_wr_iters, int thread_m_blocks, int a_sh_stride>
+__device__ __forceinline__ void load_sm70_direct_a_runtime(
+    Sm70DirectAFragment<m_halves> (&frag_a)[thread_m_blocks],
+    const void* smem_ptr, int warp_row, int sm70_lane_row, int tile_k_step) {
 #pragma unroll
-  for (int k_block = 0; k_block < 2; ++k_block) {
+  for (int j = 0; j < thread_m_blocks; ++j) {
 #pragma unroll
-    for (int m_half = 0; m_half < m_halves; ++m_half) {
+    for (int k_block = 0; k_block < 2; ++k_block) {
 #pragma unroll
-      for (int k_slice = 0; k_slice < 2; ++k_slice) {
+      for (int m_half = 0; m_half < m_halves; ++m_half) {
+        int row = 16 * j + 8 * m_half + sm70_lane_row;
+        int local_k_base =
+            16 * (warp_row * b_sh_wr_iters + tile_k_step) + 8 * k_block;
 #pragma unroll
-        for (int pair = 0; pair < 2; ++pair) {
-          frag_a.words[k_block][m_half][k_slice][pair] =
-              load_sm70_shared_u32(
-                  smem_ptr, byte_offsets[k_block][m_half][k_slice][pair]);
+        for (int k_slice = 0; k_slice < 2; ++k_slice) {
+#pragma unroll
+          for (int pair = 0; pair < 2; ++pair) {
+            int col = local_k_base + 4 * k_slice + 2 * pair;
+            int chunk =
+                sm70_transform_a_index<a_sh_stride>(row * a_sh_stride + col / 8);
+            int byte_offset =
+                chunk * sizeof(int4) + ((col & 0x7) / 2) * sizeof(uint32_t);
+            frag_a[j].words[k_block][m_half][k_slice][pair] =
+                load_sm70_shared_u32(smem_ptr, byte_offset);
+          }
         }
       }
     }
   }
 }
 
-template <int vecs>
-__device__ __forceinline__ void load_sm70_direct_b(
-    Sm70DirectBQuant<vecs>& frag_b, const void* smem_ptr,
-    const int byte_offsets[vecs][4]) {
+template <int vecs, int b_sh_wr_iters, int b_sh_stride, int sm70_b_j_groups>
+__device__ __forceinline__ void load_sm70_direct_b_runtime(
+    Sm70DirectBQuant<vecs> (&frag_b)[sm70_b_j_groups], const void* smem_ptr,
+    int warp_row,
+    int warp_col, int sm70_lane_row, int tile_k_step) {
 #pragma unroll
-  for (int vec = 0; vec < vecs; ++vec) {
+  for (int j = 0; j < sm70_b_j_groups; ++j) {
+    int local_k_block = warp_row * b_sh_wr_iters + tile_k_step;
+    int local_n_block = 4 * warp_col + j;
 #pragma unroll
-    for (int row_group = 0; row_group < 4; ++row_group) {
-      frag_b.words[vec][row_group] =
-          load_sm70_shared_u32(smem_ptr, byte_offsets[vec][row_group]);
+    for (int vec = 0; vec < vecs; ++vec) {
+      int chunk = b_sh_stride * local_k_block +
+                  local_n_block * (8 * vecs) + sm70_lane_row * vecs + vec;
+#pragma unroll
+      for (int row_group = 0; row_group < 4; ++row_group) {
+        int byte_offset =
+            chunk * sizeof(int4) + row_group * sizeof(uint32_t);
+        frag_b[j].words[vec][row_group] =
+            load_sm70_shared_u32(smem_ptr, byte_offset);
+      }
     }
   }
 }

@@ -647,7 +647,6 @@ __global__ void Marlin(
   int b_gl_stride = 16 * prob_n / (pack_factor * 4);
   constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
   constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
-  constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
   constexpr int b_sh_wr_delta = threads * b_thread_vecs;
@@ -692,8 +691,6 @@ __global__ void Marlin(
 
   b_gl_rd += B_expert_off + b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
-  [[maybe_unused]] auto b_sh_rd = threadIdx.x * b_thread_vecs;
-  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
 
   int s_gl_rd;
   if constexpr (group_blocks == -1) {
@@ -745,7 +742,6 @@ __global__ void Marlin(
   // Zero-points have the same read layout as the scales
   // (without column-wise case)
   constexpr int num_col_threads = 8;
-  constexpr int num_row_threads = 4;
   constexpr int num_ints_per_thread = 8 / pack_factor;
   int zp_sh_rd;
   if constexpr (has_zp) {
@@ -762,16 +758,6 @@ __global__ void Marlin(
     }
   }
 
-  // To ensure that writing and reading A tiles to/from shared memory, the
-  // latter in fragment format, is fully bank conflict free, we need to use a
-  // rather fancy XOR-based layout. The key here is that neither reads nor
-  // writes of the 16-byte `int4` blocks of 8 consecutive threads involve the
-  // same shared memory banks. Further, it seems (based on NSight-Compute) that
-  // each warp must also write a consecutive memory segment?
-  auto transform_a = [&](int i) {
-    int row = i / a_gl_rd_delta_o;
-    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
-  };
   constexpr int sm70_m_halves = m_block_size_8 ? 1 : 2;
   int warp_id = threadIdx.x / 32;
   int warp_row = warp_id / tb_n_warps;
@@ -779,64 +765,6 @@ __global__ void Marlin(
   int lane = threadIdx.x & 31;
   int sm70_lane_row = detail::sm70_atom_rowcol(lane);
   constexpr int sm70_b_j_groups = 4;
-  // Since the computation of this remapping is non-trivial and, due to our main
-  // loop unrolls, all shared memory accesses are static, we simply precompute
-  // both transformed reads and writes.
-  int a_sh_wr_trans[a_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
-  int a_sh_rd_direct_bytes[b_sh_wr_iters][thread_m_blocks][2][sm70_m_halves][2][2];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++) {
-  #pragma unroll
-    for (int j = 0; j < thread_m_blocks; j++) {
-    #pragma unroll
-      for (int k_block = 0; k_block < 2; ++k_block) {
-      #pragma unroll
-        for (int m_half = 0; m_half < sm70_m_halves; ++m_half) {
-          int row = 16 * j + 8 * m_half + sm70_lane_row;
-        #pragma unroll
-          for (int k_slice = 0; k_slice < 2; ++k_slice) {
-        #pragma unroll
-            for (int pair = 0; pair < 2; ++pair) {
-              int col = 16 * (warp_row * b_sh_wr_iters + i) + 8 * k_block +
-                        4 * k_slice + 2 * pair;
-              int chunk = transform_a(row * a_sh_stride + col / 8);
-              a_sh_rd_direct_bytes[i][j][k_block][m_half][k_slice][pair] =
-                  chunk * sizeof(int4) +
-                  ((col & 0x7) / 2) * sizeof(uint32_t);
-            }
-          }
-        }
-      }
-    }
-  }
-  int b_sh_rd_direct_bytes[b_sh_wr_iters][sm70_b_j_groups][b_thread_vecs][4];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; ++i) {
-  #pragma unroll
-    for (int j = 0; j < sm70_b_j_groups; ++j) {
-      int local_k_block = warp_row * b_sh_wr_iters + i;
-      int local_n_block = 4 * warp_col + j;
-    #pragma unroll
-      for (int vec = 0; vec < b_thread_vecs; ++vec) {
-        int chunk = b_sh_stride * local_k_block +
-                    local_n_block * (8 * b_thread_vecs) +
-                    sm70_lane_row * b_thread_vecs + vec;
-      #pragma unroll
-        for (int row_group = 0; row_group < 4; ++row_group) {
-          b_sh_rd_direct_bytes[i][j][vec][row_group] =
-              chunk * sizeof(int4) + row_group * sizeof(uint32_t);
-        }
-      }
-    }
-  }
-
-  // Since B-accesses have non-constant stride they have to be computed at
-  // runtime; we break dependencies between subsequent accesses with a tile by
-  // maintining multiple pointers (we have enough registers), a tiny
-  // optimization.
 
   // Shared memory storage for global fetch pipelines.
   constexpr int sh_red_size =
@@ -898,7 +826,9 @@ __global__ void Marlin(
           sorted_row = sh_rd_block_sorted_ids[row];
         int64_t true_idx =
             sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
-        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx],
+        int sh_idx = detail::sm70_transform_a_index<a_sh_stride>(
+            a_sh_wr_delta * i + a_sh_wr);
+        cp_async4_pred(&sh_a_stage[sh_idx], &A[true_idx],
                        row < block_num_valid_tokens);
       }
 
@@ -970,25 +900,17 @@ __global__ void Marlin(
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe) {
     int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
-  #pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++) {
-      detail::load_sm70_direct_a<sm70_m_halves>(
-          frag_a[k % 2][i], sh_a_stage,
-          a_sh_rd_direct_bytes[k % b_sh_wr_iters][i]);
-    }
+    detail::load_sm70_direct_a_runtime<sm70_m_halves, b_sh_wr_iters,
+                                       thread_m_blocks, a_sh_stride>(
+        frag_a[k % 2], sh_a_stage, warp_row, sm70_lane_row, k % b_sh_wr_iters);
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-
-  #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      detail::load_sm70_direct_b<b_thread_vecs>(
-          frag_b_quant[k % 2][j], sh_b_stage,
-          b_sh_rd_direct_bytes[k % b_sh_wr_iters][j]);
-    }
+    detail::load_sm70_direct_b_runtime<b_thread_vecs, b_sh_wr_iters,
+                                       b_sh_stride, sm70_b_j_groups>(
+        frag_b_quant[k % 2], sh_b_stage, warp_row, warp_col, sm70_lane_row,
+        k % b_sh_wr_iters);
   };
   auto fetch_scales_to_registers = [&](int k, int full_pipe) {
     int pipe = full_pipe % stages;
-    using IT1 = int4;
-    using IT0 = int2;
     constexpr int group_blocks2 = div_ceil(group_blocks, 1);
 
     if constexpr (group_blocks == -1) {

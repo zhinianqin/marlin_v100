@@ -40,8 +40,12 @@ def marlin_permute_bias(bias: torch.Tensor) -> torch.Tensor:
 
 def marlin_make_workspace(
     device: torch.device,
-    size: int = 1,
+    size: int = 0,
+    max_blocks_per_sm: int = 4,
 ) -> torch.Tensor:
+    if size <= 0:
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        size = sms * max_blocks_per_sm
     return torch.zeros(size, dtype=torch.int, device=device)
 
 

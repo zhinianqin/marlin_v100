@@ -65,7 +65,7 @@ _SM70_ROW_GROUPS = (
 )
 
 
-def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 1) -> torch.Tensor:
+def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 4) -> torch.Tensor:
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
 

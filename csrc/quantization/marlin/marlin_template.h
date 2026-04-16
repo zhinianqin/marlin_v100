@@ -437,9 +437,7 @@ __global__ void Marlin(
 
     if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
-      int m_per_thread =
-          div_ceil(thread_m_blocks * 16, threads / threads_per_m);
-      if (m_block_size_8) m_per_thread = div_ceil(8, threads / threads_per_m);
+      int m_per_thread = div_ceil(m_block_size, threads / threads_per_m);
       for (int i = 0; i < m_per_thread; i++) {
         int row = threads / threads_per_m * i + threadIdx.x / threads_per_m;
         if (row < prob_m) {
@@ -457,8 +455,8 @@ __global__ void Marlin(
     }
 
     if (slice_col == n_tiles) {
-      A += 16 * thread_m_blocks * lda / 8;
-      C += 16 * thread_m_blocks * prob_n / 8;
+      A += m_block_size * lda / 8;
+      C += m_block_size * prob_n / 8;
       slice_col = 0;
       par_id++;
     }
@@ -470,8 +468,8 @@ __global__ void Marlin(
       par_id = slice_col_par / n_tiles;
       slice_col = slice_col_par % n_tiles;
       slice_iters = k_tiles;
-      A = A0 + 16 * thread_m_blocks / 8 * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      A = A0 + m_block_size / 8 * par_id * lda;
+      C = C0 + m_block_size / 8 * par_id * prob_n;
     }
   };
 
@@ -482,8 +480,8 @@ __global__ void Marlin(
       slice_row = (iters * blockIdx.x) % k_tiles;
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
-      A = A0 + 16 * thread_m_blocks / 8 * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      A = A0 + m_block_size / 8 * par_id * lda;
+      C = C0 + m_block_size / 8 * par_id * prob_n;
     }
     if (!in_part2) {
       init_part1_slice();
@@ -562,8 +560,6 @@ __global__ void Marlin(
 
   b_gl_rd += b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
-  [[maybe_unused]] auto b_sh_rd = threadIdx.x * b_thread_vecs;
-  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
 
   int s_gl_rd;
   if constexpr (group_blocks == -1) {
@@ -631,24 +627,6 @@ __global__ void Marlin(
     }
   }
 
-  // Precompute which thread should not read memory in which iterations; this is
-  // needed if there are more threads than required for a certain tilesize or
-  // when the batchsize is not a multiple of 16.
-  bool a_sh_wr_pred[a_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
-
-  // To ensure that writing and reading A tiles to/from shared memory, the
-  // latter in fragment format, is fully bank conflict free, we need to use a
-  // rather fancy XOR-based layout. The key here is that neither reads nor
-  // writes of the 16-byte `int4` blocks of 8 consecutive threads involve the
-  // same shared memory banks. Further, it seems (based on NSight-Compute) that
-  // each warp must also write a consecutive memory segment?
-  auto transform_a = [&](int i) {
-    int row = i / a_gl_rd_delta_o;
-    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
-  };
   constexpr int sm70_m_halves = m_block_size_8 ? 1 : 2;
   int warp_id = threadIdx.x / 32;
   int warp_row = warp_id / tb_n_warps;
@@ -656,64 +634,6 @@ __global__ void Marlin(
   int lane = threadIdx.x & 31;
   int sm70_lane_row = detail::sm70_atom_rowcol(lane);
   constexpr int sm70_b_j_groups = 4;
-  // Since the computation of this remapping is non-trivial and, due to our main
-  // loop unrolls, all shared memory accesses are static, we simply precompute
-  // both transformed reads and writes.
-  int a_sh_wr_trans[a_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
-  int a_sh_rd_direct_bytes[b_sh_wr_iters][thread_m_blocks][2][sm70_m_halves][2][2];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++) {
-  #pragma unroll
-    for (int j = 0; j < thread_m_blocks; j++) {
-    #pragma unroll
-      for (int k_block = 0; k_block < 2; ++k_block) {
-      #pragma unroll
-        for (int m_half = 0; m_half < sm70_m_halves; ++m_half) {
-          int row = 16 * j + 8 * m_half + sm70_lane_row;
-        #pragma unroll
-          for (int k_slice = 0; k_slice < 2; ++k_slice) {
-        #pragma unroll
-            for (int pair = 0; pair < 2; ++pair) {
-              int col = 16 * (warp_row * b_sh_wr_iters + i) + 8 * k_block +
-                        4 * k_slice + 2 * pair;
-              int chunk = transform_a(row * a_sh_stride + col / 8);
-              a_sh_rd_direct_bytes[i][j][k_block][m_half][k_slice][pair] =
-                  chunk * sizeof(int4) +
-                  ((col & 0x7) / 2) * sizeof(uint32_t);
-            }
-          }
-        }
-      }
-    }
-  }
-  int b_sh_rd_direct_bytes[b_sh_wr_iters][sm70_b_j_groups][b_thread_vecs][4];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; ++i) {
-  #pragma unroll
-    for (int j = 0; j < sm70_b_j_groups; ++j) {
-      int local_k_block = warp_row * b_sh_wr_iters + i;
-      int local_n_block = 4 * warp_col + j;
-    #pragma unroll
-      for (int vec = 0; vec < b_thread_vecs; ++vec) {
-        int chunk = b_sh_stride * local_k_block +
-                    local_n_block * (8 * b_thread_vecs) +
-                    sm70_lane_row * b_thread_vecs + vec;
-      #pragma unroll
-        for (int row_group = 0; row_group < 4; ++row_group) {
-          b_sh_rd_direct_bytes[i][j][vec][row_group] =
-              chunk * sizeof(int4) + row_group * sizeof(uint32_t);
-        }
-      }
-    }
-  }
-
-  // Since B-accesses have non-constant stride they have to be computed at
-  // runtime; we break dependencies between subsequent accesses with a tile by
-  // maintining multiple pointers (we have enough registers), a tiny
-  // optimization.
 
   // Shared memory storage for global fetch pipelines.
   constexpr int sh_red_size =
@@ -767,10 +687,14 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
+        int sh_idx = detail::sm70_transform_a_index<a_sh_stride>(
+            a_sh_wr_delta * i + a_sh_wr);
+        bool a_stage_pred =
+            a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
         cp_async4_pred(
-            &sh_a_stage[a_sh_wr_trans[i]],
+            &sh_a_stage[sh_idx],
             &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
-            a_sh_wr_pred[i]);
+            a_stage_pred);
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
@@ -840,26 +764,18 @@ __global__ void Marlin(
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe) {
     int4* sh_a_stage = sh_a + a_sh_stage * pipe;
-  #pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++) {
-      detail::load_sm70_direct_a<sm70_m_halves>(
-          frag_a[k % 2][i], sh_a_stage,
-          a_sh_rd_direct_bytes[k % b_sh_wr_iters][i]);
-    }
+    detail::load_sm70_direct_a_runtime<sm70_m_halves, b_sh_wr_iters,
+                                       thread_m_blocks, a_sh_stride>(
+        frag_a[k % 2], sh_a_stage, warp_row, sm70_lane_row, k % b_sh_wr_iters);
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-
-  #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      detail::load_sm70_direct_b<b_thread_vecs>(
-          frag_b_quant[k % 2][j], sh_b_stage,
-          b_sh_rd_direct_bytes[k % b_sh_wr_iters][j]);
-    }
+    detail::load_sm70_direct_b_runtime<b_thread_vecs, b_sh_wr_iters,
+                                       b_sh_stride, sm70_b_j_groups>(
+        frag_b_quant[k % 2], sh_b_stage, warp_row, warp_col,
+        sm70_lane_row, k % b_sh_wr_iters);
   };
 
   auto fetch_scales_to_registers = [&](int k, int full_pipe) {
     int pipe = full_pipe % stages;
-    using IT1 = int4;
-    using IT0 = int2;
     constexpr int group_blocks2 = div_ceil(group_blocks, 1);
 
     if constexpr (group_blocks == -1) {
@@ -1259,7 +1175,7 @@ __global__ void Marlin(
   };
 
   auto global_reduce_fp32 = [&](bool first = false, bool last = false) {
-    constexpr int tb_m = thread_m_blocks * 16;
+    constexpr int tb_m = m_block_size;
     constexpr int tb_n = thread_n_blocks * 16;
     constexpr int c_size = tb_m * tb_n * sizeof(float) / 16;
     constexpr int vecs_per_row = sh_red_cols / 4;

@@ -49,25 +49,33 @@ __global__ void permute_cols_kernel(
     int size_k, int top_k) {
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int num_moe_blocks = div_ceil(num_tokens_past_padded, moe_block_size);
-  int32_t block_sorted_ids[moe_block_size];
+  __shared__ int4 block_sorted_ids_int4[moe_block_size / 4];
+  __shared__ int block_num_valid_tokens_sh;
+  int32_t* block_sorted_ids =
+      reinterpret_cast<int32_t*>(block_sorted_ids_int4);
   int block_num_valid_tokens = 0;
   int64_t old_expert_id = 0;
   int64_t expert_id = 0;
   int row_stride = size_k * sizeof(half) / 16;
 
   auto read_moe_block_data = [&](int block_id) {
-    block_num_valid_tokens = moe_block_size;
-    int4* tmp_block_sorted_ids = reinterpret_cast<int4*>(block_sorted_ids);
-    for (int i = 0; i < moe_block_size / 4; i++) {
-      tmp_block_sorted_ids[i] =
-          ((int4*)sorted_token_ids_ptr)[block_id * moe_block_size / 4 + i];
+    if (threadIdx.x < moe_block_size / 4) {
+      block_sorted_ids_int4[threadIdx.x] =
+          reinterpret_cast<int4 const*>(sorted_token_ids_ptr)
+              [block_id * moe_block_size / 4 + threadIdx.x];
     }
-    for (int i = 0; i < moe_block_size; i++) {
-      if (block_sorted_ids[i] >= size_m * top_k) {
-        block_num_valid_tokens = i;
-        break;
-      };
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      block_num_valid_tokens_sh = moe_block_size;
+      for (int i = 0; i < moe_block_size; i++) {
+        if (block_sorted_ids[i] >= size_m * top_k) {
+          block_num_valid_tokens_sh = i;
+          break;
+        }
+      }
     }
+    __syncthreads();
+    block_num_valid_tokens = block_num_valid_tokens_sh;
   };
 
   auto permute_row = [&](int row) {
@@ -112,6 +120,7 @@ __global__ void permute_cols_kernel(
 
     for (int i = 0; i < block_num_valid_tokens; i++)
       permute_row(block_sorted_ids[i]);
+    __syncthreads();
   }
 }
 

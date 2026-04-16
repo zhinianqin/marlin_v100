@@ -25,6 +25,7 @@
 
 #include "kernel.h"
 #include "core/registration.h"
+#include <climits>
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -140,6 +141,8 @@ thread_config_t large_batch_thread_configs[] = {
 typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
+  bool m_block_size_8;
+  int num_regs;
 } exec_config_t;
 
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
@@ -172,17 +175,17 @@ int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
   }
 }
 
-int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_blocks,
-                          int prob_m, int prob_n, int prob_k, int num_bits,
-                          int group_size, bool has_act_order, bool is_k_full,
-                          int has_zp, bool is_zp_float, bool is_a_8bit,
-                          int stages) {
+int get_kernel_cache_size(thread_config_t const& th_config, bool m_block_size_8,
+                          int thread_m_blocks, int prob_m, int prob_n,
+                          int prob_k, int num_bits, int group_size,
+                          bool has_act_order, bool is_k_full, int has_zp,
+                          bool is_zp_float, bool is_a_8bit, int stages) {
   int pack_factor = 32 / num_bits;
 
   // Get B size
   int tb_k = th_config.thread_k;
   int tb_n = th_config.thread_n;
-  int tb_m = thread_m_blocks * 16;
+  int tb_m = m_block_size_8 ? 8 : (thread_m_blocks * 16);
   int sh_a_size = stages * (tb_m * tb_k) * (is_a_8bit ? 1 : 2);
   int sh_b_size = stages * (tb_k * tb_n / pack_factor) * 4;
   int sh_red_size = tb_m * (tb_n + 8) * 4;
@@ -211,11 +214,11 @@ int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_blocks,
   return total_size;
 }
 
-bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
-                     int prob_m, int prob_n, int prob_k, int num_bits,
-                     int group_size, bool has_act_order, bool is_k_full,
-                     int has_zp, bool is_zp_float, bool is_a_8bit, int stages,
-                     int max_shared_mem) {
+bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
+                     int thread_m_blocks, int prob_m, int prob_n, int prob_k,
+                     int num_bits, int group_size, bool has_act_order,
+                     bool is_k_full, int has_zp, bool is_zp_float,
+                     bool is_a_8bit, int stages, int max_shared_mem) {
   // Sanity
   if (th_config.thread_k == -1 || th_config.thread_n == -1 ||
       th_config.num_threads == -1) {
@@ -239,8 +242,9 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
 
   // Check that pipeline fits into cache
   int cache_size = get_kernel_cache_size(
-      th_config, thread_m_blocks, prob_m, prob_n, prob_k, num_bits, group_size,
-      has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages);
+      th_config, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+      num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float,
+      is_a_8bit, stages);
   return cache_size <= max_shared_mem;
 }
 
@@ -261,11 +265,11 @@ MarlinFuncPtr get_marlin_kernel(
 exec_config_t determine_exec_config(
     const vllm::ScalarType& a_type, const vllm::ScalarType& b_type,
     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
-    int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
-    int num_bits, int group_size, bool has_act_order, bool is_k_full,
-    bool has_zp, bool is_zp_float, int is_a_8bit, int stages,
-    int max_shared_mem, int sms) {
-  exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
+    int prob_n, int prob_k, int thread_m_blocks, int num_bits, int group_size,
+    bool has_act_order, bool is_k_full, bool has_zp, bool is_zp_float,
+    int is_a_8bit, int stages, int max_shared_mem, int sms) {
+  exec_config_t exec_cfg =
+      exec_config_t{0, thread_config_t{-1, -1, -1}, false, INT_MAX};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
                                         : small_batch_thread_configs;
@@ -273,36 +277,85 @@ exec_config_t determine_exec_config(
       thread_m_blocks > 1
           ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
           : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
+  constexpr int device_max_reg_size = 255 * 1024;
+  bool m_block_size_8_candidates[] = {false, true};
+  int num_m_block_size_8_candidates = thread_m_blocks == 1 ? 2 : 1;
 
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
 
-    if (!is_valid_config(th_config, thread_m_blocks, prob_m, prob_n, prob_k,
-                         num_bits, group_size, has_act_order, is_k_full, has_zp,
-                         is_zp_float, is_a_8bit, stages,
-                         max_shared_mem - 512)) {
-      continue;
+    for (int candidate_idx = 0; candidate_idx < num_m_block_size_8_candidates;
+         ++candidate_idx) {
+      bool candidate_m_block_size_8 = m_block_size_8_candidates[candidate_idx];
+      if (!is_valid_config(th_config, candidate_m_block_size_8, thread_m_blocks,
+                           prob_m, prob_n, prob_k, num_bits, group_size,
+                           has_act_order, is_k_full, has_zp, is_zp_float,
+                           is_a_8bit, stages, max_shared_mem - 512)) {
+        continue;
+      }
+
+      int cache_size = get_kernel_cache_size(
+          th_config, candidate_m_block_size_8, thread_m_blocks, prob_m, prob_n,
+          prob_k, num_bits, group_size, has_act_order, is_k_full, has_zp,
+          is_zp_float, is_a_8bit, stages);
+
+      int group_blocks = 0;
+      if (!has_act_order) {
+        group_blocks = group_size == -1 ? -1 : group_size / 16;
+      }
+
+      auto kernel =
+          get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks,
+                            th_config.thread_n / 16, th_config.thread_k / 16,
+                            candidate_m_block_size_8, has_act_order, has_zp,
+                            group_blocks, th_config.num_threads, is_zp_float,
+                            stages);
+
+      if (kernel == MarlinDefault) continue;
+
+      cudaFuncAttributes attr;
+      cudaFuncGetAttributes(&attr, kernel);
+      int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+      int allow_count = min(device_max_reg_size / reg_size,
+                            max_shared_mem / (cache_size + 1536));
+      allow_count = max(min(allow_count, 4), 1);
+
+      int tile_m = candidate_m_block_size_8 ? 8 : (thread_m_blocks * 16);
+      int work_tiles = prob_n / th_config.thread_n * div_ceil(prob_m, tile_m) * 4;
+      if (work_tiles < sms * allow_count) {
+        allow_count = max(work_tiles / sms, 1);
+      }
+
+      bool prefer_m_block_size_8 = prob_m <= 8;
+      int current_pref_penalty =
+          exec_cfg.tb_cfg.thread_k == -1
+              ? 2
+              : int(exec_cfg.m_block_size_8 != prefer_m_block_size_8);
+      int candidate_pref_penalty =
+          int(candidate_m_block_size_8 != prefer_m_block_size_8);
+
+      bool better = false;
+      if (candidate_pref_penalty < current_pref_penalty) {
+        better = true;
+      } else if (candidate_pref_penalty == current_pref_penalty &&
+                 allow_count > exec_cfg.blocks_per_sm) {
+        better = true;
+      } else if (candidate_pref_penalty == current_pref_penalty &&
+                 allow_count == exec_cfg.blocks_per_sm &&
+                 attr.numRegs < exec_cfg.num_regs) {
+        better = true;
+      } else if (candidate_pref_penalty == current_pref_penalty &&
+                 allow_count == exec_cfg.blocks_per_sm &&
+                 attr.numRegs == exec_cfg.num_regs &&
+                 candidate_m_block_size_8 && !exec_cfg.m_block_size_8) {
+        better = true;
+      }
+
+      if (better) {
+        exec_cfg = {allow_count, th_config, candidate_m_block_size_8,
+                    attr.numRegs};
+      }
     }
-
-    int cache_size = get_kernel_cache_size(th_config, thread_m_blocks, prob_m,
-                                           prob_n, prob_k, num_bits, group_size,
-                                           has_act_order, is_k_full, has_zp,
-                                           is_zp_float, is_a_8bit, stages);
-
-    int group_blocks = 0;
-    if (!has_act_order) {
-      group_blocks = group_size == -1 ? -1 : group_size / 16;
-    }
-
-    auto kernel =
-        get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks,
-                          th_config.thread_n / 16, th_config.thread_k / 16,
-                          m_block_size_8, has_act_order, has_zp, group_blocks,
-                          th_config.num_threads, is_zp_float, stages);
-
-    if (kernel == MarlinDefault) continue;
-
-    return {1, th_config};
   }
 
   return exec_cfg;
@@ -397,23 +450,27 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int rest_m = prob_m;
   int max_thread_m_blocks = 1;
   while (rest_m) {
+    max_shared_mem_new = max_shared_mem;
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;
     int prob_m_split =
         par_count > 0 ? (par_count * (max_thread_m_blocks * 16)) : rest_m;
+    if (a_type.size_bits() == 16 && prob_m_split > 8 && prob_m_split < 16) {
+      prob_m_split = 8;
+    }
 
     int thread_k = thread_k_init;
     int thread_n = thread_n_init;
 
     int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
-    int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
+    bool m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
 
     // Set thread config
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
     if (thread_k != -1 && thread_n != -1) {
       thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
-      exec_cfg = exec_config_t{1, thread_tfg};
+      exec_cfg = exec_config_t{1, thread_tfg, m_block_size_8, 0};
       TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                   " is not divisible by thread_n = ", thread_n);
       TORCH_CHECK(prob_k % thread_k == 0, "prob_k = ", prob_k,
@@ -422,20 +479,23 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       // Auto config
       exec_cfg = determine_exec_config(
           a_type, b_type, c_type, s_type, prob_m_split, prob_n, prob_k,
-          thread_m_blocks, m_block_size_8, num_bits, group_size, has_act_order,
-          is_k_full, has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem,
-          sms);
+          thread_m_blocks, num_bits, group_size, has_act_order, is_k_full,
+          has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem, sms);
       thread_tfg = exec_cfg.tb_cfg;
+      m_block_size_8 = exec_cfg.m_block_size_8;
+
       if (thread_tfg.thread_n != -1) {
-        if (prob_n / thread_tfg.thread_n *
-                div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <=
+        int tile_m = m_block_size_8 ? 8 : (thread_m_blocks * 16);
+        if (prob_n / thread_tfg.thread_n * div_ceil(prob_m_split, tile_m) * 4 <=
             sms) {
-          if (is_valid_config({128, 64, 128}, thread_m_blocks, prob_m_split,
-                              prob_n, prob_k, num_bits, group_size,
-                              has_act_order, is_k_full, has_zp, is_zp_float,
-                              is_a_8bit, stages, max_shared_mem_new)) {
-            thread_tfg = {128, 64, 128};
-            exec_cfg = {1, thread_tfg};
+          thread_config_t fallback_cfg{128, 64, 128};
+          if (is_valid_config(fallback_cfg, m_block_size_8, thread_m_blocks,
+                              prob_m_split, prob_n, prob_k, num_bits,
+                              group_size, has_act_order, is_k_full, has_zp,
+                              is_zp_float, is_a_8bit, stages,
+                              max_shared_mem_new)) {
+            thread_tfg = fallback_cfg;
+            exec_cfg = exec_config_t{1, thread_tfg, m_block_size_8, 0};
           }
         }
       }
@@ -450,16 +510,18 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
     int blocks = sms * exec_cfg.blocks_per_sm;
-    if (exec_cfg.blocks_per_sm > 1)
+    if (exec_cfg.blocks_per_sm > 1) {
       max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+    }
 
     int thread_k_blocks = thread_k / 16;
     int thread_n_blocks = thread_n / 16;
 
     TORCH_CHECK(
-        is_valid_config(thread_tfg, thread_m_blocks, prob_m_split, prob_n,
-                        prob_k, num_bits, group_size, has_act_order, is_k_full,
-                        has_zp, is_zp_float, is_a_8bit, stages,
+        is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
+                        prob_m_split, prob_n, prob_k, num_bits, group_size,
+                        has_act_order, is_k_full, has_zp, is_zp_float,
+                        is_a_8bit, stages,
                         max_shared_mem_new),
         "Invalid thread config: thread_m_blocks = ", thread_m_blocks,
         ", thread_k = ", thread_tfg.thread_k,
@@ -469,7 +531,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         ", prob_m_split = ", prob_m_split, ", group_size = ", group_size,
         ", has_act_order = ", has_act_order, ", is_k_full = ", is_k_full,
         ", has_zp = ", has_zp, ", is_zp_float = ", is_zp_float,
-        ", stages = ", stages, ", max_shared_mem_new = ", max_shared_mem_new);
+        ", m_block_size_8 = ", m_block_size_8, ", stages = ", stages,
+        ", max_shared_mem_new = ", max_shared_mem_new);
 
     auto kernel = get_marlin_kernel(
         a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
@@ -808,7 +871,7 @@ torch::Tensor marlin_gemm(
               "size_n = ", size_n, ", is not divisible by min_thread_n = ",
               MARLIN_NAMESPACE_NAME::min_thread_n);
 
-  int min_workspace_size = sms;
+  int min_workspace_size = sms * 4;
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
