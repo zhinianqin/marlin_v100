@@ -11,6 +11,8 @@ from marlin_v100.calibration import (
 )
 from marlin_v100 import moe, ops, routing
 from tests.helpers import (
+    _REPACK_IMPL_CASES,
+    assert_repack_layout_matches_reference,
     make_moe_model_like_inputs,
     marlin_moe_reference,
     marlin_quantize_experts,
@@ -284,8 +286,10 @@ def test_grouped_topk_matches_reference():
     assert torch.equal(topk_ids, ref_ids)
 
 
-def test_fused_marlin_moe_smoke():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_smoke(repack_impl: str):
     _require_moe_cuda()
+    assert_repack_layout_matches_reference(repack_impl, quant_type=scalar_types.uint4b8)
     # This is a collectable smoke shape check only for the checked-in source target build.
 
     quant_type_id = 1
@@ -318,6 +322,7 @@ def test_fused_marlin_moe_smoke():
 def _make_moe_accuracy_inputs(
     quant_type,
     *,
+    repack_impl: str | None = None,
     group_size: int,
     act_order: bool,
     tokens: int = 4,
@@ -326,6 +331,13 @@ def _make_moe_accuracy_inputs(
     intermediate = 128
     experts = 4
     topk = 2
+    if repack_impl is not None:
+        assert_repack_layout_matches_reference(
+            repack_impl,
+            quant_type=quant_type,
+            act_order=act_order,
+            group_size=group_size,
+        )
 
     hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
         tokens=tokens,
@@ -366,6 +378,7 @@ def _make_moe_accuracy_inputs(
 def _run_fused_moe_accuracy_case(
     quant_type,
     *,
+    repack_impl: str,
     group_size: int,
     act_order: bool,
     is_k_full: bool,
@@ -383,6 +396,7 @@ def _run_fused_moe_accuracy_case(
 
     inputs = _make_moe_accuracy_inputs(
         quant_type,
+        repack_impl=repack_impl,
         group_size=group_size,
         act_order=act_order,
         tokens=tokens,
@@ -420,6 +434,7 @@ def _run_fused_moe_accuracy_case(
 def _assert_moe_backend_rejects_act_order(
     quant_type,
     *,
+    repack_impl: str | None = None,
     group_size: int,
     is_k_full: bool,
     tokens: int = 4,
@@ -434,6 +449,7 @@ def _assert_moe_backend_rejects_act_order(
 
     inputs = _make_moe_accuracy_inputs(
         quant_type,
+        repack_impl=repack_impl,
         group_size=group_size,
         act_order=True,
         tokens=tokens,
@@ -486,13 +502,17 @@ def _assert_moe_backend_rejects_act_order(
         )
 
 
-def test_fused_marlin_moe_uint4b8_topk_weight_fusion_order_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_topk_weight_fusion_order_matches_reference(
+    repack_impl: str,
+):
     _require_moe_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     inputs = _make_moe_accuracy_inputs(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         tokens=2,
@@ -530,9 +550,11 @@ def test_fused_marlin_moe_uint4b8_topk_weight_fusion_order_matches_reference():
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-def test_fused_marlin_moe_uint4b8_accuracy(group_size: int):
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_accuracy(group_size: int, repack_impl: str):
     _run_fused_moe_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=group_size,
         act_order=False,
         is_k_full=True,
@@ -541,18 +563,22 @@ def test_fused_marlin_moe_uint4b8_accuracy(group_size: int):
 
 
 @pytest.mark.parametrize("is_k_full", (True, False))
-def test_fused_marlin_moe_uint4b8_act_order_accuracy(is_k_full: bool):
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_act_order_accuracy(is_k_full: bool, repack_impl: str):
     _assert_moe_backend_rejects_act_order(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=64,
         is_k_full=is_k_full,
         moe_block_size=16,
     )
 
 
-def test_fused_marlin_moe_uint4b8_partial_block_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_partial_block_matches_reference(repack_impl: str):
     _run_fused_moe_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         is_k_full=True,
@@ -561,9 +587,11 @@ def test_fused_marlin_moe_uint4b8_partial_block_matches_reference():
     )
 
 
-def test_fused_marlin_moe_uint4b8_single_token_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_single_token_matches_reference(repack_impl: str):
     _run_fused_moe_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         is_k_full=True,
@@ -572,9 +600,11 @@ def test_fused_marlin_moe_uint4b8_single_token_matches_reference():
     )
 
 
-def test_fused_marlin_moe_uint4b8_moe_block_size_8_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_moe_block_size_8_matches_reference(repack_impl: str):
     _run_fused_moe_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         is_k_full=True,
@@ -582,9 +612,13 @@ def test_fused_marlin_moe_uint4b8_moe_block_size_8_matches_reference():
     )
 
 
-def test_fused_marlin_moe_uint4b8_moe_block_size_24_partial_bucket_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_fused_marlin_moe_uint4b8_moe_block_size_24_partial_bucket_matches_reference(
+    repack_impl: str,
+):
     _run_fused_moe_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         is_k_full=True,
@@ -595,6 +629,7 @@ def test_fused_marlin_moe_uint4b8_moe_block_size_24_partial_bucket_matches_refer
 def _run_stage1_kernel_case(
     quant_type,
     *,
+    repack_impl: str,
     group_size: int,
     act_order: bool,
     is_k_full: bool,
@@ -612,6 +647,7 @@ def _run_stage1_kernel_case(
 
     inputs = _make_moe_accuracy_inputs(
         quant_type,
+        repack_impl=repack_impl,
         group_size=group_size,
         act_order=act_order,
         tokens=tokens,
@@ -680,9 +716,11 @@ def _run_stage1_kernel_case(
     torch.testing.assert_close(stage1, reference_stage1, rtol=6e-2, atol=3e-1)
 
 
-def test_moe_wna16_uint4b8_stage1_moe_block_size_8_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_moe_wna16_uint4b8_stage1_moe_block_size_8_matches_reference(repack_impl: str):
     _run_stage1_kernel_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=64,
         act_order=False,
         is_k_full=True,
@@ -690,9 +728,11 @@ def test_moe_wna16_uint4b8_stage1_moe_block_size_8_matches_reference():
     )
 
 
-def test_moe_wna16_uint4b8_stage1_moe_block_size_24_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_moe_wna16_uint4b8_stage1_moe_block_size_24_matches_reference(repack_impl: str):
     _run_stage1_kernel_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=64,
         act_order=False,
         is_k_full=True,
@@ -703,9 +743,11 @@ def test_moe_wna16_uint4b8_stage1_moe_block_size_24_matches_reference():
 if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
 
     @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-    def test_fused_marlin_moe_uint8b128_accuracy(group_size: int):
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_uint8b128_accuracy(group_size: int, repack_impl: str):
         _run_fused_moe_accuracy_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=group_size,
             act_order=False,
             is_k_full=True,
@@ -721,9 +763,11 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
             moe_block_size=16,
         )
 
-    def test_fused_marlin_moe_uint8b128_partial_block_matches_reference():
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_uint8b128_partial_block_matches_reference(repack_impl: str):
         _run_fused_moe_accuracy_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=128,
             act_order=False,
             is_k_full=True,
@@ -731,9 +775,11 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
             moe_block_size=16,
         )
 
-    def test_fused_marlin_moe_uint8b128_single_token_matches_reference():
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_uint8b128_single_token_matches_reference(repack_impl: str):
         _run_fused_moe_accuracy_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=128,
             act_order=False,
             is_k_full=True,
@@ -741,9 +787,11 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
             moe_block_size=16,
         )
 
-    def test_moe_wna16_uint8b128_stage1_kernel_is_finite():
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_moe_wna16_uint8b128_stage1_kernel_is_finite(repack_impl: str):
         _run_stage1_kernel_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=64,
             act_order=False,
             is_k_full=True,
@@ -767,7 +815,8 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
             moe_block_size=16,
         )
 
-def test_marlin_moe_rejects_mismatched_capability_or_unsupported_dtypes():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_moe_rejects_mismatched_capability_or_unsupported_dtypes(repack_impl: str):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
@@ -824,6 +873,7 @@ def test_marlin_moe_rejects_mismatched_capability_or_unsupported_dtypes():
             )
         return
 
+    assert_repack_layout_matches_reference(repack_impl, quant_type=scalar_types.uint4b8)
     hidden_states_bf16 = hidden_states.to(torch.bfloat16)
     scales_bf16 = scales.to(torch.bfloat16)
     with pytest.raises(RuntimeError, match=_FLOAT16_DTYPE_ERROR):

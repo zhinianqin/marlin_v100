@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+import pytest
 import torch
 
 from marlin_v100.calibration import validate_dense_group_size
-from marlin_v100 import dense, quant_utils
+from marlin_v100 import dense, ops, quant_utils
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,12 @@ class scalar_types:
     uint8b128 = ScalarType(0, 8, False, 128)
 
 
+_REPACK_IMPL_CASES = (
+    pytest.param("gptq", id="gptq_marlin_repack"),
+    pytest.param("awq", id="awq_marlin_repack"),
+)
+
+
 def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 1) -> torch.Tensor:
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
@@ -63,6 +70,146 @@ def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
 
 def _supported_quant_types() -> tuple[ScalarType, ...]:
     return (scalar_types.uint4b8, scalar_types.uint8b128)
+
+
+def pack_rows(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if q_weight.shape != (size_k, size_n):
+        raise ValueError(f"Expected q_weight.shape == {(size_k, size_n)}, got {tuple(q_weight.shape)}")
+
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    if size_k % pack_factor != 0:
+        raise ValueError(f"size_k={size_k} must be divisible by pack_factor={pack_factor}")
+
+    packed = torch.zeros((size_k // pack_factor, size_n), dtype=torch.int64, device=q_weight.device)
+    for idx in range(pack_factor):
+        packed |= q_weight[idx::pack_factor, :].to(torch.int64) << (num_bits * idx)
+    return packed.to(torch.int32).contiguous()
+
+
+def gptq_pack(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    return pack_rows(q_weight, num_bits, size_k, size_n)
+
+
+def pack_cols(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if q_weight.shape != (size_k, size_n):
+        raise ValueError(f"Expected q_weight.shape == {(size_k, size_n)}, got {tuple(q_weight.shape)}")
+
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    if size_n % pack_factor != 0:
+        raise ValueError(f"size_n={size_n} must be divisible by pack_factor={pack_factor}")
+
+    packed = torch.zeros((size_k, size_n // pack_factor), dtype=torch.int64, device=q_weight.device)
+    for idx in range(pack_factor):
+        packed |= q_weight[:, idx::pack_factor].to(torch.int64) << (num_bits * idx)
+    return packed.to(torch.int32).contiguous()
+
+
+def awq_pack(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if num_bits == 4:
+        interleave = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=q_weight.device, dtype=torch.long)
+    elif num_bits == 8:
+        interleave = torch.tensor([0, 2, 1, 3], device=q_weight.device, dtype=torch.long)
+    else:
+        raise ValueError(f"num_bits must be 4 or 8, got {num_bits}")
+
+    q_weight = q_weight.reshape((-1, interleave.numel()))[:, interleave].reshape(-1, size_n)
+    return pack_cols(q_weight.contiguous(), num_bits, size_k, size_n)
+
+
+def _deterministic_repack_input(
+    quant_type: ScalarType,
+    *,
+    act_order: bool,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_weight = torch.arange(size_k * size_n, device=device, dtype=torch.int32).reshape(size_k, size_n)
+    q_weight = q_weight.remainder(1 << quant_type.size_bits).contiguous()
+    sort_indices = torch.empty(0, dtype=torch.int, device=device)
+    sorted_q_weight = q_weight
+    if act_order:
+        _g_idx, sort_indices = _make_act_order_metadata(size_k, group_size, torch.device(device))
+        sorted_q_weight = q_weight.index_select(0, sort_indices.to(torch.long)).contiguous()
+    return q_weight, sorted_q_weight, sort_indices
+
+
+def assert_repack_layout_matches_reference(
+    repack_impl: str,
+    *,
+    quant_type: ScalarType,
+    act_order: bool = False,
+    size_k: int = 128,
+    size_n: int = 64,
+    group_size: int = 64,
+) -> None:
+    if repack_impl not in {"gptq", "awq"}:
+        raise ValueError(f"Unsupported repack_impl={repack_impl!r}")
+    if size_k % 16 != 0 or size_n % 64 != 0:
+        raise ValueError(f"Marlin repack expects size_k%16==0 and size_n%64==0, got {(size_k, size_n)}")
+
+    ops._load_dense()
+    q_weight, sorted_q_weight, sort_indices = _deterministic_repack_input(
+        quant_type,
+        act_order=act_order,
+        size_k=size_k,
+        size_n=size_n,
+        group_size=group_size,
+        device="cuda",
+    )
+    weight_perm = quant_utils.get_weight_perm(quant_type.size_bits, is_a_8bit=False).to(q_weight.device)
+    expected = quant_utils.marlin_weights(
+        sorted_q_weight,
+        size_k,
+        size_n,
+        quant_type.size_bits,
+        weight_perm,
+        is_a_8bit=False,
+    )
+
+    if repack_impl == "gptq":
+        packed = gptq_pack(q_weight, quant_type.size_bits, size_k, size_n)
+        actual = ops.gptq_marlin_repack(
+            packed,
+            sort_indices,
+            size_k,
+            size_n,
+            quant_type.size_bits,
+            False,
+        )
+    else:
+        source = sorted_q_weight if act_order else q_weight
+        packed = awq_pack(source, quant_type.size_bits, size_k, size_n)
+        actual = ops.awq_marlin_repack(
+            packed,
+            size_k,
+            size_n,
+            quant_type.size_bits,
+            False,
+        )
+
+    assert torch.equal(actual, expected)
 
 
 def _quantize_unsigned_with_bias(

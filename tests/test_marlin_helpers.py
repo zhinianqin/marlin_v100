@@ -4,9 +4,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from marlin_v100 import dense, moe
-from marlin_v100.calibration import supported_dense_quant_type_names
+from marlin_v100 import dense, moe, ops
+from marlin_v100.calibration import (
+    source_target_capability,
+    source_target_label,
+    supported_dense_quant_type_names,
+)
 from tests.helpers import (
+    _REPACK_IMPL_CASES,
+    assert_repack_layout_matches_reference,
     make_moe_model_like_inputs,
     marlin_dequantize,
     marlin_quantize,
@@ -30,6 +36,23 @@ _ROUNDTRIP_CASES = [
     )
     for name in supported_dense_quant_type_names(_ROUNDTRIP_TOLERANCES)
 ]
+_REPACK_QUANT_CASES = [
+    pytest.param(_ROUNDTRIP_TOLERANCES[name][0], id=name)
+    for name in supported_dense_quant_type_names(_ROUNDTRIP_TOLERANCES)
+]
+
+
+def _require_repack_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    target_capability = source_target_capability()
+    capability = torch.cuda.get_device_capability()
+    if capability != target_capability:
+        pytest.skip(f"Marlin repack requires {source_target_label()} for this source tree")
+    try:
+        ops._load_dense()
+    except Exception as exc:  # pragma: no cover - depends on local build state
+        pytest.skip(f"marlin dense extension is not available: {exc}")
 
 
 @pytest.mark.parametrize(
@@ -115,6 +138,26 @@ def test_marlin_quantize_act_order_round_trip_matches_original_weight(
     assert not torch.equal(sort_indices, torch.arange(weight.shape[0], dtype=torch.int))
     assert torch.isfinite(dequantized).all()
     torch.testing.assert_close(dequantized, weight, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("quant_type", _REPACK_QUANT_CASES)
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_repack_layout_matches_reference_for_supported_dense_quant_types(
+    quant_type,
+    repack_impl: str,
+):
+    _require_repack_cuda()
+    assert_repack_layout_matches_reference(repack_impl, quant_type=quant_type)
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_uint4b8_act_order_repack_layout_matches_reference(repack_impl: str):
+    _require_repack_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint4b8,
+        act_order=True,
+    )
 
 
 def test_marlin_quantize_rejects_group_size_zero_outside_runtime_act_order_path():

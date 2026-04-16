@@ -11,6 +11,8 @@ from marlin_v100.calibration import (
 )
 from marlin_v100 import ops
 from tests.helpers import (
+    _REPACK_IMPL_CASES,
+    assert_repack_layout_matches_reference,
     marlin_dense_reference,
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
@@ -74,8 +76,10 @@ def test_marlin_int4_fp8_preprocess_without_zp():
     assert torch.equal(cuda_res, torch_res)
 
 
-def test_marlin_dense_smoke_local_helpers():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_smoke_local_helpers(repack_impl: str):
     _require_marlin_cuda()
+    assert_repack_layout_matches_reference(repack_impl, quant_type=scalar_types.uint4b8)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
@@ -110,6 +114,7 @@ def test_marlin_dense_smoke_local_helpers():
 def _run_dense_accuracy_case(
     quant_type,
     *,
+    repack_impl: str,
     group_size: int,
     act_order: bool,
     is_k_full: bool,
@@ -123,6 +128,12 @@ def _run_dense_accuracy_case(
         raise AssertionError("act_order accuracy coverage was replaced by explicit rejection tests")
 
     _require_marlin_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=quant_type,
+        act_order=act_order,
+        group_size=group_size,
+    )
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
@@ -172,6 +183,7 @@ def _run_dense_accuracy_case(
 def _assert_dense_backend_rejects_act_order(
     quant_type,
     *,
+    repack_impl: str | None = None,
     group_size: int,
     is_k_full: bool,
     size_m: int = 16,
@@ -179,6 +191,13 @@ def _assert_dense_backend_rejects_act_order(
     size_n: int = 256,
 ) -> None:
     _require_marlin_cuda()
+    if repack_impl is not None:
+        assert_repack_layout_matches_reference(
+            repack_impl,
+            quant_type=quant_type,
+            act_order=True,
+            group_size=group_size,
+        )
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
@@ -211,9 +230,11 @@ def _assert_dense_backend_rejects_act_order(
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-def test_marlin_dense_uint4b8_accuracy(group_size: int):
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_accuracy(group_size: int, repack_impl: str):
     _run_dense_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=group_size,
         act_order=False,
         is_k_full=True,
@@ -223,17 +244,21 @@ def test_marlin_dense_uint4b8_accuracy(group_size: int):
 
 
 @pytest.mark.parametrize("is_k_full", (True, False))
-def test_marlin_dense_uint4b8_act_order_accuracy(is_k_full: bool):
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_act_order_accuracy(is_k_full: bool, repack_impl: str):
     _assert_dense_backend_rejects_act_order(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=64,
         is_k_full=is_k_full,
     )
 
 
-def test_marlin_dense_uint4b8_8_row_bucket_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_8_row_bucket_matches_reference(repack_impl: str):
     _run_dense_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         is_k_full=True,
@@ -246,11 +271,14 @@ def test_marlin_dense_uint4b8_8_row_bucket_matches_reference():
 
 
 @pytest.mark.parametrize("group_size", (-1, 128))
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
     group_size: int,
+    repack_impl: str,
 ):
     _run_dense_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=group_size,
         act_order=False,
         is_k_full=True,
@@ -262,9 +290,11 @@ def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
     )
 
 
-def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference(repack_impl: str):
     _assert_dense_backend_rejects_act_order(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=64,
         is_k_full=False,
         size_m=8,
@@ -273,9 +303,13 @@ def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference():
     )
 
 
-def test_marlin_dense_uint4b8_size_m_24_uses_32_row_bucket_matches_reference():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_size_m_24_uses_32_row_bucket_matches_reference(
+    repack_impl: str,
+):
     _run_dense_accuracy_case(
         scalar_types.uint4b8,
+        repack_impl=repack_impl,
         group_size=128,
         act_order=False,
         is_k_full=True,
@@ -290,9 +324,11 @@ def test_marlin_dense_uint4b8_size_m_24_uses_32_row_bucket_matches_reference():
 if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
 
     @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-    def test_marlin_dense_uint8b128_accuracy(group_size: int):
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_marlin_dense_uint8b128_accuracy(group_size: int, repack_impl: str):
         _run_dense_accuracy_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=group_size,
             act_order=False,
             is_k_full=True,
@@ -318,9 +354,11 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
             size_n=256,
         )
 
-    def test_marlin_dense_uint8b128_8_row_bucket_matches_reference():
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_marlin_dense_uint8b128_8_row_bucket_matches_reference(repack_impl: str):
         _run_dense_accuracy_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=128,
             act_order=False,
             is_k_full=True,
@@ -332,11 +370,14 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
 
     @pytest.mark.parametrize("group_size", (-1, 128))
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
     def test_marlin_dense_uint8b128_sm70_scale_zp_math_consistency_matches_reference(
         group_size: int,
+        repack_impl: str,
     ):
         _run_dense_accuracy_case(
             scalar_types.uint8b128,
+            repack_impl=repack_impl,
             group_size=group_size,
             act_order=False,
             is_k_full=True,
@@ -348,7 +389,8 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
 
 
-def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes():
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes(repack_impl: str):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
@@ -392,6 +434,7 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes():
             )
         return
 
+    assert_repack_layout_matches_reference(repack_impl, quant_type=scalar_types.uint4b8)
     a_bf16 = a.to(torch.bfloat16)
     with pytest.raises(RuntimeError, match=_FLOAT16_ACTIVATION_ERROR):
         ops.marlin_gemm(
@@ -419,7 +462,8 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes():
 
 if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
 
-    def test_marlin_dense_uint8b128_rejects_unsupported_dtypes():
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_marlin_dense_uint8b128_rejects_unsupported_dtypes(repack_impl: str):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
 
@@ -463,6 +507,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 )
             return
 
+        assert_repack_layout_matches_reference(repack_impl, quant_type=scalar_types.uint8b128)
         a_bf16 = a.to(torch.bfloat16)
         with pytest.raises(RuntimeError, match=_FLOAT16_ACTIVATION_ERROR):
             ops.marlin_gemm(
