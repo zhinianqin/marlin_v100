@@ -129,16 +129,12 @@ thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
-    {128, 128, 256},
-    {64, 128, 128},
     {128, 64, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
-    {64, 256, 256},
-    {64, 128, 128},
     {128, 64, 128}};
 
 typedef struct {
@@ -189,7 +185,7 @@ int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_blocks,
   int tb_m = thread_m_blocks * 16;
   int sh_a_size = stages * (tb_m * tb_k) * (is_a_8bit ? 1 : 2);
   int sh_b_size = stages * (tb_k * tb_n / pack_factor) * 4;
-  int sh_red_size = tb_m * (tb_n + 8) * 2;
+  int sh_red_size = tb_m * (tb_n + 8) * 4;
   int sh_bias_size = tb_n * 2;
   int tmp_size =
       (sh_b_size > sh_red_size ? sh_red_size : sh_b_size) + sh_bias_size;
@@ -399,7 +395,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   if (prob_n <= 4096) max_par = 16 * 8;
   int max_shared_mem_new = max_shared_mem;
   int rest_m = prob_m;
-  int max_thread_m_blocks = 4;
+  int max_thread_m_blocks = 1;
   while (rest_m) {
     int par_count = rest_m / (max_thread_m_blocks * 16);
     if (par_count > max_par) par_count = max_par;

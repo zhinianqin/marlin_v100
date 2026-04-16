@@ -27,31 +27,19 @@ __device__ __forceinline__ int sm70_atom_c_src_vid(int m_local, int n) {
   return 2 * ((m_local >> 1) & 0x1) + (n & 0x1) + 4 * ((n >> 2) & 0x1);
 }
 
-template <typename FragC>
-__device__ __forceinline__ void scatter_sm70_atoms_to_sm80_fragment_half(
-    const float* accum, FragC& frag_c, int half_idx) {
-  float* dst = reinterpret_cast<float*>(&frag_c);
-  int lane = threadIdx.x & 31;
-  int start_i = half_idx * 2;
+__device__ __forceinline__ bool sm70_atom_is_canonical_lane(int lane) {
+  return (lane & 0xc) == 0;
+}
 
-#pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    int actual_i = start_i + i;
-    int m = (lane >> 2) + 8 * (actual_i >> 1);
-    int n = 2 * (lane & 0x3) + (actual_i & 0x1);
-    int m_local = m & 0x7;
-    int sm70_lane = sm70_atom_c_src_lane(m_local, n);
-    int want_vid = sm70_atom_c_src_vid(m_local, n);
-    float value = 0.0f;
-#pragma unroll
-    for (int vid = 0; vid < 8; ++vid) {
-      float shuffled = __shfl_sync(kFullWarpMask, accum[vid], sm70_lane);
-      if (vid == want_vid) {
-        value = shuffled;
-      }
-    }
-    dst[actual_i] += value;
-  }
+// Canonical inverse mapping from the raw SM70 atom lane/register ownership back
+// to the logical 8x8 output coordinates. This lets us dump the native
+// accumulator directly to shared memory without warp shuffles.
+__device__ __forceinline__ int sm70_atom_c_dst_m(int lane, int vid) {
+  return (lane & 0x1) + 2 * ((vid >> 1) & 0x1) + 4 * ((lane >> 4) & 0x1);
+}
+
+__device__ __forceinline__ int sm70_atom_c_dst_n(int lane, int vid) {
+  return (vid & 0x1) + 2 * ((lane >> 1) & 0x1) + 4 * ((vid >> 2) & 0x1);
 }
 
 __device__ __forceinline__ void run_sm70_atom_packed(uint32_t a0, uint32_t a1,
@@ -94,6 +82,12 @@ __device__ __forceinline__ void run_sm70_atom_packed(uint32_t a0, uint32_t a1,
 template <int m_halves>
 struct Sm70DirectAFragment {
   uint32_t words[2][m_halves][2][2];
+};
+
+template <bool is_m8>
+struct Sm70Accumulator {
+  static constexpr int m_halves = is_m8 ? 1 : 2;
+  float accum[2][m_halves][8];
 };
 
 template <int vecs>
@@ -152,10 +146,22 @@ __device__ __forceinline__ void zero_sm70_accum(float* accum) {
   }
 }
 
-template <typename FragB, typename FragC>
+template <bool is_m8>
+__device__ __forceinline__ void zero_sm70_accumulator(
+    Sm70Accumulator<is_m8>& accum) {
+#pragma unroll
+  for (int out_half = 0; out_half < 2; ++out_half) {
+#pragma unroll
+    for (int m_half = 0; m_half < Sm70Accumulator<is_m8>::m_halves; ++m_half) {
+      zero_sm70_accum(accum.accum[out_half][m_half]);
+    }
+  }
+}
+
+template <typename FragB>
 __device__ __noinline__ void mma_sm70_direct_a_native(
     const Sm70DirectAFragment<2>& a_frag, const FragB (&frag_b_q)[4],
-    FragC& frag_c) {
+    float raw_accum[2][8]) {
   uint32_t b_words[4][2];
 #pragma unroll
   for (int row_group = 0; row_group < 4; ++row_group) {
@@ -168,25 +174,22 @@ __device__ __noinline__ void mma_sm70_direct_a_native(
   for (int k_block = 0; k_block < 2; ++k_block) {
 #pragma unroll
     for (int m_half = 0; m_half < 2; ++m_half) {
-      float accum[8];
-      zero_sm70_accum(accum);
-
       run_sm70_atom_packed(a_frag.words[k_block][m_half][0][0],
                            a_frag.words[k_block][m_half][0][1],
-                           b_words[0][k_block], b_words[1][k_block], accum);
+                           b_words[0][k_block], b_words[1][k_block],
+                           raw_accum[m_half]);
       run_sm70_atom_packed(a_frag.words[k_block][m_half][1][0],
                            a_frag.words[k_block][m_half][1][1],
-                           b_words[2][k_block], b_words[3][k_block], accum);
-
-      scatter_sm70_atoms_to_sm80_fragment_half(accum, frag_c, m_half);
+                           b_words[2][k_block], b_words[3][k_block],
+                           raw_accum[m_half]);
     }
   }
 }
 
-template <typename FragB, typename FragC>
+template <typename FragB>
 __device__ __noinline__ void mma_sm70_direct_a_m8_half(
     const Sm70DirectAFragment<1>& a_frag, const FragB (&frag_b_q)[4],
-    FragC& frag_c, int out_half) {
+    float* raw_accum) {
   uint32_t b_words[4][2];
 #pragma unroll
   for (int row_group = 0; row_group < 4; ++row_group) {
@@ -197,17 +200,12 @@ __device__ __noinline__ void mma_sm70_direct_a_m8_half(
 
 #pragma unroll
   for (int k_block = 0; k_block < 2; ++k_block) {
-    float accum[8];
-    zero_sm70_accum(accum);
-
     run_sm70_atom_packed(b_words[0][k_block], b_words[1][k_block],
                          a_frag.words[k_block][0][0][0],
-                         a_frag.words[k_block][0][0][1], accum);
+                         a_frag.words[k_block][0][0][1], raw_accum);
     run_sm70_atom_packed(b_words[2][k_block], b_words[3][k_block],
                          a_frag.words[k_block][0][1][0],
-                         a_frag.words[k_block][0][1][1], accum);
-
-    scatter_sm70_atoms_to_sm80_fragment_half(accum, frag_c, out_half);
+                         a_frag.words[k_block][0][1][1], raw_accum);
   }
 }
 

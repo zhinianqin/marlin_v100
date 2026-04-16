@@ -189,7 +189,7 @@ int get_kernel_cache_size(thread_config_t const& th_config, bool m_block_size_8,
   int sh_block_meta_size = tb_m * 16;
   int sh_a_size = stages * (tb_m * tb_k) * (is_a_8bit ? 1 : 2);
   int sh_b_size = stages * (tb_k * tb_n / pack_factor) * 4;
-  int sh_red_size = tb_m * (tb_n + 8) * 2;
+  int sh_red_size = tb_m * (tb_n + 8) * 4;
   int sh_bias_size = tb_n * 2;
   int tmp_size =
       (sh_b_size > sh_red_size ? sh_red_size : sh_b_size) + sh_bias_size;

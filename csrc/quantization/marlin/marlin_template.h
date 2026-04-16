@@ -301,7 +301,7 @@ __global__ void Marlin(
 
   using Sm70FragA = detail::Sm70DirectAFragment<m_block_size_8 ? 1 : 2>;
   using FragB = typename MarlinScalarType<a_type_id>::FragB;
-  using FragC = typename MarlinScalarType<a_type_id>::FragC;
+  using Sm70FragC = detail::Sm70Accumulator<m_block_size_8>;
   using FragS = typename MarlinScalarType<c_type_id>::FragS;
   using FragZP = typename MarlinScalarType<c_type_id>::FragZP;
 
@@ -338,6 +338,10 @@ __global__ void Marlin(
   }
 
   constexpr int m_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
+  constexpr int sh_red_rows = m_block_size;
+  constexpr int sh_red_cols = 16 * thread_n_blocks;
+  constexpr int sh_red_swizzle_mask = 0x7;
+  constexpr int sh_red_stride = sh_red_cols + 8;
 
   extern __shared__ int4 sh[];
   int4* sh_new = sh;
@@ -606,13 +610,6 @@ __global__ void Marlin(
   else
     s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) % 4;
 
-  int bias_sh_rd;
-  if constexpr (m_block_size_8) {
-    bias_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 8;
-  } else {
-    bias_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) % 4;
-  }
-
   int bias_sh_wr = threadIdx.x;
   int bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
 
@@ -721,10 +718,13 @@ __global__ void Marlin(
   // optimization.
 
   // Shared memory storage for global fetch pipelines.
-  constexpr int sh_red_size = (2 * thread_n_blocks + 1) * 16 * thread_m_blocks;
+  constexpr int sh_red_size =
+      div_ceil(sh_red_rows * sh_red_stride * int(sizeof(float)),
+               int(sizeof(int4)));
   constexpr int sh_b_size = stages * b_sh_stage;
   int4* sh_b = sh_new;
   int4* sh_red = sh_new;
+  float* sh_red_f32 = reinterpret_cast<float*>(sh_red);
   constexpr int sh_size_b_red_min =
       (sh_red_size < sh_b_size ? sh_red_size : sh_b_size);
   constexpr int sh_size_b_red_max =
@@ -745,9 +745,8 @@ __global__ void Marlin(
   using Sm70FragBQuant = detail::Sm70DirectBQuant<b_thread_vecs>;
   Sm70FragA frag_a[2][thread_m_blocks];
   Sm70FragBQuant frag_b_quant[2][4];
-  FragC frag_c[thread_m_blocks][4][2];
+  Sm70FragC sm70_frag_c[thread_m_blocks][4];
   FragS frag_s[2][4];
-  FragS frag_bias[2][4];
   int frag_qzp[2][num_ints_per_thread];  // Zero-points
   FragZP frag_zp;                        // Zero-points in fp16
   FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
@@ -755,8 +754,12 @@ __global__ void Marlin(
   // Zero accumulators.
   auto zero_accums = [&]() {
   #pragma unroll
-    for (int i = 0; i < thread_m_blocks * 4 * 2 * 4; i++)
-      reinterpret_cast<float*>(frag_c)[i] = 0;
+    for (int i = 0; i < thread_m_blocks; ++i) {
+    #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        detail::zero_sm70_accumulator(sm70_frag_c[i][j]);
+      }
+    }
   };
 
   // Asynchronously fetch the next A, B and s tile from global to the next
@@ -1097,11 +1100,12 @@ __global__ void Marlin(
         #pragma unroll
         for (int i = 0; i < thread_m_blocks; i++) {
           if constexpr (m_block_size_8) {
-            detail::mma_sm70_direct_a_m8_half(frag_a[k2][i], frag_b_group,
-                                              frag_c[i][j][0], out_half);
+            detail::mma_sm70_direct_a_m8_half(
+                frag_a[k2][i], frag_b_group,
+                sm70_frag_c[i][j].accum[out_half][0]);
           } else {
-            detail::mma_sm70_direct_a_native(frag_a[k2][i], frag_b_group,
-                                             frag_c[i][j][out_half]);
+            detail::mma_sm70_direct_a_native(
+                frag_a[k2][i], frag_b_group, sm70_frag_c[i][j].accum[out_half]);
           }
         }
       }
@@ -1112,324 +1116,251 @@ __global__ void Marlin(
   // number of warps while keeping the n dimension of a tile reasonable, we have
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
-  auto thread_block_reduce = [&]() {
-    constexpr int red_off = threads / b_sh_stride_threads / 2;
-    if (red_off >= 1) {
-      auto red_idx = threadIdx.x / b_sh_stride_threads;
-      constexpr int red_sh_stride =
-          b_sh_stride_threads * 4 * 2;
-      constexpr int red_sh_delta = b_sh_stride_threads;
-      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
-                      (threadIdx.x % b_sh_stride_threads);
-
-      // Parallel logarithmic shared memory reduction. We make sure to avoid any
-      // unnecessary read or write iterations, e.g., for two warps we write only
-      // once by warp 1 and read only once by warp 0.
-
-  #pragma unroll
-      for (int m_block = 0; m_block < thread_m_blocks; m_block++) {
-  #pragma unroll
-        for (int i = red_off; i > 0; i /= 2) {
-          if (i <= red_idx && red_idx < 2 * i) {
-  #pragma unroll
-            for (int j = 0; j < 4 * 2; j += (m_block_size_8 ? 2 : 1)) {
-              int red_sh_wr =
-                  red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
-              if (i < red_off) {
-                float* c_rd = reinterpret_cast<float*>(
-                    &sh_red[red_sh_delta * j + red_sh_rd]);
-                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
-  #pragma unroll
-                for (int k = 0; k < 4; k++)
-                  reinterpret_cast<FragC*>(
-                      frag_c)[4 * 2 * m_block + j][k] +=
-                      c_rd[k] + c_wr[k];
-              }
-              sh_red[red_sh_wr] = reinterpret_cast<int4*>(
-                  &frag_c)[4 * 2 * m_block + j];
-            }
-          }
-          __syncthreads();
-        }
-        if (red_idx == 0) {
-  #pragma unroll
-          for (int i = 0; i < 4 * 2;
-               i += (m_block_size_8 ? 2 : 1)) {
-            float* c_rd =
-                reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
-  #pragma unroll
-            for (int j = 0; j < 4; j++)
-              reinterpret_cast<FragC*>(
-                  frag_c)[4 * 2 * m_block + i][j] += c_rd[j];
-          }
-        }
-        __syncthreads();
-      }
-    }
+  auto sh_red_index = [&](int row, int col) {
+    int phys_col = col ^ (row & sh_red_swizzle_mask);
+    return row * sh_red_stride + phys_col;
   };
 
-  // Since multiple threadblocks may process parts of the same column slice, we
-  // finally have to globally reduce over the results. As the striped
-  // partitioning minimizes the number of such reductions and our outputs are
-  // usually rather small, we perform this reduction serially in L2 cache.
-  auto global_reduce_fp16 = [&](bool first = false, bool last = false) {
-    // We are very careful here to reduce directly in the output buffer to
-    // maximize L2 cache utilization in this step. To do this, we write out
-    // results in FP16 (but still reduce with FP32 compute).
-    constexpr int active_threads = 32 * tb_n_warps;
-    if (threadIdx.x < active_threads) {
-      int c_gl_stride = prob_n / 8;
-      int c_gl_wr_delta_o = 8 * c_gl_stride;
-      int c_gl_wr_delta_i = 4 * (active_threads / 32);
-      int c_gl_wr;
-      if constexpr (m_block_size_8) {
-        c_gl_wr = c_gl_stride * ((threadIdx.x % 4) * 2) +
-                  4 * (threadIdx.x / 32) + (threadIdx.x % 32) / 8;
-        c_gl_wr += (2 * thread_n_blocks) * slice_col;
-      } else {
-        c_gl_wr = c_gl_stride * ((threadIdx.x % 32) / 4) +
-                  4 * (threadIdx.x / 32) + threadIdx.x % 4;
-        c_gl_wr += (2 * thread_n_blocks) * slice_col;
-      }
-      constexpr int c_sh_wr_delta = active_threads;
-      auto c_sh_wr = threadIdx.x;
+  auto sh_red_load = [&](int row, int col) {
+    return sh_red_f32[sh_red_index(row, col)];
+  };
 
-      int row = (threadIdx.x % 32) / 4;
+  auto clear_sh_red = [&]() {
+    for (int idx = threadIdx.x; idx < sh_red_rows * sh_red_stride;
+         idx += threads) {
+      sh_red_f32[idx] = 0.0f;
+    }
+    __syncthreads();
+  };
 
-      if (!first) {
-  // Interestingly, doing direct global accesses here really seems to mess up
-  // the compiler and lead to slowdowns, hence we also use async-copies even
-  // though these fetches are not actually asynchronous.
+  auto dump_sm70_to_smem = [&]() {
+    clear_sh_red();
+    if (detail::sm70_atom_is_canonical_lane(lane)) {
   #pragma unroll
-        for (int i = 0; i < (m_block_size_8 ? 2 : thread_m_blocks * 4); i++) {
+      for (int i = 0; i < thread_m_blocks; ++i) {
+  #pragma unroll
+        for (int j = 0; j < 4; ++j) {
           if constexpr (m_block_size_8) {
-            cp_async4_pred(&sh_red[c_sh_wr + c_sh_wr_delta * i],
-                           &C[c_gl_wr + i * c_gl_stride +
-                              (threadIdx.x % 8) / 4 * c_gl_wr_delta_i],
-                           (threadIdx.x % 4) * 2 + i < prob_m);
-          } else {
-            cp_async4_pred(
-                &sh_red[c_sh_wr + c_sh_wr_delta * i],
-                &C[c_gl_wr + c_gl_wr_delta_o * (i / 2) +
-                   c_gl_wr_delta_i * (i % 2)],
-                i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m);
-          }
-        }
-        cp_async_fence();
-        cp_async_wait<0>();
-      }
-
   #pragma unroll
-      for (int i = 0; i < (m_block_size_8 ? 2 : thread_m_blocks * 4); i++) {
-        bool mask = (!m_block_size_8) && (i < (thread_m_blocks - 1) * 4 ||
-                                          8 * (i / 2) + row < prob_m) ||
-                    (m_block_size_8) && ((threadIdx.x % 4) * 2 + i < prob_m);
-        if (mask) {
-          if (!first) {
-            c_scalar_t* c_red_f16;
-            {
-              int4 tmp = sh_red[c_sh_wr + i * c_sh_wr_delta];
-              c_red_f16 = reinterpret_cast<c_scalar_t*>(&tmp);
-            }
+            for (int out_half = 0; out_half < 2; ++out_half) {
   #pragma unroll
-            for (int j = 0; j < 2 * 4; j++) {
-              int delta = 0;
-              if constexpr (m_block_size_8) {
-                delta = j % 2 == 1 ? -2 : 0;
+              for (int vid = 0; vid < 8; ++vid) {
+                int row = detail::sm70_atom_c_dst_n(lane, vid);
+                int col = 16 * sm70_b_j_groups * warp_col + 16 * j +
+                          8 * out_half +
+                          detail::sm70_atom_c_dst_m(lane, vid);
+                atomicAdd(&sh_red_f32[sh_red_index(row, col)],
+                          sm70_frag_c[i][j].accum[out_half][0][vid]);
               }
-              reinterpret_cast<float*>(
-                  &frag_c)[4 * 2 * 4 * (i / 4) + 4 * j +
-                           (i % 4) + delta] += Cdtype::num2float(c_red_f16[j]);
             }
-          }
-          if (!last) {
-            c_scalar_t c_f16[8];
-  #pragma unroll
-            for (int j = 0; j < 2 * 4; j++) {
-              int delta = 0;
-              if constexpr (m_block_size_8) {
-                delta = j % 2 == 1 ? -2 : 0;
-              }
-              c_f16[j] = Cdtype::float2num(reinterpret_cast<float*>(
-                  &frag_c)[4 * 2 * 4 * (i / 4) + 4 * j +
-                           (i % 4) + delta]);
-            }
-            if constexpr (m_block_size_8) {
-              C[c_gl_wr + i * c_gl_stride +
-                (threadIdx.x % 8) / 4 * c_gl_wr_delta_i] =
-                  *reinterpret_cast<int4*>(c_f16);
-            } else {
-              C[c_gl_wr + c_gl_wr_delta_o * (i / 2) +
-                c_gl_wr_delta_i * (i % 2)] = *reinterpret_cast<int4*>(c_f16);
-            }
-          }
-        }
-      }
-    }
-  };
-
-  // Globally reduce over threadblocks that compute the same column block.
-  // We use a tmp C buffer to reduce in full fp32 precision.
-  auto global_reduce_fp32 = [&](bool first = false, bool last = false) {
-    constexpr int tb_m = thread_m_blocks * 16;
-    constexpr int tb_n = thread_n_blocks * 16;
-
-    constexpr int c_size = tb_m * tb_n * sizeof(float) / 16;
-
-    constexpr int active_threads = 32 * tb_n_warps;
-    bool is_th_active = threadIdx.x < active_threads;
-
-    constexpr int num_floats = thread_m_blocks * 4 * 2 * 4;
-    constexpr int th_size = num_floats * sizeof(float) / 16;
-
-    int c_cur_offset = locks_off * c_size;
-
-    if (!is_th_active) {
-      return;
-    }
-
-    if (!first) {
-      float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
-  #pragma unroll
-      for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        sh_red[threadIdx.x] =
-            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
-  #pragma unroll
-        for (int f = 0; f < 4; f++) {
-          frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
-        }
-      }
-    }
-
-    if (!last) {
-      int4* frag_c_ptr = reinterpret_cast<int4*>(&frag_c);
-  #pragma unroll
-      for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        C_tmp[c_cur_offset + active_threads * k + threadIdx.x] = frag_c_ptr[k];
-      }
-    }
-  };
-
-  // Write out the reduce final result in the correct layout. We only actually
-  // reshuffle matrix fragments in this step, the reduction above is performed
-  // in fragment layout.
-  auto write_result = [&](bool last) {
-    int c_gl_stride = prob_n / 8;
-    constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
-    int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
-    constexpr int c_sh_rd_delta =
-        c_sh_stride * (threads / (2 * thread_n_blocks));
-
-    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) +
-                  (threadIdx.x % (2 * thread_n_blocks));
-    c_gl_wr += (2 * thread_n_blocks) * slice_col;
-    int c_sh_wr;
-    if constexpr (m_block_size_8) {
-      c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
-                (threadIdx.x % 32) / 4;
-      c_sh_wr += 64 * (threadIdx.x / 32);
-    } else {
-      c_sh_wr =
-          (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
-      c_sh_wr += 32 * (threadIdx.x / 32);
-    }
-
-    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * thread_n_blocks)) +
-                  (threadIdx.x % (2 * thread_n_blocks));
-
-    int c_gl_wr_end = c_gl_stride * prob_m;
-    // We first reorder in shared memory to guarantee the most efficient final
-    // global write patterns
-    auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {
-      c_scalar_t2 res =
-          Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
-
-      // For per-column quantization we finally apply the scale here (only for
-      // 4-bit)
-      if constexpr (group_blocks == -1 && b_type.size_bits() == 4 &&
-                    (has_zp && dequant_skip_flop || !has_zp)) {
-        c_scalar_t2 tmp_scale = s[0];
-        if constexpr (m_block_size_8) {
-          tmp_scale = Cdtype::num2num2(
-              reinterpret_cast<scalar_t*>(&s[0])[(threadIdx.x % 8) / 4]);
-        }
-        res = __hmul2(res, tmp_scale);
-      }
-
-      if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
-        res = __hmul2(res, global_scale);
-      }
-      if (has_bias && last) {
-        c_scalar_t2 tmp_bias = b_bias[0];
-        if constexpr (m_block_size_8) {
-          tmp_bias = Cdtype::num2num2(
-              reinterpret_cast<scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
-        }
-        res = __hadd2(res, tmp_bias);
-      }
-
-      if constexpr (m_block_size_8) {
-        ((c_scalar_t*)sh_red)[idx] = res.x;
-        ((c_scalar_t*)sh_red)[idx + 8 * c_sh_stride] = res.y;
-      } else {
-        ((c_scalar_t2*)sh_red)[idx] = res;
-      }
-    };
-
-    if (threadIdx.x / 32 < tb_n_warps) {
-  #pragma unroll
-      for (int i = 0; i < thread_m_blocks; i++) {
-  #pragma unroll
-        for (int j = 0; j < 4; j++) {
-          if constexpr (m_block_size_8) {
-            int wr = c_sh_wr + 16 * j;
-            write(wr, frag_c[i][j][0][0], frag_c[i][j][0][1],
-                  frag_s[j / 2][2 * (j % 2) + 0],
-                  frag_bias[j / 2][2 * (j % 2) + 0]);
-            write(wr + 8, frag_c[i][j][0][2], frag_c[i][j][0][3],
-                  frag_s[j / 2][2 * (j % 2) + 1],
-                  frag_bias[j / 2][2 * (j % 2) + 1]);
           } else {
-            int wr = c_sh_wr + 8 * j;
-            write(wr + (4 * c_sh_stride) * 0 + 0, frag_c[i][j][0][0],
-                  frag_c[i][j][0][1], frag_s[j / 2][2 * (j % 2) + 0],
-                  frag_bias[j / 2][2 * (j % 2) + 0]);
-            write(wr + (4 * c_sh_stride) * 8 + 0, frag_c[i][j][0][2],
-                  frag_c[i][j][0][3], frag_s[j / 2][2 * (j % 2) + 0],
-                  frag_bias[j / 2][2 * (j % 2) + 0]);
-            write(wr + (4 * c_sh_stride) * 0 + 4, frag_c[i][j][1][0],
-                  frag_c[i][j][1][1], frag_s[j / 2][2 * (j % 2) + 1],
-                  frag_bias[j / 2][2 * (j % 2) + 1]);
-            write(wr + (4 * c_sh_stride) * 8 + 4, frag_c[i][j][1][2],
-                  frag_c[i][j][1][3], frag_s[j / 2][2 * (j % 2) + 1],
-                  frag_bias[j / 2][2 * (j % 2) + 1]);
+  #pragma unroll
+            for (int out_half = 0; out_half < 2; ++out_half) {
+  #pragma unroll
+              for (int m_half = 0; m_half < 2; ++m_half) {
+  #pragma unroll
+                for (int vid = 0; vid < 8; ++vid) {
+                  int row = 16 * i + 8 * m_half +
+                            detail::sm70_atom_c_dst_m(lane, vid);
+                  int col = 16 * sm70_b_j_groups * warp_col + 16 * j +
+                            8 * out_half +
+                            detail::sm70_atom_c_dst_n(lane, vid);
+                  atomicAdd(&sh_red_f32[sh_red_index(row, col)],
+                            sm70_frag_c[i][j].accum[out_half][m_half][vid]);
+                }
+              }
+            }
           }
         }
-        c_sh_wr += 16 * (4 * c_sh_stride);
       }
     }
     __syncthreads();
+  };
 
-  #pragma unroll
-    for (int i = 0;
-         i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
-         i++) {
-      if (c_gl_wr < c_gl_wr_end) {
-        if (use_atomic_add && slice_count > 1) {
-          c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[c_gl_wr]);
-          c_scalar_t2* sh_red_half2 =
-              reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
-  #pragma unroll
-          for (int a = 0; a < 4; a++) {
-            atomicAdd(&C_half2[a], sh_red_half2[a]);
-          }
-        } else {
-          C[c_gl_wr] = sh_red[c_sh_rd];
+  auto logical_tile_row_valid = [&](int row) { return row < prob_m; };
+
+  auto logical_tile_global_row = [&](int row) -> int64_t {
+    return static_cast<int64_t>(row);
+  };
+
+  auto logical_tile_add = [&](int row, int col, float val) {
+    sh_red_f32[sh_red_index(row, col)] += val;
+  };
+
+  auto logical_param_col = [&](int col) {
+    int block_col = col & 0x1f;
+    int permuted = 8 * ((block_col & 0x7) >> 1) +
+                   2 * ((block_col >> 3) & 0x3) + (block_col & 0x1);
+    return (col & ~0x1f) + permuted;
+  };
+
+  auto logical_tile_scale_num = [&](int col) -> c_scalar_t {
+    if constexpr (group_blocks == -1) {
+      return reinterpret_cast<c_scalar_t*>(sh_s)[logical_param_col(col)];
+    } else {
+      return reinterpret_cast<c_scalar_t*>(sh_s)[col];
+    }
+  };
+
+  auto logical_tile_bias_num = [&](int col) -> c_scalar_t {
+    return reinterpret_cast<c_scalar_t*>(sh_bias)[logical_param_col(col)];
+  };
+
+  auto apply_column_scales_to_logical_tile = [&]() {
+    if constexpr (group_blocks == -1 &&
+                  b_type.size_bits() == 8 &&
+                  (has_zp && dequant_skip_flop || !has_zp)) {
+      for (int linear = threadIdx.x; linear < sh_red_rows * sh_red_cols;
+           linear += threads) {
+        int row = linear / sh_red_cols;
+        int col = linear % sh_red_cols;
+        if (logical_tile_row_valid(row)) {
+          sh_red_f32[sh_red_index(row, col)] *=
+              Cdtype::num2float(logical_tile_scale_num(col));
         }
-        c_gl_wr += c_gl_wr_delta;
-        c_sh_rd += c_sh_rd_delta;
+      }
+      __syncthreads();
+    }
+  };
+
+  auto global_reduce_fp16 = [&](bool first = false, bool last = false) {
+    constexpr int vecs_per_row = sh_red_cols / 8;
+    int c_gl_stride = prob_n / 8;
+    int c_gl_base = slice_col * vecs_per_row;
+
+    for (int linear = threadIdx.x; linear < sh_red_rows * vecs_per_row;
+         linear += threads) {
+      int row = linear / vecs_per_row;
+      int col_vec = linear % vecs_per_row;
+      int col_base = 8 * col_vec;
+      if (!logical_tile_row_valid(row)) {
+        continue;
+      }
+
+      int64_t c_idx = logical_tile_global_row(row) * c_gl_stride +
+                      c_gl_base + col_vec;
+      if (!first) {
+        int4 existing = C[c_idx];
+        c_scalar_t* c_red_f16 = reinterpret_cast<c_scalar_t*>(&existing);
+      #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          logical_tile_add(row, col_base + k, Cdtype::num2float(c_red_f16[k]));
+        }
+      }
+
+      if (!last) {
+        alignas(16) c_scalar_t c_f16[8];
+      #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          c_f16[k] = Cdtype::float2num(sh_red_load(row, col_base + k));
+        }
+        C[c_idx] = *reinterpret_cast<int4*>(c_f16);
+      }
+    }
+    __syncthreads();
+  };
+
+  auto global_reduce_fp32 = [&](bool first = false, bool last = false) {
+    constexpr int tb_m = thread_m_blocks * 16;
+    constexpr int tb_n = thread_n_blocks * 16;
+    constexpr int c_size = tb_m * tb_n * sizeof(float) / 16;
+    constexpr int vecs_per_row = sh_red_cols / 4;
+    int c_cur_offset = locks_off * c_size;
+
+    for (int linear = threadIdx.x; linear < sh_red_rows * vecs_per_row;
+         linear += threads) {
+      int row = linear / vecs_per_row;
+      int col_base = 4 * (linear % vecs_per_row);
+      if (!logical_tile_row_valid(row)) {
+        continue;
+      }
+
+      if (!first) {
+        int4 existing = C_tmp[c_cur_offset + linear];
+        float* c_red_f32 = reinterpret_cast<float*>(&existing);
+      #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          logical_tile_add(row, col_base + k, c_red_f32[k]);
+        }
+      }
+
+      if (!last) {
+        alignas(16) float c_f32[4];
+      #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          c_f32[k] = sh_red_load(row, col_base + k);
+        }
+        C_tmp[c_cur_offset + linear] = *reinterpret_cast<int4*>(c_f32);
+      }
+    }
+    __syncthreads();
+  };
+
+  auto write_result = [&](bool last) {
+    constexpr int vecs_per_row = sh_red_cols / 8;
+    int c_gl_stride = prob_n / 8;
+    int c_gl_base = slice_col * vecs_per_row;
+    float global_scale_f = 1.0f;
+    if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+      global_scale_f =
+          Cdtype::num2float(reinterpret_cast<c_scalar_t*>(&global_scale)[0]);
+    }
+
+    for (int linear = threadIdx.x; linear < sh_red_rows * vecs_per_row;
+         linear += threads) {
+      int row = linear / vecs_per_row;
+      int col_vec = linear % vecs_per_row;
+      int col_base = 8 * col_vec;
+      if (!logical_tile_row_valid(row)) {
+        continue;
+      }
+
+      alignas(16) c_scalar_t packed[8];
+      float vals[8];
+    #pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        vals[k] = sh_red_load(row, col_base + k);
+      }
+
+      if constexpr (group_blocks == -1 &&
+                    b_type.size_bits() == 4 &&
+                    (has_zp && dequant_skip_flop || !has_zp)) {
+      #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          vals[k] *= Cdtype::num2float(logical_tile_scale_num(col_base + k));
+        }
+      }
+
+      if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+      #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          vals[k] *= global_scale_f;
+        }
+      }
+
+      if (has_bias && last) {
+      #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          vals[k] += Cdtype::num2float(logical_tile_bias_num(col_base + k));
+        }
+      }
+
+    #pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        packed[k] = Cdtype::float2num(vals[k]);
+      }
+
+      int64_t c_idx = logical_tile_global_row(row) * c_gl_stride +
+                      c_gl_base + col_vec;
+      if (use_atomic_add && slice_count > 1) {
+        c_scalar_t2* c_half2 = reinterpret_cast<c_scalar_t2*>(&C[c_idx]);
+        c_scalar_t2* packed_half2 = reinterpret_cast<c_scalar_t2*>(packed);
+      #pragma unroll
+        for (int a = 0; a < 4; ++a) {
+          atomicAdd(&c_half2[a], packed_half2[a]);
+        }
+      } else {
+        C[c_idx] = *reinterpret_cast<int4*>(packed);
       }
     }
     __syncthreads();
@@ -1497,25 +1428,8 @@ __global__ void Marlin(
     // While this pattern may not be the most readable, other ways of writing
     // the loop seemed to noticeably worse performance after compilation.
     if (slice_iters == 0) {
-      // convert fp16 accum to fp32 for reduction
-      if constexpr (use_fp16_accum) {
-  #pragma unroll
-        for (int i = 0; i < (thread_m_blocks * 4 * 2); i++) {
-          float* frag_c_part_float = reinterpret_cast<float*>(frag_c) + i * 4;
-          scalar_t* frag_c_part_half =
-              reinterpret_cast<scalar_t*>(frag_c_part_float);
-
-  #pragma unroll
-          for (int i = 3; i >= 0; i--) {
-            frag_c_part_float[i] = Cdtype::num2float(frag_c_part_half[i]);
-          }
-        }
-      }
-
       cp_async_wait<0>();
       bool last = slice_idx == slice_count - 1;
-      // For per-column scales, we only fetch them here in the final step before
-      // write-out
       if constexpr (group_blocks == -1 &&
                     (has_zp && dequant_skip_flop || !has_zp)) {
         if (b_type.size_bits() == 8 || (last || use_atomic_add)) {
@@ -1526,8 +1440,6 @@ __global__ void Marlin(
         }
       }
 
-      thread_block_reduce();
-
       if (has_bias && last) {
         __syncthreads();
         cp_async4_pred(&sh_bias[bias_sh_wr], &b_bias_ptr[bias_gl_rd],
@@ -1535,54 +1447,17 @@ __global__ void Marlin(
         cp_async_fence();
       }
 
+      dump_sm70_to_smem();
+
       if constexpr (group_blocks == -1 &&
                     (has_zp && dequant_skip_flop || !has_zp)) {
         if (b_type.size_bits() == 8 || (last || use_atomic_add)) {
           cp_async_wait<0>();
           __syncthreads();
-          if (threadIdx.x / 32 < tb_n_warps) {
-            reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
-            reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
-            if constexpr (m_block_size_8) {
-              int idx = (threadIdx.x / 4) % 2;
-              c_scalar_t2* frag_s_half2 =
-                  reinterpret_cast<c_scalar_t2*>(frag_s);
-  #pragma unroll
-              for (int i = 0; i < 8; i++) {
-                frag_s_half2[i] = Cdtype::num2num2(
-                    reinterpret_cast<c_scalar_t*>(&frag_s_half2[i])[idx]);
-              }
-            }
-          }
         }
       }
 
-      if (group_blocks == -1 && b_type.size_bits() == 8 &&
-                 (has_zp && dequant_skip_flop || !has_zp)) {
-        if (threadIdx.x / 32 < tb_n_warps) {
-  #pragma unroll
-          for (int i = 0; i < thread_m_blocks; i++) {
-  #pragma unroll
-            for (int j = 0; j < 4; j++) {
-              scale_float<c_type_id>(
-                  reinterpret_cast<float*>(&frag_c[i][j][0][0]),
-                  frag_s[j / 2][2 * (j % 2) + 0]);
-              scale_float<c_type_id>(
-                  reinterpret_cast<float*>(&frag_c[i][j][0][2]),
-                  frag_s[j / 2][2 * (j % 2) + (m_block_size_8 ? 1 : 0)]);
-
-              if constexpr (!m_block_size_8) {
-                scale_float<c_type_id>(
-                    reinterpret_cast<float*>(&frag_c[i][j][1][0]),
-                    frag_s[j / 2][2 * (j % 2) + 1]);
-                scale_float<c_type_id>(
-                    reinterpret_cast<float*>(&frag_c[i][j][1][2]),
-                    frag_s[j / 2][2 * (j % 2) + 1]);
-              }
-            }
-          }
-        }
-      }
+      apply_column_scales_to_logical_tile();
 
       if (slice_count > 1 && !use_atomic_add) {
         // only globally reduce if there is more than one block in a slice
@@ -1597,9 +1472,6 @@ __global__ void Marlin(
 
       if (has_bias && last) {
         cp_async_wait<0>();
-        __syncthreads();
-        reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
-        reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
         __syncthreads();
       }
 
