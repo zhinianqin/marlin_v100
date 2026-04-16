@@ -81,6 +81,7 @@ __global__ void awq_marlin_repack_kernel(
 
     int tc_col = th_id / 4;
     int tc_row = (th_id % 4) * (is_a_8bit ? 4 : 2);
+    int row_group = th_id % 4;
 
     constexpr int tc_offsets[4] = {0, 1, 8, 9};
 
@@ -140,6 +141,8 @@ __global__ void awq_marlin_repack_kernel(
     // https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h
     if constexpr (!is_a_8bit && num_bits == 4) {
       int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+      int col_block = cur_n / 16;
+      int base_idx = out_offset + col_block * 32 + tc_col * 4;
 
       uint32_t res = 0;
 #pragma unroll
@@ -147,7 +150,7 @@ __global__ void awq_marlin_repack_kernel(
         res |= vals[pack_idx[i]] << (i * 4);
       }
 
-      out_ptr[out_offset + th_id * 4 + warp_id] = res;
+      out_ptr[base_idx + row_group] = res;
 
     } else if constexpr (is_a_8bit && num_bits == 4) {
       int pack_idx[8] = {0, 4, 1, 5, 2, 6, 3, 7};
@@ -162,6 +165,8 @@ __global__ void awq_marlin_repack_kernel(
 
     } else {
       constexpr int pack_idx[4] = {0, 2, 1, 3};
+      int col_block = cur_n / 16;
+      int base_idx = out_offset + col_block * 64 + tc_col * 8;
 
       uint32_t res1 = 0;
       uint32_t res2 = 0;
@@ -172,8 +177,8 @@ __global__ void awq_marlin_repack_kernel(
         res2 |= vals[4 + ii] << (i * 8);
       }
 
-      out_ptr[out_offset + th_id * 8 + (warp_id * 2) + 0] = res1;
-      out_ptr[out_offset + th_id * 8 + (warp_id * 2) + 1] = res2;
+      out_ptr[base_idx + row_group] = res1;
+      out_ptr[base_idx + 4 + row_group] = res2;
     }
   };
 

@@ -160,6 +160,16 @@ def test_uint4b8_act_order_repack_layout_matches_reference(repack_impl: str):
     )
 
 
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_uint4_repack_layout_matches_reference(repack_impl: str):
+    _require_repack_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint4,
+        act_order=False,
+    )
+
+
 def test_marlin_quantize_rejects_group_size_zero_outside_runtime_act_order_path():
     weight = torch.randn((128, 256), dtype=torch.float16)
     with pytest.raises(ValueError, match="Unsupported dense group_size=0"):

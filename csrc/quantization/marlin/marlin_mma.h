@@ -96,6 +96,11 @@ struct Sm70DirectAFragment {
   uint32_t words[2][m_halves][2][2];
 };
 
+template <int vecs>
+struct Sm70DirectBQuant {
+  uint32_t words[vecs][4];
+};
+
 __device__ __forceinline__ uint32_t load_sm70_shared_u32(const void* smem_ptr,
                                                          int byte_offset) {
   uint32_t smem =
@@ -126,6 +131,20 @@ __device__ __forceinline__ void load_sm70_direct_a(
   }
 }
 
+template <int vecs>
+__device__ __forceinline__ void load_sm70_direct_b(
+    Sm70DirectBQuant<vecs>& frag_b, const void* smem_ptr,
+    const int byte_offsets[vecs][4]) {
+#pragma unroll
+  for (int vec = 0; vec < vecs; ++vec) {
+#pragma unroll
+    for (int row_group = 0; row_group < 4; ++row_group) {
+      frag_b.words[vec][row_group] =
+          load_sm70_shared_u32(smem_ptr, byte_offsets[vec][row_group]);
+    }
+  }
+}
+
 __device__ __forceinline__ void zero_sm70_accum(float* accum) {
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -133,36 +152,17 @@ __device__ __forceinline__ void zero_sm70_accum(float* accum) {
   }
 }
 
-__device__ __forceinline__ void shuffle_sm70_b_operand_words(
-    uint32_t b_word, int atom_rowcol, int k_slice, uint32_t& b0,
-    uint32_t& b1) {
-  int lane_in_quad_0 = 2 * k_slice;
-  int lane_in_quad_1 = lane_in_quad_0 + 1;
-  int b_source_lane_0 = 4 * atom_rowcol + lane_in_quad_0;
-  int b_source_lane_1 = 4 * atom_rowcol + lane_in_quad_1;
-  b0 = __shfl_sync(kFullWarpMask, b_word, b_source_lane_0);
-  b1 = __shfl_sync(kFullWarpMask, b_word, b_source_lane_1);
-}
-
-__device__ __forceinline__ void shuffle_sm70_transposed_weight_words(
-    uint32_t weight_word, int atom_rowcol, int k_slice, uint32_t& a0,
-    uint32_t& a1) {
-  int lane_in_quad_0 = 2 * k_slice;
-  int lane_in_quad_1 = lane_in_quad_0 + 1;
-  int a_source_lane_0 = 4 * atom_rowcol + lane_in_quad_0;
-  int a_source_lane_1 = 4 * atom_rowcol + lane_in_quad_1;
-  a0 = __shfl_sync(kFullWarpMask, weight_word, a_source_lane_0);
-  a1 = __shfl_sync(kFullWarpMask, weight_word, a_source_lane_1);
-}
-
 template <typename FragB, typename FragC>
-__device__ __forceinline__ void mma_sm70_direct_a(
-    const Sm70DirectAFragment<2>& a_frag,
-    const FragB& frag_b,
+__device__ __noinline__ void mma_sm70_direct_a_native(
+    const Sm70DirectAFragment<2>& a_frag, const FragB (&frag_b_q)[4],
     FragC& frag_c) {
-  const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
-  int lane = threadIdx.x & 31;
-  int atom_rowcol = sm70_atom_rowcol(lane);
+  uint32_t b_words[4][2];
+#pragma unroll
+  for (int row_group = 0; row_group < 4; ++row_group) {
+    const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b_q[row_group]);
+    b_words[row_group][0] = b[0];
+    b_words[row_group][1] = b[1];
+  }
 
 #pragma unroll
   for (int k_block = 0; k_block < 2; ++k_block) {
@@ -171,15 +171,12 @@ __device__ __forceinline__ void mma_sm70_direct_a(
       float accum[8];
       zero_sm70_accum(accum);
 
-#pragma unroll
-      for (int k_slice = 0; k_slice < 2; ++k_slice) {
-        uint32_t b0;
-        uint32_t b1;
-        shuffle_sm70_b_operand_words(b[k_block], atom_rowcol, k_slice, b0, b1);
-        run_sm70_atom_packed(a_frag.words[k_block][m_half][k_slice][0],
-                             a_frag.words[k_block][m_half][k_slice][1], b0, b1,
-                             accum);
-      }
+      run_sm70_atom_packed(a_frag.words[k_block][m_half][0][0],
+                           a_frag.words[k_block][m_half][0][1],
+                           b_words[0][k_block], b_words[1][k_block], accum);
+      run_sm70_atom_packed(a_frag.words[k_block][m_half][1][0],
+                           a_frag.words[k_block][m_half][1][1],
+                           b_words[2][k_block], b_words[3][k_block], accum);
 
       scatter_sm70_atoms_to_sm80_fragment_half(accum, frag_c, m_half);
     }
@@ -187,74 +184,33 @@ __device__ __forceinline__ void mma_sm70_direct_a(
 }
 
 template <typename FragB, typename FragC>
-__device__ __forceinline__ void mma_sm70_direct_a_m8(
-    const Sm70DirectAFragment<1>& a_frag,
-    const FragB& frag_b0,
-    const FragB& frag_b1,
-    FragC& frag_c) {
-  const uint32_t* b0 = reinterpret_cast<const uint32_t*>(&frag_b0);
-  const uint32_t* b1 = reinterpret_cast<const uint32_t*>(&frag_b1);
-  int lane = threadIdx.x & 31;
-  int atom_rowcol = sm70_atom_rowcol(lane);
+__device__ __noinline__ void mma_sm70_direct_a_m8_half(
+    const Sm70DirectAFragment<1>& a_frag, const FragB (&frag_b_q)[4],
+    FragC& frag_c, int out_half) {
+  uint32_t b_words[4][2];
+#pragma unroll
+  for (int row_group = 0; row_group < 4; ++row_group) {
+    const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b_q[row_group]);
+    b_words[row_group][0] = b[0];
+    b_words[row_group][1] = b[1];
+  }
 
 #pragma unroll
   for (int k_block = 0; k_block < 2; ++k_block) {
-#pragma unroll
-    for (int out_half = 0; out_half < 2; ++out_half) {
-      float accum[8];
-      zero_sm70_accum(accum);
-      uint32_t weight_word = out_half == 0 ? b0[k_block] : b1[k_block];
+    float accum[8];
+    zero_sm70_accum(accum);
 
-#pragma unroll
-      for (int k_slice = 0; k_slice < 2; ++k_slice) {
-        uint32_t weight_a0;
-        uint32_t weight_a1;
-        shuffle_sm70_transposed_weight_words(weight_word, atom_rowcol, k_slice,
-                                             weight_a0, weight_a1);
-        run_sm70_atom_packed(weight_a0, weight_a1,
-                             a_frag.words[k_block][0][k_slice][0],
-                             a_frag.words[k_block][0][k_slice][1], accum);
-      }
+    run_sm70_atom_packed(b_words[0][k_block], b_words[1][k_block],
+                         a_frag.words[k_block][0][0][0],
+                         a_frag.words[k_block][0][0][1], accum);
+    run_sm70_atom_packed(b_words[2][k_block], b_words[3][k_block],
+                         a_frag.words[k_block][0][1][0],
+                         a_frag.words[k_block][0][1][1], accum);
 
-      scatter_sm70_atoms_to_sm80_fragment_half(accum, frag_c, out_half);
-    }
+    scatter_sm70_atoms_to_sm80_fragment_half(accum, frag_c, out_half);
   }
 }
 
 }  // namespace detail
-
-template <vllm::ScalarTypeId type_id, bool use_fp16_accum, int k_size = 16>
-__device__ __noinline__ void mma(
-    const detail::Sm70DirectAFragment<2>& a_frag,
-    const typename MarlinScalarType<type_id>::FragB& frag_b,
-    typename MarlinScalarType<type_id>::FragC& frag_c, int idx = 0) {
-  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
-
-  static_cast<void>(idx);
-  static_assert(k_size == 16, "SM70 inline PTX mma only supports k_size=16.");
-  static_assert(std::is_same<scalar_t, half>::value,
-                "SM70 inline PTX mma currently supports fp16 inputs only.");
-  static_assert(!use_fp16_accum,
-                "SM70 inline PTX mma currently supports fp32 accumulation only.");
-
-  detail::mma_sm70_direct_a(a_frag, frag_b, frag_c);
-}
-
-template <vllm::ScalarTypeId type_id, bool use_fp16_accum, int k_size = 16>
-__device__ __noinline__ void mma_m8(
-    const detail::Sm70DirectAFragment<1>& a_frag,
-    const typename MarlinScalarType<type_id>::FragB& frag_b,
-    const typename MarlinScalarType<type_id>::FragB& frag_b2,
-    typename MarlinScalarType<type_id>::FragC& frag_c) {
-  using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
-
-  static_assert(k_size == 16, "SM70 inline PTX mma only supports k_size=16.");
-  static_assert(std::is_same<scalar_t, half>::value,
-                "SM70 build only supports fp16 mma kernels.");
-  static_assert(!use_fp16_accum,
-                "SM70 inline PTX mma currently supports fp32 accumulation only.");
-
-  detail::mma_sm70_direct_a_m8(a_frag, frag_b, frag_b2, frag_c);
-}
 
 }  // namespace MARLIN_NAMESPACE_NAME

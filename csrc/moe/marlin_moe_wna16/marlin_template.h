@@ -688,7 +688,7 @@ __global__ void Marlin(
 
   b_gl_rd += B_expert_off + b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
-  auto b_sh_rd = threadIdx.x * b_thread_vecs;
+  [[maybe_unused]] auto b_sh_rd = threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
 
   int s_gl_rd;
@@ -727,7 +727,8 @@ __global__ void Marlin(
   // row-major in the latter case.
   int s_sh_rd;
   if constexpr (group_blocks != -1)
-    s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
+    s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) +
+              detail::sm70_atom_rowcol(threadIdx.x % 32);
   else if constexpr (group_blocks == -1 &&
                      (m_block_size_8 || (has_zp && !dequant_skip_flop)))
     s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 8;
@@ -753,13 +754,14 @@ __global__ void Marlin(
   if constexpr (has_zp) {
     if constexpr (is_zp_float) {
       if constexpr (group_blocks != -1) {
-        zp_sh_rd =
-            8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
+        zp_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) +
+                   detail::sm70_atom_rowcol(threadIdx.x % 32);
       }
     } else {
       zp_sh_rd = num_ints_per_thread * num_col_threads *
                      ((threadIdx.x / 32) % tb_n_warps) +
-                 num_ints_per_thread * ((threadIdx.x % 32) / num_row_threads);
+                 num_ints_per_thread *
+                     detail::sm70_atom_rowcol(threadIdx.x % 32);
     }
   }
 
@@ -776,8 +778,10 @@ __global__ void Marlin(
   constexpr int sm70_m_halves = m_block_size_8 ? 1 : 2;
   int warp_id = threadIdx.x / 32;
   int warp_row = warp_id / tb_n_warps;
+  int warp_col = warp_id % tb_n_warps;
   int lane = threadIdx.x & 31;
   int sm70_lane_row = detail::sm70_atom_rowcol(lane);
+  constexpr int sm70_b_j_groups = 4;
   // Since the computation of this remapping is non-trivial and, due to our main
   // loop unrolls, all shared memory accesses are static, we simply precompute
   // both transformed reads and writes.
@@ -811,6 +815,26 @@ __global__ void Marlin(
       }
     }
   }
+  int b_sh_rd_direct_bytes[b_sh_wr_iters][sm70_b_j_groups][b_thread_vecs][4];
+  #pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; ++i) {
+  #pragma unroll
+    for (int j = 0; j < sm70_b_j_groups; ++j) {
+      int local_k_block = warp_row * b_sh_wr_iters + i;
+      int local_n_block = 4 * warp_col + j;
+    #pragma unroll
+      for (int vec = 0; vec < b_thread_vecs; ++vec) {
+        int chunk = b_sh_stride * local_k_block +
+                    local_n_block * (8 * b_thread_vecs) +
+                    sm70_lane_row * b_thread_vecs + vec;
+      #pragma unroll
+        for (int row_group = 0; row_group < 4; ++row_group) {
+          b_sh_rd_direct_bytes[i][j][vec][row_group] =
+              chunk * sizeof(int4) + row_group * sizeof(uint32_t);
+        }
+      }
+    }
+  }
 
   // Since B-accesses have non-constant stride they have to be computed at
   // runtime; we break dependencies between subsequent accesses with a tile by
@@ -840,8 +864,9 @@ __global__ void Marlin(
   int4* sh_a = sh_s + sh_s_size;
 
   // Register storage for double buffer of shared memory reads.
+  using Sm70FragBQuant = detail::Sm70DirectBQuant<b_thread_vecs>;
   Sm70FragA frag_a[2][thread_m_blocks];
-  I4 frag_b_quant[2][b_thread_vecs];
+  Sm70FragBQuant frag_b_quant[2][4];
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];
   FragS frag_bias[2][4];
@@ -951,9 +976,10 @@ __global__ void Marlin(
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 
   #pragma unroll
-    for (int i = 0; i < b_thread_vecs; i++) {
-      frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(
-          &sh_b_stage[b_sh_stride * (k % b_sh_wr_iters) + b_sh_rd + i]);
+    for (int j = 0; j < 4; ++j) {
+      detail::load_sm70_direct_b<b_thread_vecs>(
+          frag_b_quant[k % 2][j], sh_b_stage,
+          b_sh_rd_direct_bytes[k % b_sh_wr_iters][j]);
     }
   };
   auto fetch_scales_to_registers = [&](int k, int full_pipe) {
@@ -1136,32 +1162,7 @@ __global__ void Marlin(
   // dequantization and matmul operations.
   #pragma unroll
     for (int j = 0; j < 4; j++) {
-      FragB frag_b0;
-      FragB frag_b1;
-      int b_quant_0, b_quant_1;
-
-      if constexpr (b_type_id == vllm::kFE2M1f.id()) {
-        b_quant_1 = frag_b_quant[k2][0][j];
-        b_quant_0 = b_quant_1 << 8;
-      } else if constexpr (b_type.size_bits() == 4) {
-        b_quant_0 = frag_b_quant[k2][0][j];
-        b_quant_1 = b_quant_0 >> 8;
-      } else {
-        static_assert(b_type.size_bits() == 8);
-        int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
-        b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
-        b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
-      }
-
-      dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
-      dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
-
-      if constexpr (dequant_skip_flop && has_zp && !is_zp_float) {
-        sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);
-        sub_zp<a_type_id>(frag_b1, frag_zp[j], 1);
-      }
-
-      // Apply scale to frag_b0
+      scalar_t scale_vals[2];
       if constexpr (!dequant_skip_flop && has_zp && !is_zp_float &&
                            group_blocks == -1) {
         int idx = (threadIdx.x / 4) % 2;
@@ -1169,29 +1170,66 @@ __global__ void Marlin(
             reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 0])[idx],
             reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 1])[idx]);
         if (is_new_zp) frag_zp[j] = __hmul2(frag_zp[j], s2);
-        scale_and_sub<a_type_id>(frag_b0, s2.x, frag_zp[j].x);
-        scale_and_sub<a_type_id>(frag_b1, s2.y, frag_zp[j].y);
+        scale_vals[0] = s2.x;
+        scale_vals[1] = s2.y;
       } else if constexpr (!dequant_skip_flop && has_zp && group_blocks != -1) {
         if (is_new_zp)
           frag_zp[j] = __hmul2(frag_zp[j],
                                *reinterpret_cast<scalar_t2*>(&frag_s[k2][j]));
-        scale_and_sub<a_type_id>(frag_b0, frag_s[k2][j][0].x, frag_zp[j].x);
-        scale_and_sub<a_type_id>(frag_b1, frag_s[k2][j][0].y, frag_zp[j].y);
-      } else if constexpr (group_blocks != -1) {
-        scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
-        scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
+        scale_vals[0] = frag_s[k2][j][0].x;
+        scale_vals[1] = frag_s[k2][j][0].y;
       }
 
+      auto dequant_sm70_half = [&](int out_half, FragB (&frag_b_group)[4]) {
       #pragma unroll
-      for (int i = 0; i < thread_m_blocks; i++) {
-        if constexpr (m_block_size_8) {
-          mma_m8<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0, frag_b1,
-                                            frag_c[i][j][0]);
-        } else {
-          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0,
-                                         frag_c[i][j][0]);
-          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b1,
-                                         frag_c[i][j][1]);
+        for (int row_group = 0; row_group < 4; ++row_group) {
+          int b_quant;
+          if constexpr (b_type.size_bits() == 4) {
+            uint32_t packed_word = frag_b_quant[k2][j].words[0][row_group];
+            b_quant =
+                static_cast<int>(out_half == 0 ? packed_word : (packed_word >> 8));
+          } else {
+            static_assert(b_type.size_bits() == 8);
+            b_quant = static_cast<int>(frag_b_quant[k2][j].words[out_half]
+                                                          [row_group]);
+          }
+          dequant_data(b_quant, reinterpret_cast<scalar_32bit_t*>(
+                                    &frag_b_group[row_group]));
+        }
+      };
+
+      auto apply_sm70_post_ops = [&](FragB (&frag_b_group)[4], int out_half) {
+      #pragma unroll
+        for (int row_group = 0; row_group < 4; ++row_group) {
+          if constexpr (dequant_skip_flop && has_zp && !is_zp_float) {
+            sub_zp<a_type_id>(frag_b_group[row_group], frag_zp[j], out_half);
+          }
+
+          if constexpr (!dequant_skip_flop && has_zp && !is_zp_float) {
+            scalar_t zp_val = out_half == 0 ? frag_zp[j].x : frag_zp[j].y;
+            scale_and_sub<a_type_id>(frag_b_group[row_group],
+                                     scale_vals[out_half], zp_val);
+          } else if constexpr (group_blocks != -1) {
+            scale<a_type_id>(frag_b_group[row_group], frag_s[k2][j], out_half);
+          }
+        }
+      };
+
+      #pragma unroll
+      for (int out_half = 0; out_half < 2; ++out_half) {
+        FragB frag_b_group[4];
+        dequant_sm70_half(out_half, frag_b_group);
+        apply_sm70_post_ops(frag_b_group, out_half);
+
+        #pragma unroll
+        for (int i = 0; i < thread_m_blocks; i++) {
+          if constexpr (m_block_size_8) {
+            detail::mma_sm70_direct_a_m8_half(frag_a[k2][i], frag_b_group,
+                                              frag_c[i][j][0], out_half);
+          } else {
+            detail::mma_sm70_direct_a_native(frag_a[k2][i], frag_b_group,
+                                             frag_c[i][j][out_half]);
+          }
         }
       }
     }

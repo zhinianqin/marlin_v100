@@ -57,6 +57,12 @@ _REPACK_IMPL_CASES = (
     pytest.param("gptq", id="gptq_marlin_repack"),
     pytest.param("awq", id="awq_marlin_repack"),
 )
+_SM70_ROW_GROUPS = (
+    (0, 1, 8, 9),
+    (2, 3, 10, 11),
+    (4, 5, 12, 13),
+    (6, 7, 14, 15),
+)
 
 
 def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 1) -> torch.Tensor:
@@ -329,25 +335,61 @@ def marlin_unpack(
 ) -> torch.Tensor:
     if quant_type not in _supported_quant_types():
         raise ValueError("Local marlin_v100 helper currently supports uint4b8 and uint8b128 only.")
-    perm = quant_utils.get_weight_perm(quant_type.size_bits, is_a_8bit=False).to(
-        q_weight.device, dtype=torch.long
+    num_bits = quant_type.size_bits
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    tile_words = (16 * 64) // pack_factor
+    packed = (q_weight.detach().cpu().numpy().astype("uint32", copy=False) & 0xFFFFFFFF).reshape(
+        size_k // 16, size_n // 64, tile_words
     )
-    inv_perm = torch.empty_like(perm)
-    inv_perm[perm] = torch.arange(perm.numel(), device=q_weight.device, dtype=torch.long)
+    unpacked = torch.empty((size_k, size_n), dtype=torch.int32)
+    unpacked_np = unpacked.numpy()
 
-    packed = q_weight.to(torch.int64) & 0xFFFFFFFF
-    pack_factor = quant_utils.get_pack_factor(quant_type.size_bits)
-    unpacked = torch.stack(
-        [
-            (packed >> (quant_type.size_bits * i)) & ((1 << quant_type.size_bits) - 1)
-            for i in range(pack_factor)
-        ],
-        dim=-1,
-    )
-    unpacked = unpacked.to(torch.int32).reshape(q_weight.shape[0], q_weight.shape[1] * pack_factor)
-    unpacked = unpacked.reshape(-1, perm.numel())[:, inv_perm].reshape(size_k // 16, size_n * 16)
-    unpacked = unpacked.reshape(size_k // 16, size_n // 16, 16, 16)
-    return unpacked.permute(0, 2, 1, 3).reshape(size_k, size_n)
+    if num_bits == 4:
+        for k_tile in range(size_k // 16):
+            row_start = 16 * k_tile
+            for n_tile in range(size_n // 64):
+                tile = packed[k_tile, n_tile].reshape(4, 8, 4)
+                col_tile_start = 64 * n_tile
+                for j in range(4):
+                    col_block_start = col_tile_start + 16 * j
+                    for atom_rowcol in range(8):
+                        col0 = col_block_start + atom_rowcol
+                        col1 = col0 + 8
+                        for row_group, rows in enumerate(_SM70_ROW_GROUPS):
+                            word = int(tile[j, atom_rowcol, row_group])
+                            packed_vals = [(word >> (num_bits * idx)) & 0xF for idx in range(8)]
+                            logical_vals = [0] * 8
+                            for out_idx, src_idx in enumerate(quant_utils._SM70_U4_PACK_ORDER):
+                                logical_vals[src_idx] = packed_vals[out_idx]
+                            for idx, row in enumerate(rows):
+                                unpacked_np[row_start + row, col0] = logical_vals[idx]
+                                unpacked_np[row_start + row, col1] = logical_vals[4 + idx]
+    else:
+        for k_tile in range(size_k // 16):
+            row_start = 16 * k_tile
+            for n_tile in range(size_n // 64):
+                tile = packed[k_tile, n_tile].reshape(4, 8, 2, 4)
+                col_tile_start = 64 * n_tile
+                for j in range(4):
+                    col_block_start = col_tile_start + 16 * j
+                    for atom_rowcol in range(8):
+                        col0 = col_block_start + atom_rowcol
+                        col1 = col0 + 8
+                        for row_group, rows in enumerate(_SM70_ROW_GROUPS):
+                            word0 = int(tile[j, atom_rowcol, 0, row_group])
+                            word1 = int(tile[j, atom_rowcol, 1, row_group])
+                            packed_vals0 = [(word0 >> (num_bits * idx)) & 0xFF for idx in range(4)]
+                            packed_vals1 = [(word1 >> (num_bits * idx)) & 0xFF for idx in range(4)]
+                            logical_vals0 = [0] * 4
+                            logical_vals1 = [0] * 4
+                            for out_idx, src_idx in enumerate(quant_utils._SM70_U8_PACK_ORDER):
+                                logical_vals0[src_idx] = packed_vals0[out_idx]
+                                logical_vals1[src_idx] = packed_vals1[out_idx]
+                            for idx, row in enumerate(rows):
+                                unpacked_np[row_start + row, col0] = logical_vals0[idx]
+                                unpacked_np[row_start + row, col1] = logical_vals1[idx]
+
+    return unpacked.to(q_weight.device)
 
 
 def marlin_unpermute_scales(
