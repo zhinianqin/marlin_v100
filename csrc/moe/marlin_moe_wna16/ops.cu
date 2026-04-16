@@ -189,7 +189,7 @@ int get_kernel_cache_size(thread_config_t const& th_config, bool m_block_size_8,
   // Get B size
   int tb_k = th_config.thread_k;
   int tb_n = th_config.thread_n;
-  int tb_m = thread_m_blocks * 16;
+  int tb_m = m_block_size_8 ? 8 : (thread_m_blocks * 16);
 
   // shm size for block_sorted_ids/rd_block_sorted_ids/block_topk_weights
   // both of them requires tb_m * 4 bytes (tb_m * int32 or tb_m * float32)
