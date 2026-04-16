@@ -517,7 +517,6 @@ __global__ void Marlin(
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / 4;
   constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
-  constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
   constexpr int b_sh_wr_delta = threads * b_thread_vecs;
@@ -616,7 +615,6 @@ __global__ void Marlin(
   // Zero-points have the same read layout as the scales
   // (without column-wise case)
   constexpr int num_col_threads = 8;
-  constexpr int num_row_threads = 4;
   constexpr int num_ints_per_thread = 8 / pack_factor;
   int zp_sh_rd;
   if constexpr (has_zp) {
