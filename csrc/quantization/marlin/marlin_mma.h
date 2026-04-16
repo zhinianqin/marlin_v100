@@ -159,7 +159,7 @@ __device__ __forceinline__ void zero_sm70_accumulator(
 }
 
 template <typename FragB>
-__device__ __noinline__ void mma_sm70_direct_a_native(
+__device__ __forceinline__ void mma_sm70_direct_a_native(
     const Sm70DirectAFragment<2>& a_frag, const FragB (&frag_b_q)[4],
     float raw_accum[2][8]) {
   uint32_t b_words[4][2];
@@ -187,7 +187,7 @@ __device__ __noinline__ void mma_sm70_direct_a_native(
 }
 
 template <typename FragB>
-__device__ __noinline__ void mma_sm70_direct_a_m8_half(
+__device__ __forceinline__ void mma_sm70_direct_a_m8_half(
     const Sm70DirectAFragment<1>& a_frag, const FragB (&frag_b_q)[4],
     float* raw_accum) {
   uint32_t b_words[4][2];
