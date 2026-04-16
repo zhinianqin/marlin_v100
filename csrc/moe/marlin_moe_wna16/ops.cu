@@ -25,6 +25,7 @@
 
 #include "kernel.h"
 #include "core/registration.h"
+#include <climits>
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -134,19 +135,19 @@ thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
-    {128, 128, 256},
     {128, 64, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
-    {64, 256, 256},
     {128, 64, 128}};
 
 typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
+  bool m_block_size_8;
+  int num_regs;
 } exec_config_t;
 
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
@@ -277,7 +278,8 @@ exec_config_t determine_exec_config(
     bool m_block_size_8, int num_bits, int group_size, bool has_act_order,
     bool is_k_full, bool has_zp, bool is_zp_float, bool is_a_8bit, int stages,
     int max_shared_mem, int sms) {
-  exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
+  exec_config_t exec_cfg =
+      exec_config_t{0, thread_config_t{-1, -1, -1}, m_block_size_8, INT_MAX};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
                                         : small_batch_thread_configs;
@@ -285,8 +287,6 @@ exec_config_t determine_exec_config(
       thread_m_blocks > 1
           ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
           : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
-
-  int count = 0;
   constexpr int device_max_reg_size = 255 * 1024;
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
@@ -331,10 +331,17 @@ exec_config_t determine_exec_config(
           max(prob_n / th_config.thread_n * prob_m * top_k * 4 / sms, 1);
     }
 
-    if (allow_count > count) {
-      count = allow_count;
-      exec_cfg = {count, th_config};
-    };
+    bool better = false;
+    if (allow_count > exec_cfg.blocks_per_sm) {
+      better = true;
+    } else if (allow_count == exec_cfg.blocks_per_sm &&
+               attr.numRegs < exec_cfg.num_regs) {
+      better = true;
+    }
+
+    if (better) {
+      exec_cfg = {allow_count, th_config, m_block_size_8, attr.numRegs};
+    }
   }
 
   return exec_cfg;
@@ -353,6 +360,20 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
                bool use_fp32_reduce, bool is_zp_float) {
+  TORCH_CHECK(moe_block_size == 8 || moe_block_size == 16,
+              "SM70 Marlin MoE only supports moe_block_size=8 or 16. Got ",
+              moe_block_size);
+  TORCH_CHECK(
+      (thread_k == -1 && thread_n == -1) || (thread_k == 128 && thread_n == 64),
+      "SM70 Marlin MoE only supports automatic thread selection or "
+      "thread_k/thread_n=(128,64). Got thread_k=",
+      thread_k, ", thread_n=", thread_n);
+  TORCH_CHECK(
+      blocks_per_sm == -1 || (thread_k == 128 && thread_n == 64),
+      "SM70 Marlin MoE only applies blocks_per_sm when thread_k/thread_n="
+      "(128,64). Got blocks_per_sm=",
+      blocks_per_sm, ", thread_k=", thread_k, ", thread_n=", thread_n);
+
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -452,7 +473,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   if (thread_k != -1 && thread_n != -1) {
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
     if (blocks_per_sm == -1) blocks_per_sm = 1;
-    exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
+    exec_cfg = exec_config_t{blocks_per_sm, thread_tfg, m_block_size_8, 0};
     TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                 " is not divisible by thread_n = ", thread_n);
     TORCH_CHECK(prob_k % thread_k == 0, "prob_k = ", prob_k,
@@ -538,9 +559,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
-    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+  int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
+  bool is_zp_float, int64_t thread_k, int64_t thread_n,
+  int64_t blocks_per_sm) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -613,12 +634,19 @@ torch::Tensor moe_wna16_marlin_gemm(
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
 
-  if (moe_block_size != 8) {
-    TORCH_CHECK(moe_block_size % 16 == 0,
-                "unsupported moe_block_size=", moe_block_size);
-    TORCH_CHECK(moe_block_size >= 16 && moe_block_size <= 64,
-                "unsupported moe_block_size=", moe_block_size);
-  }
+  TORCH_CHECK(moe_block_size == 8 || moe_block_size == 16,
+              "SM70 Marlin MoE only supports moe_block_size=8 or 16. Got ",
+              moe_block_size);
+  TORCH_CHECK(
+      (thread_k == -1 && thread_n == -1) || (thread_k == 128 && thread_n == 64),
+      "SM70 Marlin MoE only supports automatic thread selection or "
+      "thread_k/thread_n=(128,64). Got thread_k=",
+      thread_k, ", thread_n=", thread_n);
+  TORCH_CHECK(
+      blocks_per_sm == -1 || (thread_k == 128 && thread_n == 64),
+      "SM70 Marlin MoE only applies blocks_per_sm when thread_k/thread_n="
+      "(128,64). Got blocks_per_sm=",
+      blocks_per_sm, ", thread_k=", thread_k, ", thread_n=", thread_n);
 
   // Verify A
   TORCH_CHECK(a.size(0) == size_m, "Shape mismatch: a.size(0) = ", a.size(0),

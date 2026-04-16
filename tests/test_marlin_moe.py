@@ -22,6 +22,7 @@ from tests.helpers import (
 
 _MOE_SUPPORTED_QUANT_NAMES = frozenset(supported_moe_quant_type_names(("uint4b8", "uint8b128")))
 _GROUP_SIZES = (-1, 32, 64, 128)
+_SM70_SUPPORTED_MOE_BLOCK_SIZES = (8, 16)
 _FLOAT16_DTYPE_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
     rf"|{source_target_label()} build only supports float16 outputs\."
@@ -29,8 +30,18 @@ _FLOAT16_DTYPE_ERROR = (
 )
 _FORCED_GEOMETRY_REPACK_CASES = (_REPACK_IMPL_CASES[0],)
 _FORCED_THREAD_GEOMETRY_CASES = (
+    pytest.param(8, 128, 128, 128, 64, id="thread_n_64_moe_block_8"),
+    pytest.param(16, 256, 128, 128, 64, id="thread_n_64_moe_block_16"),
+)
+_UNSUPPORTED_MOE_BLOCK_SIZE_CASES = (
+    pytest.param(24, id="moe_block_24"),
+    pytest.param(32, id="moe_block_32"),
+    pytest.param(48, id="moe_block_48"),
+    pytest.param(64, id="moe_block_64"),
+)
+_UNSUPPORTED_THREAD_GEOMETRY_CASES = (
     pytest.param(16, 128, 128, 128, 128, id="thread_n_128_moe_block_16"),
-    pytest.param(32, 256, 128, 64, 256, id="thread_n_256_moe_block_32"),
+    pytest.param(16, 256, 128, 64, 256, id="thread_n_256_moe_block_16"),
 )
 
 
@@ -392,8 +403,8 @@ def _run_fused_moe_accuracy_case(
 ) -> None:
     if act_order:
         raise AssertionError("act_order accuracy coverage was replaced by explicit rejection tests")
-    if moe_block_size != 8 and moe_block_size % 16 != 0:
-        pytest.skip("current SM70 MoE kernel only supports block size 8 or multiples of 16")
+    if moe_block_size not in _SM70_SUPPORTED_MOE_BLOCK_SIZES:
+        raise AssertionError("accuracy helper only covers SM70 MoE block sizes 8 and 16")
 
     _require_moe_cuda()
     torch.manual_seed(0)
@@ -445,8 +456,8 @@ def _assert_moe_backend_rejects_act_order(
     tokens: int = 4,
     moe_block_size: int = 16,
 ) -> None:
-    if moe_block_size != 8 and moe_block_size % 16 != 0:
-        pytest.skip("current SM70 MoE kernel only supports block size 8 or multiples of 16")
+    if moe_block_size not in _SM70_SUPPORTED_MOE_BLOCK_SIZES:
+        raise AssertionError("act_order rejection helper only covers SM70 MoE block sizes 8 and 16")
 
     _require_moe_cuda()
     torch.manual_seed(0)
@@ -618,17 +629,38 @@ def test_fused_marlin_moe_uint4b8_moe_block_size_8_matches_reference(repack_impl
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_fused_marlin_moe_uint4b8_moe_block_size_24_partial_bucket_matches_reference(
+def test_fused_marlin_moe_uint4b8_rejects_unsupported_moe_block_size(
     repack_impl: str,
 ):
-    _run_fused_moe_accuracy_case(
+    _require_moe_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    inputs = _make_moe_accuracy_inputs(
         scalar_types.uint4b8,
         repack_impl=repack_impl,
         group_size=128,
         act_order=False,
-        is_k_full=True,
-        moe_block_size=24,
+        tokens=3,
     )
+
+    with pytest.raises(RuntimeError, match="moe_block_size=8 or 16"):
+        moe.fused_marlin_moe(
+            hidden_states=inputs["hidden_states"],
+            w1=inputs["w1_q"],
+            w2=inputs["w2_q"],
+            w1_scale=inputs["w1_scales"],
+            w2_scale=inputs["w2_scales"],
+            topk_weights=inputs["topk_weights"],
+            topk_ids=inputs["topk_ids"],
+            quant_type_id=scalar_types.uint4b8.id,
+            g_idx1=inputs["w1_g_idx"],
+            g_idx2=inputs["w2_g_idx"],
+            sort_indices1=inputs["w1_perm"],
+            sort_indices2=inputs["w2_perm"],
+            is_k_full=True,
+            moe_block_size=24,
+        )
 
 
 def _run_stage1_kernel_case(
@@ -650,8 +682,8 @@ def _run_stage1_kernel_case(
 ) -> None:
     if act_order:
         raise AssertionError("act_order stage1 coverage was replaced by explicit rejection tests")
-    if moe_block_size != 8 and moe_block_size % 16 != 0:
-        pytest.skip("current SM70 MoE kernel only supports block size 8 or multiples of 16")
+    if moe_block_size not in _SM70_SUPPORTED_MOE_BLOCK_SIZES:
+        raise AssertionError("stage1 helper only covers SM70 MoE block sizes 8 and 16")
 
     _require_moe_cuda()
     torch.manual_seed(0)
@@ -852,6 +884,81 @@ def _run_forced_fused_kernel_case(
     torch.testing.assert_close(fused_output, reference, rtol=7e-2, atol=1e-2)
 
 
+def _assert_stage1_kernel_rejects_unsupported_config(
+    quant_type,
+    *,
+    repack_impl: str,
+    moe_block_size: int,
+    thread_k: int,
+    thread_n: int,
+    error_match: str,
+    hidden: int = 128,
+    intermediate: int = 128,
+    experts: int = 4,
+    tokens: int = 2,
+    topk: int = 2,
+) -> None:
+    _require_moe_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    inputs = _make_moe_accuracy_inputs(
+        quant_type,
+        repack_impl=repack_impl,
+        group_size=128,
+        act_order=False,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+    )
+    hidden_states = inputs["hidden_states"]
+    topk_weights = inputs["topk_weights"]
+    topk_ids = inputs["topk_ids"]
+    workspace = torch.zeros(
+        torch.cuda.get_device_properties(hidden_states.device).multi_processor_count * 4,
+        dtype=torch.int,
+        device=hidden_states.device,
+    )
+    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+        topk_ids, block_size=moe_block_size, num_experts=experts
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        ops.moe_wna16_marlin_gemm(
+            hidden_states,
+            torch.empty((tokens * topk, 2 * intermediate), device="cuda", dtype=torch.float16),
+            inputs["w1_q"],
+            None,
+            inputs["w1_scales"],
+            None,
+            None,
+            None,
+            inputs["w1_g_idx"],
+            inputs["w1_perm"],
+            workspace,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            topk_weights,
+            moe_block_size,
+            topk,
+            False,
+            quant_type.id,
+            tokens,
+            2 * intermediate,
+            hidden,
+            True,
+            False,
+            True,
+            False,
+            thread_k,
+            thread_n,
+            -1,
+        )
+
+
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_moe_wna16_uint4b8_stage1_moe_block_size_8_matches_reference(repack_impl: str):
     _run_stage1_kernel_case(
@@ -865,20 +972,46 @@ def test_moe_wna16_uint4b8_stage1_moe_block_size_8_matches_reference(repack_impl
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_moe_wna16_uint4b8_stage1_moe_block_size_24_matches_reference(repack_impl: str):
-    _run_stage1_kernel_case(
+@pytest.mark.parametrize("moe_block_size", _UNSUPPORTED_MOE_BLOCK_SIZE_CASES)
+def test_moe_wna16_uint4b8_stage1_rejects_unsupported_moe_block_size(
+    repack_impl: str, moe_block_size: int
+):
+    _assert_stage1_kernel_rejects_unsupported_config(
         scalar_types.uint4b8,
         repack_impl=repack_impl,
-        group_size=64,
-        act_order=False,
-        is_k_full=True,
-        moe_block_size=24,
+        moe_block_size=moe_block_size,
+        thread_k=-1,
+        thread_n=-1,
+        error_match="moe_block_size=8 or 16",
     )
 
 
 @pytest.mark.parametrize(
-    "moe_block_size,hidden,intermediate,thread_k,thread_n",
-    _FORCED_THREAD_GEOMETRY_CASES,
+    "moe_block_size,hidden,intermediate,thread_k,thread_n", _UNSUPPORTED_THREAD_GEOMETRY_CASES
+)
+@pytest.mark.parametrize("repack_impl", _FORCED_GEOMETRY_REPACK_CASES)
+def test_moe_wna16_uint4b8_stage1_rejects_unsupported_thread_geometry(
+    repack_impl: str,
+    moe_block_size: int,
+    hidden: int,
+    intermediate: int,
+    thread_k: int,
+    thread_n: int,
+):
+    _assert_stage1_kernel_rejects_unsupported_config(
+        scalar_types.uint4b8,
+        repack_impl=repack_impl,
+        moe_block_size=moe_block_size,
+        hidden=hidden,
+        intermediate=intermediate,
+        thread_k=thread_k,
+        thread_n=thread_n,
+        error_match="automatic thread selection or thread_k/thread_n=\\(128,64\\)",
+    )
+
+
+@pytest.mark.parametrize(
+    "moe_block_size,hidden,intermediate,thread_k,thread_n", _FORCED_THREAD_GEOMETRY_CASES
 )
 @pytest.mark.parametrize("repack_impl", _FORCED_GEOMETRY_REPACK_CASES)
 def test_moe_wna16_uint4b8_stage1_forced_thread_geometry_matches_reference(
@@ -896,17 +1029,16 @@ def test_moe_wna16_uint4b8_stage1_forced_thread_geometry_matches_reference(
         act_order=False,
         is_k_full=True,
         tokens=2,
-        moe_block_size=moe_block_size,
         hidden=hidden,
         intermediate=intermediate,
+        moe_block_size=moe_block_size,
         thread_k=thread_k,
         thread_n=thread_n,
     )
 
 
 @pytest.mark.parametrize(
-    "moe_block_size,hidden,intermediate,thread_k,thread_n",
-    _FORCED_THREAD_GEOMETRY_CASES,
+    "moe_block_size,hidden,intermediate,thread_k,thread_n", _FORCED_THREAD_GEOMETRY_CASES
 )
 @pytest.mark.parametrize("repack_impl", _FORCED_GEOMETRY_REPACK_CASES)
 def test_fused_marlin_moe_uint4b8_forced_thread_geometry_matches_reference(

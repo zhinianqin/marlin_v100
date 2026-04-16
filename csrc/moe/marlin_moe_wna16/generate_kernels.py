@@ -52,9 +52,9 @@ TEMPLATE = (
     "( MARLIN_KERNEL_PARAMS );"
 )
 
-THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (128, 64, 128)]
+THREAD_CONFIGS = [(128, 64, 128)]
 
-THREAD_M_BLOCKS = [0.5, 1, 2]
+THREAD_M_BLOCKS = [0.5, 1]
 
 QUANT_CONFIGS = [
     {
@@ -106,12 +106,6 @@ def generate_new_kernels():
                 all_group_blocks, all_m_blocks, all_thread_configs
             ):
                 thread_k, thread_n, threads = thread_configs
-
-                if threads == 256:
-                    if m_blocks <= 1 and (thread_k, thread_n) != (128, 128):
-                        continue
-                    if m_blocks > 1 and (thread_k, thread_n) != (64, 256):
-                        continue
 
                 config = {
                     "threads": threads,
