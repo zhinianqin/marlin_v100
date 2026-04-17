@@ -364,14 +364,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
               "SM70 Marlin MoE only supports moe_block_size=8 or 16. Got ",
               moe_block_size);
   TORCH_CHECK(
-      (thread_k == -1 && thread_n == -1) || (thread_k == 128 && thread_n == 64),
+      (thread_k == -1 && thread_n == -1) ||
+          (thread_k == 128 && (thread_n == 64 || thread_n == 32)),
       "SM70 Marlin MoE only supports automatic thread selection or "
-      "thread_k/thread_n=(128,64). Got thread_k=",
+      "thread_k/thread_n=(128,64) or (128,32). Got thread_k=",
       thread_k, ", thread_n=", thread_n);
   TORCH_CHECK(
-      blocks_per_sm == -1 || (thread_k == 128 && thread_n == 64),
+      blocks_per_sm == -1 ||
+          (thread_k == 128 && (thread_n == 64 || thread_n == 32)),
       "SM70 Marlin MoE only applies blocks_per_sm when thread_k/thread_n="
-      "(128,64). Got blocks_per_sm=",
+      "(128,64) or (128,32). Got blocks_per_sm=",
       blocks_per_sm, ", thread_k=", thread_k, ", thread_n=", thread_n);
 
   int thread_m_blocks = div_ceil(moe_block_size, 16);
@@ -471,11 +473,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
-    thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
+    int effective_thread_n = thread_n == 32 ? 64 : thread_n;
+    thread_tfg = thread_config_t{thread_k, effective_thread_n,
+                                 thread_k * effective_thread_n / 64};
     if (blocks_per_sm == -1) blocks_per_sm = 1;
     exec_cfg = exec_config_t{blocks_per_sm, thread_tfg, m_block_size_8, 0};
-    TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
-                " is not divisible by thread_n = ", thread_n);
+    TORCH_CHECK(prob_n % effective_thread_n == 0, "prob_n = ", prob_n,
+                " is not divisible by effective thread_n = ",
+                effective_thread_n);
     TORCH_CHECK(prob_k % thread_k == 0, "prob_k = ", prob_k,
                 " is not divisible by thread_k = ", thread_k);
   } else {
@@ -638,14 +643,16 @@ torch::Tensor moe_wna16_marlin_gemm(
               "SM70 Marlin MoE only supports moe_block_size=8 or 16. Got ",
               moe_block_size);
   TORCH_CHECK(
-      (thread_k == -1 && thread_n == -1) || (thread_k == 128 && thread_n == 64),
+      (thread_k == -1 && thread_n == -1) ||
+          (thread_k == 128 && (thread_n == 64 || thread_n == 32)),
       "SM70 Marlin MoE only supports automatic thread selection or "
-      "thread_k/thread_n=(128,64). Got thread_k=",
+      "thread_k/thread_n=(128,64) or (128,32). Got thread_k=",
       thread_k, ", thread_n=", thread_n);
   TORCH_CHECK(
-      blocks_per_sm == -1 || (thread_k == 128 && thread_n == 64),
+      blocks_per_sm == -1 ||
+          (thread_k == 128 && (thread_n == 64 || thread_n == 32)),
       "SM70 Marlin MoE only applies blocks_per_sm when thread_k/thread_n="
-      "(128,64). Got blocks_per_sm=",
+      "(128,64) or (128,32). Got blocks_per_sm=",
       blocks_per_sm, ", thread_k=", thread_k, ", thread_n=", thread_n);
 
   // Verify A

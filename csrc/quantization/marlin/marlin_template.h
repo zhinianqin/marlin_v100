@@ -629,11 +629,22 @@ __global__ void Marlin(
     }
   }
 
-  constexpr int sm70_b_j_groups = 4;
+  constexpr int sm70_total_warps = threads / 32;
+  constexpr int sm70_b_j_groups = thread_n_blocks;
+  constexpr int warp_n_slices = sm70_b_j_groups > 2 ? 2 : 1;
+  constexpr int warp_j_groups = sm70_b_j_groups / warp_n_slices;
   constexpr int sm70_n_atom_tiles = 2 * sm70_b_j_groups;
+  constexpr int sm70_local_n_atom_tiles = 2 * warp_j_groups;
+  constexpr int warp_k_groups = sm70_total_warps / warp_n_slices;
+  constexpr int k_steps_per_warp = thread_k_blocks / warp_k_groups;
+  static_assert(threads % 32 == 0);
+  static_assert(sm70_b_j_groups % warp_n_slices == 0);
+  static_assert(sm70_total_warps % warp_n_slices == 0);
+  static_assert(thread_k_blocks % warp_k_groups == 0);
   int warp_id = threadIdx.x / 32;
-  int warp_row = warp_id / tb_n_warps;
-  int warp_col = warp_id % tb_n_warps;
+  int warp_n_slice = warp_id % warp_n_slices;
+  int warp_k_group = warp_id / warp_n_slices;
+  int j_group_base = warp_n_slice * warp_j_groups;
   int lane = threadIdx.x & 31;
   int sm70_lane_row = detail::sm70_atom_rowcol(lane);
 
@@ -664,8 +675,8 @@ __global__ void Marlin(
   // Register storage for double buffer of shared memory reads.
   using Sm70FragBQuant = detail::Sm70DirectBQuant<b_thread_vecs>;
   Sm70FragA frag_a[2][sm70_m_atom_tiles];
-  Sm70FragBQuant frag_b_quant[2][4];
-  Sm70FragC sm70_frag_c[sm70_m_atom_tiles][sm70_n_atom_tiles];
+  Sm70FragBQuant frag_b_quant[2][warp_j_groups];
+  Sm70FragC sm70_frag_c[sm70_m_atom_tiles][sm70_local_n_atom_tiles];
   FragS frag_s[2][4];
   int frag_qzp[2][num_ints_per_thread];  // Zero-points
   FragZP frag_zp;                        // Zero-points in fp16
@@ -676,7 +687,7 @@ __global__ void Marlin(
   #pragma unroll
     for (int m_atom = 0; m_atom < sm70_m_atom_tiles; ++m_atom) {
     #pragma unroll
-      for (int n_atom = 0; n_atom < sm70_n_atom_tiles; ++n_atom) {
+      for (int n_atom = 0; n_atom < sm70_local_n_atom_tiles; ++n_atom) {
         detail::zero_sm70_accumulator(sm70_frag_c[m_atom][n_atom]);
       }
     }
@@ -766,14 +777,15 @@ __global__ void Marlin(
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe) {
     int4* sh_a_stage = sh_a + a_sh_stage * pipe;
-    detail::load_sm70_direct_a_runtime<sm70_m_atom_tiles, b_sh_wr_iters,
+    detail::load_sm70_direct_a_runtime<sm70_m_atom_tiles, k_steps_per_warp,
                                        a_sh_stride>(
-        frag_a[k % 2], sh_a_stage, warp_row, sm70_lane_row, k % b_sh_wr_iters);
+        frag_a[k % 2], sh_a_stage, warp_k_group, sm70_lane_row,
+        k % k_steps_per_warp);
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-    detail::load_sm70_direct_b_runtime<b_thread_vecs, b_sh_wr_iters,
-                                       b_sh_stride, sm70_b_j_groups>(
-        frag_b_quant[k % 2], sh_b_stage, warp_row, warp_col,
-        sm70_lane_row, k % b_sh_wr_iters);
+    detail::load_sm70_direct_b_runtime<b_thread_vecs, k_steps_per_warp,
+                                       b_sh_stride, warp_j_groups>(
+        frag_b_quant[k % 2], sh_b_stage, warp_k_group, j_group_base,
+        sm70_lane_row, k % k_steps_per_warp);
   };
 
   auto fetch_scales_to_registers = [&](int k, int full_pipe) {
@@ -790,7 +802,7 @@ __global__ void Marlin(
         if constexpr (group_blocks >= thread_k_blocks) {
           constexpr int g = group_blocks / thread_k_blocks;
           if (pipe % g == 0) {
-            if (k % b_sh_wr_iters == 0) {
+            if (k % k_steps_per_warp == 0) {
               int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
               reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
             } else {
@@ -798,11 +810,8 @@ __global__ void Marlin(
                   reinterpret_cast<int4*>(&frag_s[0])[0];
             }
           }
-        } else if (group_blocks2 < b_sh_wr_iters || k % b_sh_wr_iters == 0) {
-          auto warp_id = threadIdx.x / 32;
-          int warp_row = warp_id / tb_n_warps;
-
-          int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
+        } else if (group_blocks2 < k_steps_per_warp || k % k_steps_per_warp == 0) {
+          int k_blocks = k_steps_per_warp * warp_k_group + k % k_steps_per_warp;
           int cur_group_id = k_blocks / group_blocks2;
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
@@ -815,7 +824,7 @@ __global__ void Marlin(
                 reinterpret_cast<int2*>(
                     sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
           }
-        } else if (group_blocks >= b_sh_wr_iters) {
+        } else if (group_blocks >= k_steps_per_warp) {
           if constexpr (b_type_id != vllm::kFE2M1f.id()) {
             reinterpret_cast<int4*>(&frag_s[1])[0] =
                 reinterpret_cast<int4*>(&frag_s[0])[0];
@@ -843,7 +852,7 @@ __global__ void Marlin(
         }
       } else if constexpr (group_blocks >= thread_k_blocks) {
         constexpr int g = group_blocks / thread_k_blocks;
-        if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+        if (pipe % g == 0 && k % k_steps_per_warp == 0) {
           int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
   #pragma unroll
           for (int i = 0; i < num_ints_per_thread; i++) {
@@ -852,11 +861,7 @@ __global__ void Marlin(
           }
         }
       } else {
-        auto warp_id = threadIdx.x / 32;
-
-        int warp_row = warp_id / tb_n_warps;
-
-        int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
+        int k_blocks = k_steps_per_warp * warp_k_group + k % k_steps_per_warp;
         int cur_group_id = k_blocks / div_ceil(group_blocks, 1);
 
         int4* sh_zp_stage = sh_zp + zp_sh_stage * pipe;
@@ -877,16 +882,13 @@ __global__ void Marlin(
       if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
           constexpr int g = group_blocks / thread_k_blocks;
-          if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+          if (pipe % g == 0 && k % k_steps_per_warp == 0) {
             int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
             reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] =
                 sh_zp_stage[zp_sh_rd];
           }
-        } else if (group_blocks < b_sh_wr_iters || k % b_sh_wr_iters == 0) {
-          auto warp_id = threadIdx.x / 32;
-
-          int warp_row = warp_id / tb_n_warps;
-          int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
+        } else if (group_blocks < k_steps_per_warp || k % k_steps_per_warp == 0) {
+          int k_blocks = k_steps_per_warp * warp_k_group + k % k_steps_per_warp;
           int cur_group_id = k_blocks / group_blocks;
 
           int4* sh_zp_stage = sh_zp + zp_sh_stage * pipe;
@@ -911,7 +913,7 @@ __global__ void Marlin(
     constexpr int g =
         group_blocks > 0 ? div_ceil(group_blocks, thread_k_blocks) : 1;
     const bool is_new_zp =
-        ((group_blocks > 0) && (group_blocks < b_sh_wr_iters || k == 0)) &&
+        ((group_blocks > 0) && (group_blocks < k_steps_per_warp || k == 0)) &&
             (pipe % g == 0) ||
         (group_blocks == -1 && is_first_matmul_in_slice);
     if constexpr (has_zp && !is_zp_float) {
@@ -990,8 +992,9 @@ __global__ void Marlin(
   // We iterate over native 8x8 atoms along N while keeping the existing B
   // packing and scale/zp fetch layout.
   #pragma unroll
-    for (int n_atom = 0; n_atom < sm70_n_atom_tiles; ++n_atom) {
-      int j_group = n_atom / 2;
+    for (int n_atom = 0; n_atom < sm70_local_n_atom_tiles; ++n_atom) {
+      int local_j_group = n_atom / 2;
+      int j_group = j_group_base + local_j_group;
       int out_half = n_atom % 2;
       scalar_t scale_val = scalar_t{};
       if constexpr (!dequant_skip_flop && has_zp && !is_zp_float &&
@@ -1014,7 +1017,7 @@ __global__ void Marlin(
       }
 
       FragB frag_b_group[4];
-      dequant_sm70_half(j_group, out_half, frag_b_group);
+      dequant_sm70_half(local_j_group, out_half, frag_b_group);
       apply_sm70_post_ops(j_group, out_half, scale_val, frag_b_group);
 
       #pragma unroll
@@ -1052,12 +1055,12 @@ __global__ void Marlin(
   #pragma unroll
       for (int m_atom = 0; m_atom < sm70_m_atom_tiles; ++m_atom) {
   #pragma unroll
-        for (int n_atom = 0; n_atom < sm70_n_atom_tiles; ++n_atom) {
+        for (int n_atom = 0; n_atom < sm70_local_n_atom_tiles; ++n_atom) {
   #pragma unroll
           for (int vid = 0; vid < 8; ++vid) {
+            int global_n_atom = 2 * j_group_base + n_atom;
             int row = 8 * m_atom + detail::sm70_atom_c_dst_n(lane, vid);
-            int col = 16 * sm70_b_j_groups * warp_col + 8 * n_atom +
-                      detail::sm70_atom_c_dst_m(lane, vid);
+            int col = 8 * global_n_atom + detail::sm70_atom_c_dst_m(lane, vid);
             atomicAdd(&sh_red_f32[sh_red_index(row, col)],
                       sm70_frag_c[m_atom][n_atom].accum[vid]);
           }
@@ -1293,18 +1296,18 @@ __global__ void Marlin(
   #pragma unroll
     for (int pipe = 0; pipe < stages;) {
   #pragma unroll
-      for (int k = 0; k < b_sh_wr_iters; k++) {
+      for (int k = 0; k < k_steps_per_warp; k++) {
         fetch_to_registers(k + 1, pipe % stages);
         fetch_scales_to_registers(k + 1, pipe);
         fetch_zp_to_registers(k + 1, pipe);
-        if (k == b_sh_wr_iters - 2) {
+        if (k == k_steps_per_warp - 2) {
           fetch_to_shared((pipe + stages - 1) % stages, pipe,
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
         }
 
-        matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
+        matmul(k, pipe - (k >= k_steps_per_warp - 2 ? 1 : 0));
       }
       slice_iters--;
       if (slice_iters == 0) {

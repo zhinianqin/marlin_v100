@@ -29,9 +29,13 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 scales\."
 )
 _FORCED_GEOMETRY_REPACK_CASES = (_REPACK_IMPL_CASES[0],)
+_SUPPORTED_THREAD_GEOMETRY_ERROR = (
+    "automatic thread selection or thread_k/thread_n=\\(128,64\\) or \\(128,32\\)"
+)
 _FORCED_THREAD_GEOMETRY_CASES = (
     pytest.param(8, 128, 128, 128, 64, id="thread_n_64_moe_block_8"),
     pytest.param(16, 256, 128, 128, 64, id="thread_n_64_moe_block_16"),
+    pytest.param(16, 256, 128, 128, 32, id="thread_n_32_moe_block_16"),
 )
 _UNSUPPORTED_MOE_BLOCK_SIZE_CASES = (
     pytest.param(24, id="moe_block_24"),
@@ -1006,7 +1010,7 @@ def test_moe_wna16_uint4b8_stage1_rejects_unsupported_thread_geometry(
         intermediate=intermediate,
         thread_k=thread_k,
         thread_n=thread_n,
-        error_match="automatic thread selection or thread_k/thread_n=\\(128,64\\)",
+        error_match=_SUPPORTED_THREAD_GEOMETRY_ERROR,
     )
 
 

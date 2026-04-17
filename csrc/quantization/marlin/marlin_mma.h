@@ -107,17 +107,18 @@ __device__ __forceinline__ uint32_t load_sm70_shared_u32(const void* smem_ptr,
   return value;
 }
 
-template <int m_atoms, int b_sh_wr_iters, int a_sh_stride>
+template <int m_atoms, int k_steps_per_warp, int a_sh_stride>
 __device__ __forceinline__ void load_sm70_direct_a_runtime(
     Sm70DirectAFragment (&frag_a)[m_atoms],
-    const void* smem_ptr, int warp_row, int sm70_lane_row, int tile_k_step) {
+    const void* smem_ptr, int warp_k_group, int sm70_lane_row,
+    int tile_k_step) {
 #pragma unroll
   for (int m_atom = 0; m_atom < m_atoms; ++m_atom) {
 #pragma unroll
     for (int k_block = 0; k_block < 2; ++k_block) {
       int row = 8 * m_atom + sm70_lane_row;
       int local_k_base =
-          16 * (warp_row * b_sh_wr_iters + tile_k_step) + 8 * k_block;
+          16 * (warp_k_group * k_steps_per_warp + tile_k_step) + 8 * k_block;
 #pragma unroll
       for (int k_slice = 0; k_slice < 2; ++k_slice) {
 #pragma unroll
@@ -135,15 +136,14 @@ __device__ __forceinline__ void load_sm70_direct_a_runtime(
   }
 }
 
-template <int vecs, int b_sh_wr_iters, int b_sh_stride, int sm70_b_j_groups>
+template <int vecs, int k_steps_per_warp, int b_sh_stride, int warp_j_groups>
 __device__ __forceinline__ void load_sm70_direct_b_runtime(
-    Sm70DirectBQuant<vecs> (&frag_b)[sm70_b_j_groups], const void* smem_ptr,
-    int warp_row,
-    int warp_col, int sm70_lane_row, int tile_k_step) {
+    Sm70DirectBQuant<vecs> (&frag_b)[warp_j_groups], const void* smem_ptr,
+    int warp_k_group, int j_group_base, int sm70_lane_row, int tile_k_step) {
 #pragma unroll
-  for (int j = 0; j < sm70_b_j_groups; ++j) {
-    int local_k_block = warp_row * b_sh_wr_iters + tile_k_step;
-    int local_n_block = 4 * warp_col + j;
+  for (int j = 0; j < warp_j_groups; ++j) {
+    int local_k_block = warp_k_group * k_steps_per_warp + tile_k_step;
+    int local_n_block = j_group_base + j;
 #pragma unroll
     for (int vec = 0; vec < vecs; ++vec) {
       int chunk = b_sh_stride * local_k_block +
