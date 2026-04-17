@@ -53,11 +53,16 @@ using I4 = Vec<int, 4>;
 
 constexpr int div_ceil(int a, int b) { return (a + b - 1) / b; }
 
+template <typename T>
+__device__ __forceinline__ T ld_global_cg(const T* ptr) {
+  return __ldcg(ptr);
+}
+
 __device__ inline void cp_async1_ca_pred(void* smem_ptr, const void* glob_ptr,
                                          bool pred = true) {
   if (pred) {
     reinterpret_cast<int32_t*>(smem_ptr)[0] =
-        reinterpret_cast<const int32_t*>(glob_ptr)[0];
+        ld_global_cg(reinterpret_cast<const int32_t*>(glob_ptr));
   }
 }
 
@@ -65,7 +70,7 @@ __device__ inline void cp_async2_ca_pred(void* smem_ptr, const void* glob_ptr,
                                          bool pred = true) {
   if (pred) {
     reinterpret_cast<int64_t*>(smem_ptr)[0] =
-        reinterpret_cast<const int64_t*>(glob_ptr)[0];
+        ld_global_cg(reinterpret_cast<const int64_t*>(glob_ptr));
   }
 }
 
@@ -73,7 +78,7 @@ __device__ inline void cp_async4_ca_pred(void* smem_ptr, const void* glob_ptr,
                                          bool pred = true) {
   if (pred) {
     reinterpret_cast<int4*>(smem_ptr)[0] =
-        reinterpret_cast<const int4*>(glob_ptr)[0];
+        ld_global_cg(reinterpret_cast<const int4*>(glob_ptr));
   }
 }
 
@@ -81,13 +86,13 @@ __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr,
                                       bool pred = true) {
   if (pred) {
     reinterpret_cast<int4*>(smem_ptr)[0] =
-        reinterpret_cast<const int4*>(glob_ptr)[0];
+        ld_global_cg(reinterpret_cast<const int4*>(glob_ptr));
   }
 }
 
 __device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
   reinterpret_cast<int4*>(smem_ptr)[0] =
-      reinterpret_cast<const int4*>(glob_ptr)[0];
+      ld_global_cg(reinterpret_cast<const int4*>(glob_ptr));
 }
 
 __device__ inline void cp_async_fence() {}

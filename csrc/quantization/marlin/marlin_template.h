@@ -693,8 +693,9 @@ __global__ void Marlin(
     }
   };
 
-  // Asynchronously fetch the next A, B and s tile from global to the next
-  // shared memory pipeline location.
+  // Fetch the next A, B and s tile from global to the next shared memory
+  // pipeline location. On SM70 the historical cp_async helpers are
+  // synchronous ld.global.cg loads into registers followed by shared stores.
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
     if (pred) {
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
