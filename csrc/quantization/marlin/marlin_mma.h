@@ -107,6 +107,16 @@ __device__ __forceinline__ uint32_t load_sm70_shared_u32(const void* smem_ptr,
   return value;
 }
 
+__device__ __forceinline__ void load_sm70_shared_u32x4(
+    uint32_t& dst0, uint32_t& dst1, uint32_t& dst2, uint32_t& dst3,
+    const void* smem_ptr, int byte_offset) {
+  uint32_t smem =
+      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr)) + byte_offset;
+  asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(dst0), "=r"(dst1), "=r"(dst2), "=r"(dst3)
+               : "r"(smem));
+}
+
 template <int m_atoms, int k_steps_per_warp, int a_sh_stride>
 __device__ __forceinline__ void load_sm70_direct_a_runtime(
     Sm70DirectAFragment (&frag_a)[m_atoms],
@@ -148,13 +158,13 @@ __device__ __forceinline__ void load_sm70_direct_b_runtime(
     for (int vec = 0; vec < vecs; ++vec) {
       int chunk = b_sh_stride * local_k_block +
                   local_n_block * (8 * vecs) + sm70_lane_row * vecs + vec;
-#pragma unroll
-      for (int row_group = 0; row_group < 4; ++row_group) {
-        int byte_offset =
-            chunk * sizeof(int4) + row_group * sizeof(uint32_t);
-        frag_b[j].words[vec][row_group] =
-            load_sm70_shared_u32(smem_ptr, byte_offset);
-      }
+      // B tiles are stored as int4 chunks in shared memory, so the four
+      // row-group words for this vec are already packed into one 16-byte lane.
+      int byte_offset = chunk * sizeof(int4);
+      load_sm70_shared_u32x4(
+          frag_b[j].words[vec][0], frag_b[j].words[vec][1],
+          frag_b[j].words[vec][2], frag_b[j].words[vec][3], smem_ptr,
+          byte_offset);
     }
   }
 }
