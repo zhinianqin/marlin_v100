@@ -91,6 +91,17 @@ __device__ inline uint32_t prmt(uint32_t a) {
   return res;
 }
 
+// SM70's uint4 hot path only consumes bytes 0 and 2. Repacking the current
+// half's source bytes with PRMT removes the serial `>> 8` dependency from the
+// template-level extraction logic.
+__device__ inline uint32_t sm70_u4_even_half_carrier(uint32_t q) {
+  return prmt<0x0, 0x4240>(q);
+}
+
+__device__ inline uint32_t sm70_u4_odd_half_carrier(uint32_t q) {
+  return prmt<0x0, 0x4341>(q);
+}
+
 template <typename scalar_t2, vllm::ScalarTypeId w_type_id,
           bool skip_flop = false>
 __device__ inline void dequant(int q, scalar_t2* frag_b);
@@ -107,15 +118,21 @@ __device__ inline void dequant(int q, scalar_t2* frag_b);
 template <>
 __device__ inline void dequant<half2, vllm::kU4B8.id(), true>(int q,
                                                               half2* frag_b) {
-  const int MASK = 0x000f000f;
+  const int LO = 0x000f000f;
+  const int HI = 0x00f000f0;
   const int EX = 0x64006400;
   // Guarantee that the `(a & b) | c` operations are LOP3s.
-  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
-  q >>= 4;
-  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  // Use the same affine fixup as the unsigned int4 high-half path, but keep
+  // the raw 0..15 range instead of fusing any symmetric zero point.
+  const int MUL = 0x2c002c00;
+  const int ADD = 0xd400d400;
 
   frag_b[0] = *reinterpret_cast<half2*>(&lo);
-  frag_b[1] = *reinterpret_cast<half2*>(&hi);
+  frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
+                      *reinterpret_cast<const half2*>(&MUL),
+                      *reinterpret_cast<const half2*>(&ADD));
 }
 
 template <>

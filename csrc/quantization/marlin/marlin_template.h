@@ -138,6 +138,14 @@ __device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
 }
 
 template <vllm::ScalarTypeId type_id>
+__device__ inline void scale_prepared(
+    typename MarlinScalarType<type_id>::FragB& frag_b,
+    typename MarlinScalarType<type_id>::scalar_t2 s2) {
+  frag_b[0] = __hmul2(frag_b[0], s2);
+  frag_b[1] = __hmul2(frag_b[1], s2);
+}
+
+template <vllm::ScalarTypeId type_id>
 __device__ inline void scale_and_sub(
     typename MarlinScalarType<type_id>::FragB& frag_b,
     typename MarlinScalarType<type_id>::scalar_t s,
@@ -151,6 +159,15 @@ __device__ inline void scale_and_sub(
 }
 
 template <vllm::ScalarTypeId type_id>
+__device__ inline void scale_and_sub_prepared(
+    typename MarlinScalarType<type_id>::FragB& frag_b,
+    typename MarlinScalarType<type_id>::scalar_t2 s2,
+    typename MarlinScalarType<type_id>::scalar_t2 neg_zp2) {
+  frag_b[0] = __hfma2(frag_b[0], s2, neg_zp2);
+  frag_b[1] = __hfma2(frag_b[1], s2, neg_zp2);
+}
+
+template <vllm::ScalarTypeId type_id>
 __device__ inline void sub_zp(
     typename MarlinScalarType<type_id>::FragB& frag_b,
     typename MarlinScalarType<type_id>::scalar_t2& frag_zp, int i) {
@@ -160,6 +177,14 @@ __device__ inline void sub_zp(
       reinterpret_cast<scalar_t*>(&frag_zp)[i]);
   frag_b[0] = __hsub2(frag_b[0], zp);
   frag_b[1] = __hsub2(frag_b[1], zp);
+}
+
+template <vllm::ScalarTypeId type_id>
+__device__ inline void sub_zp_prepared(
+    typename MarlinScalarType<type_id>::FragB& frag_b,
+    typename MarlinScalarType<type_id>::scalar_t2 zp2) {
+  frag_b[0] = __hsub2(frag_b[0], zp2);
+  frag_b[1] = __hsub2(frag_b[1], zp2);
 }
 
 // Given 2 floats multiply by 2 scales (halves)
@@ -924,7 +949,10 @@ __global__ void Marlin(
 
         if constexpr (b_type.size_bits() == 4) {
           zp_quant_0 = frag_qzp[k2][0];
-          zp_quant_1 = zp_quant_0 >> 8;
+          zp_quant_1 =
+              static_cast<int>(sm70_u4_odd_half_carrier(zp_quant_0));
+          zp_quant_0 =
+              static_cast<int>(sm70_u4_even_half_carrier(zp_quant_0));
         } else {
           static_assert(b_type.size_bits() == 8);
           zp_quant_0 = frag_qzp[k2][0];
@@ -960,8 +988,9 @@ __global__ void Marlin(
         int b_quant;
         if constexpr (b_type.size_bits() == 4) {
           uint32_t packed_word = frag_b_quant[k2][j_group].words[0][row_group];
-          b_quant =
-              static_cast<int>(out_half == 0 ? packed_word : (packed_word >> 8));
+          uint32_t even_half = sm70_u4_even_half_carrier(packed_word);
+          uint32_t odd_half = sm70_u4_odd_half_carrier(packed_word);
+          b_quant = static_cast<int>(out_half == 0 ? even_half : odd_half);
         } else {
           static_assert(b_type.size_bits() == 8);
           b_quant = static_cast<int>(frag_b_quant[k2][j_group].words[out_half]
@@ -974,18 +1003,32 @@ __global__ void Marlin(
 
     auto apply_sm70_post_ops = [&](int j_group, int out_half, scalar_t scale_val,
                                    FragB (&frag_b_group)[4]) {
+      scalar_t2 zp2;
+      scalar_t2 scale2;
+      scalar_t2 neg_zp2;
+      if constexpr (dequant_skip_flop && has_zp && !is_zp_float) {
+        zp2 = MarlinScalarType<a_type_id>::num2num2(
+            reinterpret_cast<scalar_t*>(&frag_zp[j_group])[out_half]);
+      }
+      if constexpr (!dequant_skip_flop && has_zp && !is_zp_float) {
+        scale2 = MarlinScalarType<a_type_id>::num2num2(scale_val);
+        neg_zp2 = __hneg2(MarlinScalarType<a_type_id>::num2num2(
+            reinterpret_cast<scalar_t*>(&frag_zp[j_group])[out_half]));
+      } else if constexpr (group_blocks != -1) {
+        scale2 = MarlinScalarType<a_type_id>::num2num2(
+            reinterpret_cast<scalar_t*>(&frag_s[k2][j_group])[out_half]);
+      }
     #pragma unroll
       for (int row_group = 0; row_group < 4; ++row_group) {
         if constexpr (dequant_skip_flop && has_zp && !is_zp_float) {
-          sub_zp<a_type_id>(frag_b_group[row_group], frag_zp[j_group], out_half);
+          sub_zp_prepared<a_type_id>(frag_b_group[row_group], zp2);
         }
 
         if constexpr (!dequant_skip_flop && has_zp && !is_zp_float) {
-          scalar_t zp_val = out_half == 0 ? frag_zp[j_group].x : frag_zp[j_group].y;
-          scale_and_sub<a_type_id>(frag_b_group[row_group], scale_val, zp_val);
+          scale_and_sub_prepared<a_type_id>(frag_b_group[row_group], scale2,
+                                            neg_zp2);
         } else if constexpr (group_blocks != -1) {
-          scale<a_type_id>(frag_b_group[row_group], frag_s[k2][j_group],
-                           out_half);
+          scale_prepared<a_type_id>(frag_b_group[row_group], scale2);
         }
       }
     };
