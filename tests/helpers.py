@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+import pytest
 import torch
 
 from marlin_v100.calibration import validate_dense_group_size
-from marlin_v100 import dense, quant_utils
+from marlin_v100 import dense, ops, quant_utils
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,19 @@ class scalar_types:
     uint8b128 = ScalarType(0, 8, False, 128)
 
 
-def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 1) -> torch.Tensor:
+_REPACK_IMPL_CASES = (
+    pytest.param("gptq", id="gptq_marlin_repack"),
+    pytest.param("awq", id="awq_marlin_repack"),
+)
+_SM70_ROW_GROUPS = (
+    (0, 1, 8, 9),
+    (2, 3, 10, 11),
+    (4, 5, 12, 13),
+    (6, 7, 14, 15),
+)
+
+
+def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 4) -> torch.Tensor:
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
 
@@ -63,6 +76,209 @@ def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
 
 def _supported_quant_types() -> tuple[ScalarType, ...]:
     return (scalar_types.uint4b8, scalar_types.uint8b128)
+
+
+def _supported_unpack_quant_types() -> tuple[ScalarType, ...]:
+    return (scalar_types.uint4, scalar_types.uint4b8, scalar_types.uint8b128)
+
+
+def pack_rows(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if q_weight.shape != (size_k, size_n):
+        raise ValueError(f"Expected q_weight.shape == {(size_k, size_n)}, got {tuple(q_weight.shape)}")
+
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    if size_k % pack_factor != 0:
+        raise ValueError(f"size_k={size_k} must be divisible by pack_factor={pack_factor}")
+
+    packed = torch.zeros((size_k // pack_factor, size_n), dtype=torch.int64, device=q_weight.device)
+    for idx in range(pack_factor):
+        packed |= q_weight[idx::pack_factor, :].to(torch.int64) << (num_bits * idx)
+    return packed.to(torch.int32).contiguous()
+
+
+def gptq_pack(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    return pack_rows(q_weight, num_bits, size_k, size_n)
+
+
+def pack_cols(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if q_weight.shape != (size_k, size_n):
+        raise ValueError(f"Expected q_weight.shape == {(size_k, size_n)}, got {tuple(q_weight.shape)}")
+
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    if size_n % pack_factor != 0:
+        raise ValueError(f"size_n={size_n} must be divisible by pack_factor={pack_factor}")
+
+    packed = torch.zeros((size_k, size_n // pack_factor), dtype=torch.int64, device=q_weight.device)
+    for idx in range(pack_factor):
+        packed |= q_weight[:, idx::pack_factor].to(torch.int64) << (num_bits * idx)
+    return packed.to(torch.int32).contiguous()
+
+
+def unpack_cols(
+    q_packed: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if q_packed.shape != (size_k, size_n // quant_utils.get_pack_factor(num_bits)):
+        raise ValueError(
+            "Expected q_packed.shape == "
+            f"{(size_k, size_n // quant_utils.get_pack_factor(num_bits))}, got {tuple(q_packed.shape)}"
+        )
+
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    unpacked = torch.empty((size_k, size_n), dtype=torch.int32, device=q_packed.device)
+    mask = (1 << num_bits) - 1
+    for idx in range(pack_factor):
+        unpacked[:, idx::pack_factor] = ((q_packed.to(torch.int64) >> (num_bits * idx)) & mask).to(
+            torch.int32
+        )
+    return unpacked.contiguous()
+
+
+def pack_uint4_zero_points(zero_points: torch.Tensor, size_k: int, size_n: int) -> torch.Tensor:
+    if zero_points.shape != (size_k, size_n):
+        raise ValueError(
+            f"Expected zero_points.shape == {(size_k, size_n)}, got {tuple(zero_points.shape)}"
+        )
+
+    order = torch.tensor(quant_utils._SM70_U4_PACK_ORDER, device=zero_points.device, dtype=torch.long)
+    reshaped = zero_points.reshape(size_k, size_n // 8, 8).index_select(2, order)
+    packed = torch.zeros((size_k, size_n // 8), dtype=torch.int64, device=zero_points.device)
+    for idx in range(8):
+        packed |= reshaped[:, :, idx].to(torch.int64) << (4 * idx)
+    return packed.to(torch.int32).contiguous()
+
+
+def unpack_uint4_zero_points(
+    packed_zero_points: torch.Tensor,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if packed_zero_points.shape != (size_k, size_n // 8):
+        raise ValueError(
+            "Expected packed_zero_points.shape == "
+            f"{(size_k, size_n // 8)}, got {tuple(packed_zero_points.shape)}"
+        )
+
+    unpacked = torch.empty((size_k, size_n), dtype=torch.int32, device=packed_zero_points.device)
+    words = packed_zero_points.to(torch.int64)
+    for word_idx in range(size_n // 8):
+        packed_vals = [((words[:, word_idx] >> (4 * idx)) & 0xF).to(torch.int32) for idx in range(8)]
+        logical_vals = [torch.empty_like(packed_vals[0]) for _ in range(8)]
+        for out_idx, src_idx in enumerate(quant_utils._SM70_U4_PACK_ORDER):
+            logical_vals[src_idx] = packed_vals[out_idx]
+        for idx, values in enumerate(logical_vals):
+            unpacked[:, word_idx * 8 + idx] = values
+    return unpacked.contiguous()
+
+
+def awq_pack(
+    q_weight: torch.Tensor,
+    num_bits: int,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    if num_bits == 4:
+        interleave = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=q_weight.device, dtype=torch.long)
+    elif num_bits == 8:
+        interleave = torch.tensor([0, 2, 1, 3], device=q_weight.device, dtype=torch.long)
+    else:
+        raise ValueError(f"num_bits must be 4 or 8, got {num_bits}")
+
+    q_weight = q_weight.reshape((-1, interleave.numel()))[:, interleave].reshape(-1, size_n)
+    return pack_cols(q_weight.contiguous(), num_bits, size_k, size_n)
+
+
+def _deterministic_repack_input(
+    quant_type: ScalarType,
+    *,
+    act_order: bool,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_weight = torch.arange(size_k * size_n, device=device, dtype=torch.int32).reshape(size_k, size_n)
+    q_weight = q_weight.remainder(1 << quant_type.size_bits).contiguous()
+    sort_indices = torch.empty(0, dtype=torch.int, device=device)
+    sorted_q_weight = q_weight
+    if act_order:
+        _g_idx, sort_indices = _make_act_order_metadata(size_k, group_size, torch.device(device))
+        sorted_q_weight = q_weight.index_select(0, sort_indices.to(torch.long)).contiguous()
+    return q_weight, sorted_q_weight, sort_indices
+
+
+def assert_repack_layout_matches_reference(
+    repack_impl: str,
+    *,
+    quant_type: ScalarType,
+    act_order: bool = False,
+    size_k: int = 128,
+    size_n: int = 64,
+    group_size: int = 64,
+) -> None:
+    if repack_impl not in {"gptq", "awq"}:
+        raise ValueError(f"Unsupported repack_impl={repack_impl!r}")
+    if size_k % 16 != 0 or size_n % 64 != 0:
+        raise ValueError(f"Marlin repack expects size_k%16==0 and size_n%64==0, got {(size_k, size_n)}")
+
+    ops._load_dense()
+    q_weight, sorted_q_weight, sort_indices = _deterministic_repack_input(
+        quant_type,
+        act_order=act_order,
+        size_k=size_k,
+        size_n=size_n,
+        group_size=group_size,
+        device="cuda",
+    )
+    weight_perm = quant_utils.get_weight_perm(quant_type.size_bits, is_a_8bit=False).to(q_weight.device)
+    expected = quant_utils.marlin_weights(
+        sorted_q_weight,
+        size_k,
+        size_n,
+        quant_type.size_bits,
+        weight_perm,
+        is_a_8bit=False,
+    )
+
+    if repack_impl == "gptq":
+        packed = gptq_pack(q_weight, quant_type.size_bits, size_k, size_n)
+        actual = ops.gptq_marlin_repack(
+            packed,
+            sort_indices,
+            size_k,
+            size_n,
+            quant_type.size_bits,
+            False,
+        )
+    else:
+        source = sorted_q_weight if act_order else q_weight
+        packed = awq_pack(source, quant_type.size_bits, size_k, size_n)
+        actual = ops.awq_marlin_repack(
+            packed,
+            size_k,
+            size_n,
+            quant_type.size_bits,
+            False,
+        )
+
+    assert torch.equal(actual, expected)
 
 
 def _quantize_unsigned_with_bias(
@@ -83,6 +299,26 @@ def _quantize_unsigned_with_bias(
     q = torch.round(reshaped / scales.unsqueeze(1)).clamp(-bias, bias - 1).to(torch.int32)
     q = (q + bias).reshape(size_k, size_n)
     return q, scales
+
+
+def _quantize_uint4_with_zero_point(
+    weight: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    size_k, size_n = weight.shape
+    if group_size == -1:
+        group_size = size_k
+    if size_k % group_size != 0:
+        raise ValueError(f"group_size={group_size} must divide size_k={size_k}")
+
+    groups = size_k // group_size
+    reshaped = weight.to(torch.float32).reshape(groups, group_size, size_n)
+    mins = reshaped.amin(dim=1)
+    maxs = reshaped.amax(dim=1)
+    scales = ((maxs - mins) / 15.0).clamp_min(1e-6)
+    zero_points = torch.round(-mins / scales).clamp(0, 15).to(torch.int32)
+    q = torch.round(reshaped / scales.unsqueeze(1) + zero_points.unsqueeze(1))
+    q = q.clamp(0, 15).to(torch.int32).reshape(size_k, size_n)
+    return q, scales.to(weight.dtype), zero_points.contiguous()
 
 
 def _make_group_ids(size_k: int, group_size: int, device: torch.device) -> torch.Tensor:
@@ -174,33 +410,152 @@ def marlin_dequantize(
     return dequantized
 
 
+def marlin_quantize_uint4_zp(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_dense_group_size(group_size)
+    size_k, size_n = weight.shape
+    q_weight, scales, zero_points = _quantize_uint4_with_zero_point(weight, group_size)
+    weight_perm = quant_utils.get_weight_perm(scalar_types.uint4.size_bits, is_a_8bit=False)
+    marlin_q_weight = quant_utils.marlin_weights(
+        q_weight,
+        size_k,
+        size_n,
+        scalar_types.uint4.size_bits,
+        weight_perm,
+        is_a_8bit=False,
+    )
+    marlin_scales = dense.marlin_permute_scales(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    packed_zero_points = pack_uint4_zero_points(
+        zero_points,
+        zero_points.shape[0],
+        size_n,
+    )
+    dequantized = marlin_dequantize_uint4_zp(
+        marlin_q_weight,
+        marlin_scales,
+        packed_zero_points,
+        size_k,
+        size_n,
+        group_size,
+    )
+    return weight, marlin_q_weight, marlin_scales, packed_zero_points, dequantized
+
+
+def marlin_dequantize_uint4_zp(
+    q_weight: torch.Tensor,
+    scales: torch.Tensor,
+    packed_zero_points: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    perm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    unpacked = _marlin_unpack_impl(q_weight, size_k, size_n, scalar_types.uint4).to(torch.float32)
+    unpermuted_scales = _marlin_unpermute_scales_impl(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+    ).to(torch.float32)
+    unpacked_zero_points = unpack_uint4_zero_points(
+        packed_zero_points,
+        unpermuted_scales.shape[0],
+        size_n,
+    ).to(torch.float32)
+    if group_size == -1:
+        group_size = size_k
+    expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
+    expanded_zero_points = unpacked_zero_points.repeat_interleave(group_size, dim=0)[:size_k]
+    dequantized = ((unpacked - expanded_zero_points) * expanded_scales).to(torch.float16)
+    if perm is not None and perm.numel() > 0:
+        logical = torch.empty_like(dequantized)
+        logical[perm.to(torch.long)] = dequantized
+        return logical
+    return dequantized
+
+
 def marlin_unpack(
     q_weight: torch.Tensor,
     size_k: int,
     size_n: int,
     quant_type: ScalarType,
 ) -> torch.Tensor:
-    if quant_type not in _supported_quant_types():
-        raise ValueError("Local marlin_v100 helper currently supports uint4b8 and uint8b128 only.")
-    perm = quant_utils.get_weight_perm(quant_type.size_bits, is_a_8bit=False).to(
-        q_weight.device, dtype=torch.long
-    )
-    inv_perm = torch.empty_like(perm)
-    inv_perm[perm] = torch.arange(perm.numel(), device=q_weight.device, dtype=torch.long)
+    if quant_type not in _supported_unpack_quant_types():
+        raise ValueError(
+            "Local marlin_v100 helper currently supports uint4, uint4b8, and uint8b128 unpacking."
+        )
+    return _marlin_unpack_impl(q_weight, size_k, size_n, quant_type)
 
-    packed = q_weight.to(torch.int64) & 0xFFFFFFFF
-    pack_factor = quant_utils.get_pack_factor(quant_type.size_bits)
-    unpacked = torch.stack(
-        [
-            (packed >> (quant_type.size_bits * i)) & ((1 << quant_type.size_bits) - 1)
-            for i in range(pack_factor)
-        ],
-        dim=-1,
+
+def _marlin_unpack_impl(
+    q_weight: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    quant_type: ScalarType,
+) -> torch.Tensor:
+    num_bits = quant_type.size_bits
+    pack_factor = quant_utils.get_pack_factor(num_bits)
+    tile_words = (16 * 64) // pack_factor
+    packed = (q_weight.detach().cpu().numpy().astype("uint32", copy=False) & 0xFFFFFFFF).reshape(
+        size_k // 16, size_n // 64, tile_words
     )
-    unpacked = unpacked.to(torch.int32).reshape(q_weight.shape[0], q_weight.shape[1] * pack_factor)
-    unpacked = unpacked.reshape(-1, perm.numel())[:, inv_perm].reshape(size_k // 16, size_n * 16)
-    unpacked = unpacked.reshape(size_k // 16, size_n // 16, 16, 16)
-    return unpacked.permute(0, 2, 1, 3).reshape(size_k, size_n)
+    unpacked = torch.empty((size_k, size_n), dtype=torch.int32)
+    unpacked_np = unpacked.numpy()
+
+    if num_bits == 4:
+        for k_tile in range(size_k // 16):
+            row_start = 16 * k_tile
+            for n_tile in range(size_n // 64):
+                tile = packed[k_tile, n_tile].reshape(4, 8, 4)
+                col_tile_start = 64 * n_tile
+                for j in range(4):
+                    col_block_start = col_tile_start + 16 * j
+                    for atom_rowcol in range(8):
+                        col0 = col_block_start + atom_rowcol
+                        col1 = col0 + 8
+                        for row_group, rows in enumerate(_SM70_ROW_GROUPS):
+                            word = int(tile[j, atom_rowcol, row_group])
+                            packed_vals = [(word >> (num_bits * idx)) & 0xF for idx in range(8)]
+                            logical_vals = [0] * 8
+                            for out_idx, src_idx in enumerate(quant_utils._SM70_U4_PACK_ORDER):
+                                logical_vals[src_idx] = packed_vals[out_idx]
+                            for idx, row in enumerate(rows):
+                                unpacked_np[row_start + row, col0] = logical_vals[idx]
+                                unpacked_np[row_start + row, col1] = logical_vals[4 + idx]
+    else:
+        for k_tile in range(size_k // 16):
+            row_start = 16 * k_tile
+            for n_tile in range(size_n // 64):
+                tile = packed[k_tile, n_tile].reshape(4, 8, 2, 4)
+                col_tile_start = 64 * n_tile
+                for j in range(4):
+                    col_block_start = col_tile_start + 16 * j
+                    for atom_rowcol in range(8):
+                        col0 = col_block_start + atom_rowcol
+                        col1 = col0 + 8
+                        for row_group, rows in enumerate(_SM70_ROW_GROUPS):
+                            word0 = int(tile[j, atom_rowcol, 0, row_group])
+                            word1 = int(tile[j, atom_rowcol, 1, row_group])
+                            packed_vals0 = [(word0 >> (num_bits * idx)) & 0xFF for idx in range(4)]
+                            packed_vals1 = [(word1 >> (num_bits * idx)) & 0xFF for idx in range(4)]
+                            logical_vals0 = [0] * 4
+                            logical_vals1 = [0] * 4
+                            for out_idx, src_idx in enumerate(quant_utils._SM70_U8_PACK_ORDER):
+                                logical_vals0[src_idx] = packed_vals0[out_idx]
+                                logical_vals1[src_idx] = packed_vals1[out_idx]
+                            for idx, row in enumerate(rows):
+                                unpacked_np[row_start + row, col0] = logical_vals0[idx]
+                                unpacked_np[row_start + row, col1] = logical_vals1[idx]
+
+    return unpacked.to(q_weight.device)
 
 
 def marlin_unpermute_scales(
@@ -210,8 +565,19 @@ def marlin_unpermute_scales(
     group_size: int,
     quant_type: ScalarType,
 ) -> torch.Tensor:
-    if quant_type not in _supported_quant_types():
-        raise ValueError("Local marlin_v100 helper currently supports uint4b8 and uint8b128 only.")
+    if quant_type not in _supported_unpack_quant_types():
+        raise ValueError(
+            "Local marlin_v100 helper currently supports uint4, uint4b8, and uint8b128 scale unpermute."
+        )
+    return _marlin_unpermute_scales_impl(scales, size_k, size_n, group_size)
+
+
+def _marlin_unpermute_scales_impl(
+    scales: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+) -> torch.Tensor:
     scale_perm, scale_perm_single = dense.get_scale_perms()
     perm = scale_perm if group_size < size_k and group_size != -1 else scale_perm_single
     perm = torch.tensor(perm, device=scales.device, dtype=torch.long)
@@ -279,6 +645,44 @@ def marlin_quantize_experts_with_metadata(
     return (
         torch.stack(q_weights),
         torch.stack(scales),
+        torch.stack(dequantized),
+        torch.stack(g_indices),
+        torch.stack(perms),
+    )
+
+
+def marlin_quantize_experts_uint4_zp_with_metadata(
+    weights: torch.Tensor,
+    group_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    q_weights = []
+    scales = []
+    zero_points = []
+    dequantized = []
+    g_indices = []
+    perms = []
+    for expert in range(weights.shape[0]):
+        _, q_weight, scale, packed_zero_points, expert_dequantized = marlin_quantize_uint4_zp(
+            weights[expert],
+            group_size,
+        )
+        q_weights.append(q_weight)
+        scales.append(scale)
+        zero_points.append(packed_zero_points)
+        dequantized.append(expert_dequantized)
+        g_indices.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+        perms.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+    return (
+        torch.stack(q_weights),
+        torch.stack(scales),
+        torch.stack(zero_points),
         torch.stack(dequantized),
         torch.stack(g_indices),
         torch.stack(perms),

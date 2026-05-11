@@ -4,12 +4,23 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from marlin_v100 import dense, moe
-from marlin_v100.calibration import supported_dense_quant_type_names
+from marlin_v100 import dense, moe, ops
+from marlin_v100.calibration import (
+    source_target_capability,
+    source_target_label,
+    supported_dense_quant_type_names,
+)
 from tests.helpers import (
+    _REPACK_IMPL_CASES,
+    assert_repack_layout_matches_reference,
+    make_moe_model_like_inputs,
+    marlin_dequantize_uint4_zp,
     marlin_dequantize,
     marlin_quantize,
+    marlin_quantize_experts_uint4_zp_with_metadata,
     marlin_quantize_experts,
+    marlin_quantize_experts_with_metadata,
+    marlin_quantize_uint4_zp,
     scalar_types,
 )
 
@@ -28,6 +39,23 @@ _ROUNDTRIP_CASES = [
     )
     for name in supported_dense_quant_type_names(_ROUNDTRIP_TOLERANCES)
 ]
+_REPACK_QUANT_CASES = [
+    pytest.param(_ROUNDTRIP_TOLERANCES[name][0], id=name)
+    for name in supported_dense_quant_type_names(_ROUNDTRIP_TOLERANCES)
+]
+
+
+def _require_repack_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    target_capability = source_target_capability()
+    capability = torch.cuda.get_device_capability()
+    if capability != target_capability:
+        pytest.skip(f"Marlin repack requires {source_target_label()} for this source tree")
+    try:
+        ops._load_dense()
+    except Exception as exc:  # pragma: no cover - depends on local build state
+        pytest.skip(f"marlin dense extension is not available: {exc}")
 
 
 @pytest.mark.parametrize(
@@ -115,10 +143,97 @@ def test_marlin_quantize_act_order_round_trip_matches_original_weight(
     torch.testing.assert_close(dequantized, weight, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("quant_type", _REPACK_QUANT_CASES)
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_repack_layout_matches_reference_for_supported_dense_quant_types(
+    quant_type,
+    repack_impl: str,
+):
+    _require_repack_cuda()
+    assert_repack_layout_matches_reference(repack_impl, quant_type=quant_type)
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_uint4b8_act_order_repack_layout_matches_reference(repack_impl: str):
+    _require_repack_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint4b8,
+        act_order=True,
+    )
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_uint4_repack_layout_matches_reference(repack_impl: str):
+    _require_repack_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint4,
+        act_order=False,
+    )
+
+
 def test_marlin_quantize_rejects_group_size_zero_outside_runtime_act_order_path():
     weight = torch.randn((128, 256), dtype=torch.float16)
     with pytest.raises(ValueError, match="Unsupported dense group_size=0"):
         marlin_quantize(weight, scalar_types.uint4b8, 0, False)
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+def test_marlin_quantize_uint4_zp_round_trip_matches_original_weight(group_size: int):
+    torch.manual_seed(0)
+    weight = torch.randn((128, 256), dtype=torch.float16)
+    _weight, q_weight, scales, zero_points, dequantized = marlin_quantize_uint4_zp(weight, group_size)
+
+    assert q_weight.shape == (weight.shape[0] // 16, weight.shape[1] * 16 // 8)
+    assert scales.shape == (
+        1 if group_size == -1 else weight.shape[0] // group_size,
+        weight.shape[1],
+    )
+    assert zero_points.shape == (
+        1 if group_size == -1 else weight.shape[0] // group_size,
+        weight.shape[1] // 8,
+    )
+    assert zero_points.dtype == torch.int32
+    assert torch.isfinite(dequantized).all()
+    torch.testing.assert_close(dequantized, weight, atol=4.0e-1, rtol=3.0e-1)
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+def test_marlin_quantize_experts_uint4_zp_round_trip_matches_original_weights(group_size: int):
+    torch.manual_seed(0)
+    weights = torch.randn((2, 128, 256), dtype=torch.float16)
+    q_weights, scales, zero_points, dequantized, g_idx, perm = (
+        marlin_quantize_experts_uint4_zp_with_metadata(weights, group_size)
+    )
+    expected_groups = 1 if group_size == -1 else weights.shape[1] // group_size
+
+    assert q_weights.shape[0] == weights.shape[0]
+    assert scales.shape == (weights.shape[0], expected_groups, weights.shape[2])
+    assert zero_points.shape == (weights.shape[0], expected_groups, weights.shape[2] // 8)
+    assert dequantized.shape == weights.shape
+    assert g_idx.shape == (weights.shape[0], 0)
+    assert perm.shape == (weights.shape[0], 0)
+    assert zero_points.dtype == torch.int32
+    assert torch.isfinite(dequantized).all()
+    torch.testing.assert_close(dequantized, weights, atol=4.0e-1, rtol=3.0e-1)
+
+
+def test_marlin_dequantize_uint4_zp_matches_quantize_helper_output():
+    torch.manual_seed(0)
+    weight = torch.randn((128, 256), dtype=torch.float16)
+    _weight, q_weight, scales, zero_points, dequantized = marlin_quantize_uint4_zp(weight, 64)
+    roundtrip = marlin_dequantize_uint4_zp(
+        q_weight,
+        scales,
+        zero_points,
+        size_k=weight.shape[0],
+        size_n=weight.shape[1],
+        group_size=64,
+    )
+
+    assert zero_points.dtype == torch.int32
+    torch.testing.assert_close(roundtrip, dequantized, atol=0.0, rtol=0.0)
 
 
 def test_dense_wrapper_rejects_incomplete_act_order_metadata_before_loading_extension():
@@ -140,6 +255,30 @@ def test_dense_wrapper_rejects_incomplete_act_order_metadata_before_loading_exte
             workspace=workspace,
             g_idx=g_idx,
             perm=None,
+            is_k_full=True,
+        )
+
+
+def test_dense_wrapper_rejects_act_order_metadata_before_loading_extension():
+    a = torch.randn((4, 128), dtype=torch.float16)
+    weight = torch.randn((128, 256), dtype=torch.float16)
+    _, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
+        weight, scalar_types.uint4b8, 64, True
+    )
+    workspace = torch.zeros((1,), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="act_order is not supported"):
+        dense.run_marlin_gemm(
+            a,
+            q_weight,
+            scales,
+            scalar_types.uint4b8.id,
+            size_m=a.shape[0],
+            size_n=weight.shape[1],
+            size_k=weight.shape[0],
+            workspace=workspace,
+            g_idx=g_idx,
+            perm=sort_indices,
             is_k_full=True,
         )
 
@@ -166,4 +305,38 @@ def test_moe_wrapper_rejects_incomplete_act_order_metadata_before_loading_extens
             quant_type_id=scalar_types.uint4b8.id,
             g_idx1=g_idx,
             sort_indices1=None,
+        )
+
+
+def test_moe_wrapper_rejects_act_order_metadata_before_loading_extension():
+    hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
+        tokens=4,
+        hidden=128,
+        intermediate=128,
+        experts=2,
+        topk=2,
+        device="cpu",
+    )
+    w1_q, w1_scale, _w1_dequant, g_idx1, sort_indices1 = marlin_quantize_experts_with_metadata(
+        w1, scalar_types.uint4b8, 64, True
+    )
+    w2_q, w2_scale, _w2_dequant, _g_idx2, _sort_indices2 = marlin_quantize_experts_with_metadata(
+        w2, scalar_types.uint4b8, 64, False
+    )
+
+    with pytest.raises(ValueError, match="act_order is not supported"):
+        moe.fused_marlin_moe(
+            hidden_states=hidden_states,
+            w1=w1_q,
+            w2=w2_q,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_type_id=scalar_types.uint4b8.id,
+            g_idx1=g_idx1,
+            g_idx2=None,
+            sort_indices1=sort_indices1,
+            sort_indices2=None,
+            is_k_full=True,
         )
