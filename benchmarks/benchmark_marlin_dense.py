@@ -27,10 +27,12 @@ from marlin_v100 import dense, ops
 from tests.helpers import (
     marlin_make_workspace_new,
     marlin_quantize,
+    marlin_quantize_uint4_zp,
     scalar_types,
 )
 
 _DENSE_QUANT_TYPE_CANDIDATES = {
+    "uint4": scalar_types.uint4,
     "uint4b8": scalar_types.uint4b8,
     "uint8b128": scalar_types.uint8b128,
 }
@@ -190,9 +192,19 @@ def run_case(
     device = torch.device("cuda")
     a = torch.randn((size_m, size_k), device=device, dtype=torch.float16)
     weight = torch.randn((size_k, size_n), device=device, dtype=torch.float16)
-    weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
-        weight, quant_type, group_size, act_order
-    )
+    b_zeros = None
+    if quant_name == "uint4":
+        if act_order:
+            return None
+        _weight, q_weight, scales, b_zeros, weight_ref = marlin_quantize_uint4_zp(
+            weight, group_size
+        )
+        g_idx = torch.empty(0, dtype=torch.int, device=device)
+        sort_indices = torch.empty(0, dtype=torch.int, device=device)
+    else:
+        weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
+            weight, quant_type, group_size, act_order
+        )
     workspace = marlin_make_workspace_new(device)
     torch_output = torch.empty((size_m, size_n), device=device, dtype=torch.float16)
     marlin_output = torch.empty((size_m, size_n), device=device, dtype=torch.float16)
@@ -211,6 +223,7 @@ def run_case(
             size_n,
             size_k,
             workspace=workspace,
+            b_zeros=b_zeros,
             g_idx=g_idx,
             perm=sort_indices,
             is_k_full=is_k_full,
@@ -245,6 +258,7 @@ def run_case(
                 size_k,
                 workspace=workspace,
                 c=marlin_output,
+                b_zeros=b_zeros,
                 g_idx=g_idx,
                 perm=sort_indices,
                 is_k_full=is_k_full,

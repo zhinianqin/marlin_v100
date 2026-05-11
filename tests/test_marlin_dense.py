@@ -17,11 +17,12 @@ from tests.helpers import (
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
     marlin_quantize,
+    marlin_quantize_uint4_zp,
     scalar_types,
 )
 
 _DENSE_SUPPORTED_QUANT_NAMES = frozenset(
-    supported_dense_quant_type_names(("uint4b8", "uint8b128"))
+    supported_dense_quant_type_names(("uint4", "uint4b8", "uint8b128"))
 )
 _GROUP_SIZES = (-1, 32, 64, 128)
 _FLOAT16_ACTIVATION_ERROR = (
@@ -276,6 +277,62 @@ def _assert_dense_backend_rejects_act_order(
         )
 
 
+def _run_dense_uint4_zp_accuracy_case(
+    *,
+    repack_impl: str,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+) -> None:
+    _require_marlin_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint4,
+        act_order=False,
+        group_size=64 if group_size == -1 else group_size,
+    )
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, zero_points, dequantized = marlin_quantize_uint4_zp(
+        w, group_size
+    )
+    output = ops.marlin_gemm(
+        a,
+        None,
+        q_w,
+        None,
+        scales,
+        None,
+        None,
+        zero_points,
+        None,
+        None,
+        marlin_make_workspace_new(a.device),
+        scalar_types.uint4.id,
+        a.shape[0],
+        w.shape[1],
+        w.shape[0],
+        True,
+        False,
+        True,
+        False,
+    )
+    reference = torch.matmul(a.to(torch.float32), dequantized.to(torch.float32)).to(
+        torch.float16
+    )
+
+    assert torch.isfinite(output).all()
+    assert not torch.all(output == 0)
+    assert output.float().std().item() > 0
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint4b8_accuracy(group_size: int, repack_impl: str):
@@ -366,6 +423,158 @@ def test_marlin_dense_uint4b8_size_m_24_uses_32_row_bucket_matches_reference(
         size_k=256,
         size_n=256,
     )
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4_zp_accuracy(group_size: int, repack_impl: str):
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=group_size,
+        rtol=5e-2,
+        atol=2.5e-1,
+    )
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4_zp_8_row_bucket_matches_reference(repack_impl: str):
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=256,
+    )
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4_zp_size_m_24_matches_reference(repack_impl: str):
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=24,
+        size_k=256,
+        size_n=256,
+    )
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4_zp_small_tile_matches_reference(repack_impl: str):
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=128,
+        size_n=128,
+    )
+
+
+def test_marlin_dense_uint4_zp_requires_zero_points():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+    w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, _zero_points, _dequantized = marlin_quantize_uint4_zp(w, 128)
+
+    with pytest.raises(RuntimeError, match="requires integer zero-points"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            None,
+            None,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint4.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            False,
+        )
+
+
+def test_marlin_dense_uint4_zp_rejects_float_zero_points():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+    w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, zero_points, _dequantized = marlin_quantize_uint4_zp(w, 128)
+
+    with pytest.raises(RuntimeError, match="does not support float zero-points"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zero_points.to(torch.float16),
+            None,
+            None,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint4.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            True,
+        )
+
+
+def test_marlin_dense_uint4_zp_rejects_act_order():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    size_k = 256
+    a = torch.randn((16, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, 256), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, zero_points, _dequantized = marlin_quantize_uint4_zp(w, 64)
+    g_idx = (torch.arange(size_k, device=a.device, dtype=torch.int32) // 64).contiguous()
+    perm = torch.arange(size_k, device=a.device, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="act_order is not supported"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zero_points,
+            g_idx,
+            perm,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint4.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            False,
+        )
 
 
 if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:

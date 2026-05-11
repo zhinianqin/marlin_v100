@@ -18,7 +18,10 @@ _QUANT_CANDIDATES = ("uint4", "uint4b8", "uint8b128", "fp8", "nvfp4", "mxfp4")
 def test_sm70_support_matrix_filters_out_fp8_family_candidates():
     target = (7, 0)
 
-    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == ("uint4b8",)
+    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == (
+        "uint4",
+        "uint4b8",
+    )
     assert supported_moe_quant_type_names(_QUANT_CANDIDATES, target) == (
         "uint4",
         "uint4b8",
@@ -38,7 +41,10 @@ def test_sm70_support_matrix_filters_out_fp8_family_candidates():
 def test_unknown_capability_falls_back_to_sm70_style_quant_candidates():
     target = (8, 0)
 
-    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == ("uint4b8",)
+    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == (
+        "uint4",
+        "uint4b8",
+    )
     assert supported_moe_quant_type_names(_QUANT_CANDIDATES, target) == (
         "uint4",
         "uint4b8",

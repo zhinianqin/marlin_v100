@@ -35,7 +35,7 @@ class ArchitectureSupport:
 
 
 QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
-    "uint4": QuantTypeSupport(name="uint4", dense_supported=False, moe_supported=True),
+    "uint4": QuantTypeSupport(name="uint4", dense_supported=True, moe_supported=True),
     "uint4b8": QuantTypeSupport(name="uint4b8", dense_supported=True, moe_supported=True),
     "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=False, moe_supported=True),
     "fp8": QuantTypeSupport(
@@ -60,8 +60,8 @@ QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
 }
 
 _ARCHITECTURE_SUPPORT: dict[tuple[int, int], ArchitectureSupport] = {
-    # 2b1fd987 keeps SM70 limited to the uint4b8/uint8b128-style paths. Kernel
-    # generators and runtime checks explicitly reject fp8 and nvfp4-specific flows.
+    # SM70 is limited to int quantized paths. Kernel generators and runtime
+    # checks explicitly reject fp8 and nvfp4-specific flows.
     (7, 0): ArchitectureSupport(
         target_capability=(7, 0),
         dense_group_sizes=(-1, 32, 64, 128),
