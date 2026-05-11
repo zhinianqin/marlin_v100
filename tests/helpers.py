@@ -162,6 +162,25 @@ def pack_uint4_zero_points(zero_points: torch.Tensor, size_k: int, size_n: int) 
     packed = torch.zeros((size_k, size_n // 8), dtype=torch.int64, device=zero_points.device)
     for idx in range(8):
         packed |= reshaped[:, :, idx].to(torch.int64) << (4 * idx)
+
+    words_per_tile = quant_utils._SM70_U4_ZERO_WORDS_PER_CTA_N
+    full_tiles = packed.shape[1] // words_per_tile
+    if full_tiles > 0:
+        pair_order = torch.tensor(
+            quant_utils._SM70_U4_ZERO_WORD_PAIR_ORDER,
+            device=zero_points.device,
+            dtype=torch.long,
+        )
+        tiled = packed[:, : full_tiles * words_per_tile].reshape(
+            size_k, full_tiles, words_per_tile
+        )
+        paired = tiled.index_select(2, pair_order).reshape(
+            size_k, full_tiles * words_per_tile
+        )
+        if full_tiles * words_per_tile != packed.shape[1]:
+            packed = torch.cat((paired, packed[:, full_tiles * words_per_tile :]), dim=1)
+        else:
+            packed = paired
     return packed.to(torch.int32).contiguous()
 
 
@@ -178,6 +197,28 @@ def unpack_uint4_zero_points(
 
     unpacked = torch.empty((size_k, size_n), dtype=torch.int32, device=packed_zero_points.device)
     words = packed_zero_points.to(torch.int64)
+    words_per_tile = quant_utils._SM70_U4_ZERO_WORDS_PER_CTA_N
+    full_tiles = words.shape[1] // words_per_tile
+    if full_tiles > 0:
+        pair_order = torch.tensor(
+            quant_utils._SM70_U4_ZERO_WORD_PAIR_ORDER,
+            device=packed_zero_points.device,
+            dtype=torch.long,
+        )
+        inverse_order = torch.empty_like(pair_order)
+        inverse_order[pair_order] = torch.arange(
+            words_per_tile, device=packed_zero_points.device, dtype=torch.long
+        )
+        tiled = words[:, : full_tiles * words_per_tile].reshape(
+            size_k, full_tiles, words_per_tile
+        )
+        unpaired = tiled.index_select(2, inverse_order).reshape(
+            size_k, full_tiles * words_per_tile
+        )
+        if full_tiles * words_per_tile != words.shape[1]:
+            words = torch.cat((unpaired, words[:, full_tiles * words_per_tile :]), dim=1)
+        else:
+            words = unpaired
     for word_idx in range(size_n // 8):
         packed_vals = [((words[:, word_idx] >> (4 * idx)) & 0xF).to(torch.int32) for idx in range(8)]
         logical_vals = [torch.empty_like(packed_vals[0]) for _ in range(8)]
@@ -230,7 +271,7 @@ def assert_repack_layout_matches_reference(
     quant_type: ScalarType,
     act_order: bool = False,
     size_k: int = 128,
-    size_n: int = 64,
+    size_n: int = 128,
     group_size: int = 64,
 ) -> None:
     if repack_impl not in {"gptq", "awq"}:
