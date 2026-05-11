@@ -44,6 +44,29 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
   list(APPEND VLLM_GPU_FLAGS "--compress-mode=size")
 endif()
 
+if(NOT DEFINED CUTLASS_DIR)
+  if(DEFINED ENV{CUTLASS_DIR} AND NOT "$ENV{CUTLASS_DIR}" STREQUAL "")
+    set(CUTLASS_DIR "$ENV{CUTLASS_DIR}" CACHE PATH "Path to the external CUTLASS checkout")
+  else()
+    set(CUTLASS_DIR "/root/source/repos/cutlass" CACHE PATH "Path to the external CUTLASS checkout")
+  endif()
+endif()
+
+if(NOT EXISTS "${CUTLASS_DIR}/include/cute/tensor.hpp")
+  message(FATAL_ERROR
+    "CUTLASS_DIR must point to a CUTLASS checkout with include/cute/tensor.hpp. "
+    "Current CUTLASS_DIR='${CUTLASS_DIR}'.")
+endif()
+
+if(NOT EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
+  message(FATAL_ERROR
+    "CUTLASS_DIR must point to a CUTLASS checkout with include/cutlass/cutlass.h. "
+    "Current CUTLASS_DIR='${CUTLASS_DIR}'.")
+endif()
+
+set(MARLIN_V100_CUTLASS_INCLUDE_DIRS "${CUTLASS_DIR}/include")
+message(STATUS "marlin_v100 CUTLASS_DIR: ${CUTLASS_DIR}")
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CUDA_TOOLKIT_ROOT_DIR}/include")
 if(CUDA_VERSION VERSION_GREATER_EQUAL 13.0)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${CUDA_TOOLKIT_ROOT_DIR}/include/cccl")
@@ -142,6 +165,7 @@ define_extension_target(
   LANGUAGE ${VLLM_GPU_LANG}
   SOURCES ${MARLIN_V100_DENSE_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+  INCLUDE_DIRECTORIES ${MARLIN_V100_CUTLASS_INCLUDE_DIRS}
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   USE_SABI 3
   WITH_SOABI)
@@ -152,6 +176,7 @@ define_extension_target(
   LANGUAGE ${VLLM_GPU_LANG}
   SOURCES ${MARLIN_V100_MOE_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+  INCLUDE_DIRECTORIES ${MARLIN_V100_CUTLASS_INCLUDE_DIRS}
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   USE_SABI 3
   WITH_SOABI)
