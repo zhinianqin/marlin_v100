@@ -72,6 +72,44 @@ __global__ void awq_marlin_repack_kernel(
       return;
     }
 
+    constexpr int tile_size =
+        target_tile_k_size * target_tile_n_size / pack_factor;
+    int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_size;
+
+    if constexpr (!is_a_8bit && num_bits == 4) {
+      int word_idx = threadIdx.x;
+      if (word_idx >= tile_size) {
+        return;
+      }
+
+      int local_k = word_idx / 8;
+      int local_n_vec = word_idx % 8;
+
+      constexpr int sh_stride = tile_n_ints;
+      int4* sh_stage_ptr = sh + stage_size * pipe;
+      uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
+      uint32_t packed_src =
+          sh_stage_int_ptr[local_k * sh_stride + local_n_vec];
+
+      constexpr int undo_pack[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+      constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+      uint32_t vals[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        vals[i] = (packed_src >> (undo_pack[i] * 4)) & 0xF;
+      }
+
+      uint32_t res = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        res |= vals[pack_idx[i]] << (i * 4);
+      }
+
+      out_ptr[out_offset + word_idx] = res;
+      return;
+    }
+
     auto warp_id = threadIdx.x / 32;
     auto th_id = threadIdx.x % 32;
 
@@ -131,10 +169,6 @@ __global__ void awq_marlin_repack_kernel(
         vals[4 + i] = (packed_src_1 >> (cur_n_pos_unpacked * num_bits)) & mask;
       }
     }
-
-    constexpr int tile_size =
-        target_tile_k_size * target_tile_n_size / pack_factor;
-    int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_size;
 
     // Result of:
     // https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h

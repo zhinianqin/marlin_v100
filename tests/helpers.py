@@ -514,22 +514,20 @@ def _marlin_unpack_impl(
         for k_tile in range(size_k // 16):
             row_start = 16 * k_tile
             for n_tile in range(size_n // 64):
-                tile = packed[k_tile, n_tile].reshape(4, 8, 4)
+                tile = packed[k_tile, n_tile].reshape(16, 8)
                 col_tile_start = 64 * n_tile
-                for j in range(4):
-                    col_block_start = col_tile_start + 16 * j
-                    for atom_rowcol in range(8):
-                        col0 = col_block_start + atom_rowcol
-                        col1 = col0 + 8
-                        for row_group, rows in enumerate(_SM70_ROW_GROUPS):
-                            word = int(tile[j, atom_rowcol, row_group])
-                            packed_vals = [(word >> (num_bits * idx)) & 0xF for idx in range(8)]
-                            logical_vals = [0] * 8
-                            for out_idx, src_idx in enumerate(quant_utils._SM70_U4_PACK_ORDER):
-                                logical_vals[src_idx] = packed_vals[out_idx]
-                            for idx, row in enumerate(rows):
-                                unpacked_np[row_start + row, col0] = logical_vals[idx]
-                                unpacked_np[row_start + row, col1] = logical_vals[4 + idx]
+                for local_k in range(16):
+                    for local_n_vec in range(8):
+                        word = int(tile[local_k, local_n_vec])
+                        packed_vals = [(word >> (num_bits * idx)) & 0xF for idx in range(8)]
+                        logical_vals = [0] * 8
+                        for out_idx, src_idx in enumerate(quant_utils._SM70_U4_PACK_ORDER):
+                            logical_vals[src_idx] = packed_vals[out_idx]
+                        for idx, value in enumerate(logical_vals):
+                            unpacked_np[
+                                row_start + local_k,
+                                col_tile_start + local_n_vec * 8 + idx,
+                            ] = value
     else:
         for k_tile in range(size_k // 16):
             row_start = 16 * k_tile
@@ -578,12 +576,7 @@ def _marlin_unpermute_scales_impl(
     size_n: int,
     group_size: int,
 ) -> torch.Tensor:
-    scale_perm, scale_perm_single = dense.get_scale_perms()
-    perm = scale_perm if group_size < size_k and group_size != -1 else scale_perm_single
-    perm = torch.tensor(perm, device=scales.device, dtype=torch.long)
-    inv_perm = torch.empty_like(perm)
-    inv_perm[perm] = torch.arange(perm.numel(), device=scales.device, dtype=torch.long)
-    return scales.reshape(-1, perm.numel())[:, inv_perm].reshape(-1, size_n).contiguous()
+    return scales.reshape(-1, size_n).contiguous()
 
 
 def marlin_dense_reference(

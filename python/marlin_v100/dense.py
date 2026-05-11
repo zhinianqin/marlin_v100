@@ -23,11 +23,6 @@ def marlin_permute_scales(
     group_size: int,
     is_a_8bit: bool = False,
 ) -> torch.Tensor:
-    scale_perm, scale_perm_single = get_scale_perms()
-    if group_size < size_k and group_size != -1 and not is_a_8bit:
-        scales = scales.reshape((-1, len(scale_perm)))[:, scale_perm]
-    else:
-        scales = scales.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
     return scales.reshape((-1, size_n)).contiguous()
 
 

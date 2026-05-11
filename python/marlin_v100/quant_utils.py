@@ -94,19 +94,17 @@ def _pack_sm70_native_tile(q_tile: np.ndarray, num_bits: int) -> np.ndarray:
         raise ValueError(f"Expected a 16x64 tile, got {q_tile.shape}")
 
     if num_bits == 4:
-        packed = np.empty((4, 8, 4), dtype=np.uint32)
-        for j in range(4):
-            col_base = 16 * j
-            for atom_rowcol in range(8):
-                col0 = col_base + atom_rowcol
-                col1 = col0 + 8
-                for row_group, rows in enumerate(_SM70_ROW_GROUPS):
-                    vals = [int(q_tile[row, col0]) for row in rows]
-                    vals.extend(int(q_tile[row, col1]) for row in rows)
-                    word = 0
-                    for out_idx, src_idx in enumerate(_SM70_U4_PACK_ORDER):
-                        word |= vals[src_idx] << (num_bits * out_idx)
-                    packed[j, atom_rowcol, row_group] = np.uint32(word)
+        packed = np.empty((16, 8), dtype=np.uint32)
+        for local_k in range(16):
+            for local_n_vec in range(8):
+                vals = [
+                    int(q_tile[local_k, local_n_vec * 8 + n])
+                    for n in range(8)
+                ]
+                word = 0
+                for out_idx, src_idx in enumerate(_SM70_U4_PACK_ORDER):
+                    word |= vals[src_idx] << (num_bits * out_idx)
+                packed[local_k, local_n_vec] = np.uint32(word)
         return packed.reshape(-1)
 
     if num_bits == 8:

@@ -37,7 +37,7 @@ class ArchitectureSupport:
 QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
     "uint4": QuantTypeSupport(name="uint4", dense_supported=False, moe_supported=True),
     "uint4b8": QuantTypeSupport(name="uint4b8", dense_supported=True, moe_supported=True),
-    "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=True, moe_supported=True),
+    "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=False, moe_supported=True),
     "fp8": QuantTypeSupport(
         name="fp8",
         dense_supported=True,

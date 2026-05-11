@@ -26,6 +26,12 @@
 #include "kernel.h"
 #include "core/registration.h"
 
+torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
+                                    torch::Tensor& b_q_weight,
+                                    torch::Tensor& b_scales, int64_t size_m,
+                                    int64_t size_n, int64_t size_k,
+                                    int64_t group_size);
+
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
@@ -592,9 +598,10 @@ torch::Tensor marlin_gemm(
               "SM70 build only supports float16 outputs.");
   TORCH_CHECK(s_type == vllm::kFloat16,
               "SM70 build only supports float16 scales.");
-  TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
-                  b_type == vllm::kU8B128,
-              "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
+  TORCH_CHECK(
+      b_type == vllm::kU4B8,
+      "SM70 CUTLASS prototype currently implements only uint4b8 dense weights. "
+      "TODO: reintroduce uint4 zero-point and uint8b128 implementations.");
   TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
 
   int pack_factor = 32 / b_type.size_bits();
@@ -773,15 +780,9 @@ torch::Tensor marlin_gemm(
     b_zeros = torch::empty({0}, options);
   }
   bool has_zp = b_zeros.size(-1) > 0;
-  if (has_zp) {
-    TORCH_CHECK(b_type == vllm::kU4,
-                "SM70 build only supports uint4 weights when zero-points are enabled. Got = ",
-                b_type.str());
-  } else {
-    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
-                "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
-                b_type.str());
-  }
+  TORCH_CHECK(!has_zp,
+              "SM70 CUTLASS uint4b8 prototype does not support zero-points. "
+              "TODO: add uint4 zero-point dequant-to-SMEM path.");
 
   // Verify b_zeros
   if (has_zp) {
@@ -826,6 +827,29 @@ torch::Tensor marlin_gemm(
         a.scalar_type() == c.scalar_type(),
         "scalar type of a must be the same with c for 16 bit activation");
   }
+
+  TORCH_CHECK(b_q_weight.scalar_type() == at::ScalarType::Int,
+              "SM70 CUTLASS uint4b8 prototype expects int32 packed weights.");
+  TORCH_CHECK(!has_act_order,
+              "act_order is not supported for the SM70 CUTLASS uint4b8 prototype.");
+  TORCH_CHECK(!has_bias,
+              "SM70 CUTLASS uint4b8 prototype does not support bias. TODO: add epilogue bias fusion.");
+  TORCH_CHECK(global_scale.numel() == 0,
+              "SM70 CUTLASS uint4b8 prototype does not support global_scale.");
+  TORCH_CHECK(!use_atomic_add,
+              "SM70 CUTLASS uint4b8 prototype does not support atomic-add output.");
+  TORCH_CHECK(is_k_full,
+              "SM70 CUTLASS uint4b8 prototype requires full-K non act-order inputs.");
+  TORCH_CHECK(size_k % 32 == 0,
+              "SM70 CUTLASS uint4b8 prototype requires size_k % 32 == 0.");
+  TORCH_CHECK(size_n % 64 == 0,
+              "SM70 CUTLASS uint4b8 prototype requires size_n % 64 == 0.");
+  TORCH_CHECK(group_size == -1 || group_size > 0,
+              "SM70 CUTLASS uint4b8 prototype received invalid group_size = ",
+              group_size);
+
+  return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
+                               size_k, group_size);
 
   marlin::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
