@@ -30,6 +30,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "marlin_int4_fp8_preprocess(Tensor qweight, "
       "Tensor? qzeros_or_none, bool inplace) -> Tensor");
+
+  ops.def(
+      "sm70_cutlass_matmul_probe(Tensor a, Tensor b, int cta_m, int cta_n, "
+      "int cta_k, int warps, int stages, int a_path, int b_path) -> Tensor");
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

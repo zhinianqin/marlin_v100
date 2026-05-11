@@ -11,10 +11,10 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$RESULTS_DIR/${TIMESTAMP}_${TARGET}_${BENCH_PRESET}.log"
 
 case "$TARGET" in
-  dense|moe|all)
+  matmul|dense|moe|all)
     ;;
   *)
-    echo "Usage: ./benchmark.sh [dense|moe|all]"
+    echo "Usage: ./benchmark.sh [matmul|dense|moe|all]"
     exit 1
     ;;
 esac
@@ -37,6 +37,7 @@ export PYTHONPATH="$ROOT_DIR/python"
 
 read -r -a DENSE_EXTRA_ARGS <<<"${DENSE_ARGS:-}"
 read -r -a MOE_EXTRA_ARGS <<<"${MOE_ARGS:-}"
+read -r -a MATMUL_EXTRA_ARGS <<<"${MATMUL_ARGS:-}"
 
 if [[ ! -f "$ROOT_DIR/python/marlin_v100/_C.abi3.so" || ! -f "$ROOT_DIR/python/marlin_v100/_moe_C.abi3.so" ]]; then
   echo "Extensions not found. Building first..."
@@ -51,6 +52,12 @@ echo "Preset: $BENCH_PRESET"
 echo "Log: $LOG_FILE"
 echo
 
+run_matmul() {
+  "$ROOT_DIR/.venv/bin/python" benchmarks/benchmark_sm70_matmul_probe.py \
+    --preset "$BENCH_PRESET" \
+    "${MATMUL_EXTRA_ARGS[@]}"
+}
+
 run_dense() {
   "$ROOT_DIR/.venv/bin/python" benchmarks/benchmark_marlin_dense.py \
     --preset "$BENCH_PRESET" \
@@ -64,6 +71,9 @@ run_moe() {
 }
 
 case "$TARGET" in
+  matmul)
+    run_matmul
+    ;;
   dense)
     run_dense
     ;;
@@ -71,6 +81,8 @@ case "$TARGET" in
     run_moe
     ;;
   all)
+    run_matmul
+    echo
     run_dense
     echo
     run_moe

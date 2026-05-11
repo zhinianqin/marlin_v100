@@ -43,6 +43,11 @@ def marlin_int4_fp8_preprocess(*args, **kwargs) -> torch.Tensor:
     return torch.ops._C.marlin_int4_fp8_preprocess(*args, **kwargs)
 
 
+def sm70_cutlass_matmul_probe(*args, **kwargs) -> torch.Tensor:
+    _load_dense()
+    return torch.ops._C.sm70_cutlass_matmul_probe(*args, **kwargs)
+
+
 def topk_softmax(*args, **kwargs) -> None:
     _load_moe()
     return torch.ops._moe_C.topk_softmax(*args, **kwargs)

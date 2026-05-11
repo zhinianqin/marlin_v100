@@ -53,9 +53,56 @@ def test_marlin_dense_symbols_available():
         "gptq_marlin_repack",
         "awq_marlin_repack",
         "marlin_int4_fp8_preprocess",
+        "sm70_cutlass_matmul_probe",
     ]
     for name in expected:
         assert hasattr(ops, name)
+
+
+def test_sm70_cutlass_matmul_probe_matches_torch_mm():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_probe(a, b, 32, 64, 64, 4, 2, 0, 0)
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+def test_sm70_cutlass_matmul_probe_threadblock_path_matches_torch_mm():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    a = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 256), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_probe(a, b, 128, 256, 32, 8, 2, 2, 0)
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+def test_sm70_cutlass_matmul_probe_rejects_direct_a_path():
+    _require_marlin_cuda()
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="A direct-global path is TODO"):
+        ops.sm70_cutlass_matmul_probe(a, b, 32, 64, 64, 4, 2, 1, 0)
+
+
+def test_sm70_cutlass_matmul_probe_rejects_non_pure_b_path():
+    _require_marlin_cuda()
+    a = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 256), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="unknown B path id"):
+        ops.sm70_cutlass_matmul_probe(a, b, 128, 256, 32, 8, 2, 2, 1)
 
 
 def test_marlin_int4_fp8_preprocess_without_zp():

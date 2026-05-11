@@ -104,6 +104,7 @@ list(APPEND MARLIN_V100_DENSE_SRC ${MARLIN_TEMPLATE_SM70_KERNEL_SRC})
 
 set(MARLIN_SRCS
    "csrc/quantization/marlin/marlin.cu"
+   "csrc/quantization/marlin/sm70_cutlass_matmul_probe.cu"
    "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
    "csrc/quantization/marlin/gptq_marlin_repack.cu"
    "csrc/quantization/marlin/awq_marlin_repack.cu")
