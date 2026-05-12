@@ -29,12 +29,13 @@ constexpr int kQuantTileN = 64;
 constexpr int kU4ValuesPerWord = 8;
 constexpr int kU4WordsPerTile = kQuantTileK * kQuantTileN / kU4ValuesPerWord;
 
-template <typename Shape_, typename ThreadMap_, int GroupSize_>
+template <typename Shape_, typename ThreadMap_, int GroupSize_, bool FullTile_>
 class Sm70U4B8IteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
+  static bool const kFullTile = FullTile_;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
@@ -169,7 +170,17 @@ class Sm70U4B8IteratorB {
         int const logical_n =
             n_offset_ + thread_offset_.contiguous() +
             c * ThreadMap::Delta::kContiguous;
-        if (logical_n + ThreadMap::kElementsPerAccess <= params_.size_n) {
+        if constexpr (kFullTile) {
+          half2 const* scale_vec =
+              reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
+                                             logical_n);
+          half2* cache = cached_scales_ + c * 4;
+          cache[0] = scale_vec[0];
+          cache[1] = scale_vec[1];
+          cache[2] = scale_vec[2];
+          cache[3] = scale_vec[3];
+        } else if (logical_n + ThreadMap::kElementsPerAccess <=
+                   params_.size_n) {
           half2 const* scale_vec =
               reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
                                              logical_n);
@@ -185,15 +196,52 @@ class Sm70U4B8IteratorB {
   }
 
   CUTLASS_DEVICE
-  void load(Fragment& frag) const {
-    if (!mask_enabled_) {
-      return;
+  void load_full_tile(Fragment& frag) const {
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+        constexpr int kAccess = ThreadMap::kElementsPerAccess;
+        int const frag_base =
+            (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
+        int const qword_offset =
+            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
+
+        uint32_t const qword = qweight_[qword_offset];
+        half2 const* scale_vec;
+        if constexpr (kGroupSize == 32) {
+          int const logical_n =
+              n_offset_ + thread_offset_.contiguous() +
+              c * ThreadMap::Delta::kContiguous;
+          int const logical_k =
+              k_offset_ + thread_offset_.strided() +
+              s * ThreadMap::Delta::kStrided;
+          int const group = scale_group(logical_k);
+          scale_vec =
+              reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
+                                             logical_n);
+        } else {
+          scale_vec = cached_scales_ + c * 4;
+        }
+
+        half2 deq01_23[2];
+        half2 deq45_67[2];
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
+            static_cast<int>(qword), deq01_23);
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
+            static_cast<int>(qword >> 8), deq45_67);
+
+        half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+        frag_vec[0] = __hmul2(deq01_23[0], scale_vec[0]);
+        frag_vec[1] = __hmul2(deq01_23[1], scale_vec[1]);
+        frag_vec[2] = __hmul2(deq45_67[0], scale_vec[2]);
+        frag_vec[3] = __hmul2(deq45_67[1], scale_vec[3]);
+      }
     }
+  }
 
-    int const first_logical_k = k_offset_ + thread_offset_.strided();
-    int const current_group = scale_group(first_logical_k);
-    refresh_scale_cache(current_group);
-
+  CUTLASS_DEVICE
+  void load_residue_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
       CUTLASS_PRAGMA_UNROLL
@@ -243,9 +291,26 @@ class Sm70U4B8IteratorB {
       }
     }
   }
+
+  CUTLASS_DEVICE
+  void load(Fragment& frag) const {
+    if (!mask_enabled_) {
+      return;
+    }
+
+    int const first_logical_k = k_offset_ + thread_offset_.strided();
+    int const current_group = scale_group(first_logical_k);
+    refresh_scale_cache(current_group);
+
+    if constexpr (kFullTile) {
+      load_full_tile(frag);
+    } else {
+      load_residue_tile(frag);
+    }
+  }
 };
 
-template <int GroupSize>
+template <int GroupSize, bool FullTile>
 struct Sm70U4B8GemmTraits {
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
@@ -266,7 +331,8 @@ struct Sm70U4B8GemmTraits {
       ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
       128 / cutlass::sizeof_bits<ElementA>::value>;
   using IteratorB = Sm70U4B8IteratorB<
-      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize>;
+      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
+      FullTile>;
   using Mma = cutlass::gemm::threadblock::MmaPipelined<
       ThreadblockShape, IteratorA, typename MmaCore::SmemIteratorA, IteratorB,
       typename MmaCore::SmemIteratorB, ElementAccumulator, LayoutC,
@@ -293,7 +359,7 @@ struct Sm70U4B8GemmTraits {
   };
 };
 
-template <int GroupSize>
+template <int GroupSize, bool FullTile>
 __global__ __launch_bounds__(kThreads, 1)
 void sm70_marlin_u4b8_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
@@ -301,7 +367,7 @@ void sm70_marlin_u4b8_gemm_kernel(
     cutlass::half_t const* __restrict__ b_scales,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda,
     int group_size) {
-  using Traits = Sm70U4B8GemmTraits<GroupSize>;
+  using Traits = Sm70U4B8GemmTraits<GroupSize, FullTile>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -351,13 +417,13 @@ void sm70_marlin_u4b8_gemm_kernel(
 
 }  // namespace
 
-template <int GroupSize>
+template <int GroupSize, bool FullTile>
 torch::Tensor launch_sm70_marlin_u4b8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k) {
-  auto kernel = sm70_marlin_u4b8_gemm_kernel<GroupSize>;
+  auto kernel = sm70_marlin_u4b8_gemm_kernel<GroupSize, FullTile>;
   size_t smem_bytes =
-      sizeof(typename Sm70U4B8GemmTraits<GroupSize>::SharedStorage);
+      sizeof(typename Sm70U4B8GemmTraits<GroupSize, FullTile>::SharedStorage);
   if (smem_bytes >= (48u << 10)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -380,25 +446,23 @@ torch::Tensor launch_sm70_marlin_u4b8_gemm(
   return c;
 }
 
-torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
-                                    torch::Tensor& b_q_weight,
-                                    torch::Tensor& b_scales, int64_t size_m,
-                                    int64_t size_n, int64_t size_k,
-                                    int64_t group_size) {
-  c10::cuda::CUDAGuard device_guard(a.device());
-
+template <bool FullTile>
+torch::Tensor launch_sm70_marlin_u4b8_gemm_group_size(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
+    int64_t group_size) {
   switch (group_size) {
     case -1:
-      return launch_sm70_marlin_u4b8_gemm<-1>(
+      return launch_sm70_marlin_u4b8_gemm<-1, FullTile>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 32:
-      return launch_sm70_marlin_u4b8_gemm<32>(
+      return launch_sm70_marlin_u4b8_gemm<32, FullTile>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 64:
-      return launch_sm70_marlin_u4b8_gemm<64>(
+      return launch_sm70_marlin_u4b8_gemm<64, FullTile>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 128:
-      return launch_sm70_marlin_u4b8_gemm<128>(
+      return launch_sm70_marlin_u4b8_gemm<128, FullTile>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     default:
       TORCH_CHECK(false,
@@ -407,4 +471,20 @@ torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
                   group_size);
   }
   return c;
+}
+
+torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
+                                    torch::Tensor& b_q_weight,
+                                    torch::Tensor& b_scales, int64_t size_m,
+                                    int64_t size_n, int64_t size_k,
+                                    int64_t group_size) {
+  c10::cuda::CUDAGuard device_guard(a.device());
+
+  bool const full_tile = (size_k % kCtaK == 0 && size_n % kCtaN == 0);
+  if (full_tile) {
+    return launch_sm70_marlin_u4b8_gemm_group_size<true>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  }
+  return launch_sm70_marlin_u4b8_gemm_group_size<false>(
+      a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
 }
