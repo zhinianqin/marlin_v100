@@ -20,9 +20,9 @@
 namespace {
 
 constexpr int kCtaM = 128;
-constexpr int kCtaN = 128;
+constexpr int kCtaN = 256;
 constexpr int kCtaK = 32;
-constexpr int kWarps = 4;
+constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
 constexpr int kQuantTileK = 16;
 constexpr int kQuantTileN = 64;
@@ -36,9 +36,23 @@ class Sm70U4B8IteratorB {
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
   static bool const kFullTile = FullTile_;
+  static bool const kCacheScales = GroupSize_ == -1;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+  static_assert(Shape::kN == kCtaN,
+                "The SM70 kU4B8 IteratorB expects CTA_N=256.");
+  static_assert(Shape::kK == kCtaK,
+                "The SM70 kU4B8 IteratorB expects CTA_K=32.");
+  static_assert(ThreadMap::Iterations::kStrided == 1,
+                "The SM70 kU4B8 IteratorB expects one K-strided iteration.");
+  static_assert(ThreadMap::Iterations::kContiguous == 4,
+                "The SM70 kU4B8 IteratorB expects four 64-column accesses.");
+  static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
+                "The SM70 kU4B8 IteratorB expects 64-column deltas.");
+  static_assert(ThreadMap::kElementsPerAccess == kU4ValuesPerWord,
+                "The SM70 kU4B8 IteratorB expects one packed int4 word per "
+                "access.");
 
   struct Params {
     int size_k;
@@ -59,6 +73,8 @@ class Sm70U4B8IteratorB {
   int qweight_offsets_[ThreadMap::Iterations::kCount];
   int k_offset_;
   int n_offset_;
+  int tile_k_end_;
+  int next_k_advance_;
   bool mask_enabled_;
   mutable int cached_group_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
@@ -74,6 +90,9 @@ class Sm70U4B8IteratorB {
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
         n_offset_(threadblock_offset.column()),
+        tile_k_end_(threadblock_offset.row() +
+                    initial_k_advance(params.size_k)),
+        next_k_advance_(initial_k_advance(params.size_k)),
         mask_enabled_(true),
         cached_group_(-2) {
     CUTLASS_PRAGMA_UNROLL
@@ -95,9 +114,14 @@ class Sm70U4B8IteratorB {
 
   CUTLASS_DEVICE
   Sm70U4B8IteratorB& operator++() {
+    int const k_advance = next_k_advance_;
     int const k_advance_qwords =
-        (Shape::kK / kQuantTileK) * (params_.size_n * 2);
-    k_offset_ += Shape::kK;
+        (k_advance / kQuantTileK) * (params_.size_n * 2);
+    k_offset_ += k_advance;
+    int const next_tile_k_end = k_offset_ + Shape::kK;
+    tile_k_end_ = next_tile_k_end < params_.size_k ? next_tile_k_end
+                                                   : params_.size_k;
+    next_k_advance_ = Shape::kK;
     CUTLASS_PRAGMA_UNROLL
     for (int idx = 0; idx < ThreadMap::Iterations::kCount; ++idx) {
       qweight_offsets_[idx] += k_advance_qwords;
@@ -114,6 +138,12 @@ class Sm70U4B8IteratorB {
 
   CUTLASS_DEVICE
   void enable_mask() { mask_enabled_ = true; }
+
+  CUTLASS_DEVICE
+  static int initial_k_advance(int size_k) {
+    int const residue_k = size_k % Shape::kK;
+    return residue_k == 0 ? Shape::kK : residue_k;
+  }
 
   CUTLASS_DEVICE
   int scale_group(int logical_k) const {
@@ -134,8 +164,8 @@ class Sm70U4B8IteratorB {
       cutlass::layout::PitchLinearCoord const& thread_offset,
       cutlass::MatrixCoord const& threadblock_offset) {
     static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
-                  "The SM70 kU4B8 prototype expects two 64-column B accesses "
-                  "per thread.");
+                  "The SM70 kU4B8 prototype expects 64-column B access "
+                  "deltas.");
 
     int const logical_k = threadblock_offset.row() + thread_offset.strided();
     int const logical_n =
@@ -158,7 +188,7 @@ class Sm70U4B8IteratorB {
 
   CUTLASS_DEVICE
   void refresh_scale_cache(int group) const {
-    if constexpr (kGroupSize == 32) {
+    if constexpr (!kCacheScales) {
       return;
     } else {
       if (cached_group_ == group) {
@@ -209,7 +239,7 @@ class Sm70U4B8IteratorB {
 
         uint32_t const qword = qweight_[qword_offset];
         half2 const* scale_vec;
-        if constexpr (kGroupSize == 32) {
+        if constexpr (!kCacheScales) {
           int const logical_n =
               n_offset_ + thread_offset_.contiguous() +
               c * ThreadMap::Delta::kContiguous;
@@ -256,9 +286,15 @@ class Sm70U4B8IteratorB {
             k_offset_ + thread_offset_.strided() +
             s * ThreadMap::Delta::kStrided;
 
-        bool const valid = logical_k < params_.size_k &&
+        bool const valid = logical_k < tile_k_end_ &&
                            logical_n + kAccess <= params_.size_n;
         if (!valid) {
+          half2 const zero = __float2half2_rn(0.0f);
+          half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+          frag_vec[0] = zero;
+          frag_vec[1] = zero;
+          frag_vec[2] = zero;
+          frag_vec[3] = zero;
           continue;
         }
 
@@ -267,7 +303,7 @@ class Sm70U4B8IteratorB {
 
         uint32_t const qword = qweight_[qword_offset];
         half2 const* scale_vec;
-        if constexpr (kGroupSize == 32) {
+        if constexpr (!kCacheScales) {
           int const group = scale_group(logical_k);
           scale_vec =
               reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
@@ -326,6 +362,8 @@ struct Sm70U4B8GemmTraits {
       ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
       ElementB, LayoutB, ElementAccumulator, LayoutC,
       cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
+  static_assert(MmaCore::kThreads == kThreads,
+                "SM70 kU4B8 launch threads must match CUTLASS warp count.");
   using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
       cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
       ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
@@ -365,8 +403,7 @@ void sm70_marlin_u4b8_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
-    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda,
-    int group_size) {
+    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
   using Traits = Sm70U4B8GemmTraits<GroupSize, FullTile>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
@@ -441,7 +478,7 @@ torch::Tensor launch_sm70_marlin_u4b8_gemm(
       reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
       static_cast<int>(size_m), static_cast<int>(size_n),
-      static_cast<int>(size_k), static_cast<int>(a.stride(0)), GroupSize);
+      static_cast<int>(size_k), static_cast<int>(a.stride(0)));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return c;
 }

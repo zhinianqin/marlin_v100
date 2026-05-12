@@ -394,6 +394,83 @@ def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
     )
 
 
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_residue_n_matches_reference(
+    group_size: int,
+    repack_impl: str,
+):
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        repack_impl=repack_impl,
+        group_size=group_size,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=128,
+    )
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_residue_k_single_group_matches_reference(
+    repack_impl: str,
+):
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        repack_impl=repack_impl,
+        group_size=-1,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=144,
+        size_n=256,
+    )
+
+
+def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    size_m = 8
+    size_k = 144
+    size_n = 256
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    _w, q_w, _scales, g_idx, sort_indices, _ = marlin_quantize(
+        w, scalar_types.uint4b8, -1, False
+    )
+    scales = torch.ones((3, size_n), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="single-scale residue path"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            marlin_make_empty_g_idx(a.device),
+            g_idx,
+            sort_indices,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint4b8.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            False,
+        )
+
+
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference(repack_impl: str):
     _assert_dense_backend_rejects_act_order(
