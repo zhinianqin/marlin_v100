@@ -156,7 +156,14 @@ __global__ void gptq_marlin_repack_kernel(
         res |= vals[pack_idx[i]] << (i * 4);
       }
 
-      out_ptr[out_offset + word_idx] = res;
+      int const macro_n_tile = n_tile_id / 4;
+      int const macro_first_n_tile = macro_n_tile * 4;
+      int const subtile = n_tile_id - macro_first_n_tile;
+      int const subtile_count = min(4, n_tiles - macro_first_n_tile);
+      int const local_word = local_k * 8 + local_n_vec;
+      int const macro_offset =
+          macro_n_tile * 4 * tile_size + local_word * subtile_count + subtile;
+      out_ptr[k_tile_id * n_tiles * tile_size + macro_offset] = res;
       return;
     }
 

@@ -146,11 +146,19 @@ class Sm70U4ZpIteratorB {
     int const k_tile = logical_k / kQuantTileK;
     int const local_k = logical_k - k_tile * kQuantTileK;
     int const n_tile = logical_n / kQuantTileN;
+    int const macro_n_tile = n_tile / 4;
+    int const macro_first_n_tile = macro_n_tile * 4;
+    int const subtile = n_tile - macro_first_n_tile;
+    int subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
+    subtile_count = subtile_count < 4 ? subtile_count : 4;
     int const local_n_vec =
         (logical_n - n_tile * kQuantTileN) / ThreadMap::kElementsPerAccess;
+    int const local_word = local_k * (kQuantTileN / kU4ValuesPerWord) +
+                           local_n_vec;
 
-    return k_tile * (params.size_n * 2) + n_tile * kU4WordsPerTile +
-           local_k * (kQuantTileN / kU4ValuesPerWord) + local_n_vec;
+    return k_tile * (params.size_n * 2) +
+           macro_n_tile * 4 * kU4WordsPerTile +
+           local_word * subtile_count + subtile;
   }
 
   template <int C>

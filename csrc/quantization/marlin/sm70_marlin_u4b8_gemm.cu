@@ -70,13 +70,12 @@ class Sm70U4B8IteratorB {
   half const* scales_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
-  int qweight_offsets_[ThreadMap::Iterations::kCount];
+  int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
   int tile_k_end_;
   int next_k_advance_;
   bool mask_enabled_;
-  mutable int cached_group_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
 
  public:
@@ -93,22 +92,14 @@ class Sm70U4B8IteratorB {
         tile_k_end_(threadblock_offset.row() +
                     initial_k_advance(params.size_k)),
         next_k_advance_(initial_k_advance(params.size_k)),
-        mask_enabled_(true),
-        cached_group_(-2) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const idx = c + s * ThreadMap::Iterations::kContiguous;
-        int const logical_k = threadblock_offset.row() +
-                              thread_offset_.strided() +
-                              s * ThreadMap::Delta::kStrided;
-        int const logical_n = threadblock_offset.column() +
-                              thread_offset_.contiguous() +
-                              c * ThreadMap::Delta::kContiguous;
-        qweight_offsets_[idx] =
-            qweight_offset_from_logical(params_, logical_k, logical_n);
-      }
+        mask_enabled_(true) {
+    int const logical_k = threadblock_offset.row() + thread_offset_.strided();
+    int const logical_n =
+        threadblock_offset.column() + thread_offset_.contiguous();
+    qweight_base_offset_ =
+        qweight_offset_from_logical(params_, logical_k, logical_n);
+    if constexpr (kCacheScales) {
+      cache_single_group_scales();
     }
   }
 
@@ -122,10 +113,7 @@ class Sm70U4B8IteratorB {
     tile_k_end_ = next_tile_k_end < params_.size_k ? next_tile_k_end
                                                    : params_.size_k;
     next_k_advance_ = Shape::kK;
-    CUTLASS_PRAGMA_UNROLL
-    for (int idx = 0; idx < ThreadMap::Iterations::kCount; ++idx) {
-      qweight_offsets_[idx] += k_advance_qwords;
-    }
+    qweight_base_offset_ += k_advance_qwords;
     return *this;
   }
 
@@ -179,22 +167,37 @@ class Sm70U4B8IteratorB {
     int const k_tile = logical_k / kQuantTileK;
     int const local_k = logical_k - k_tile * kQuantTileK;
     int const n_tile = logical_n / kQuantTileN;
+    int const macro_n_tile = n_tile / 4;
+    int const macro_first_n_tile = macro_n_tile * 4;
+    int const subtile = n_tile - macro_first_n_tile;
+    int subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
+    subtile_count = subtile_count < 4 ? subtile_count : 4;
     int const local_n_vec =
         (logical_n - n_tile * kQuantTileN) / ThreadMap::kElementsPerAccess;
+    int const local_word = local_k * (kQuantTileN / kU4ValuesPerWord) +
+                           local_n_vec;
 
-    return k_tile * (params.size_n * 2) + n_tile * kU4WordsPerTile +
-           local_k * (kQuantTileN / kU4ValuesPerWord) + local_n_vec;
+    return k_tile * (params.size_n * 2) +
+           macro_n_tile * 4 * kU4WordsPerTile +
+           local_word * subtile_count + subtile;
   }
 
   CUTLASS_DEVICE
-  void refresh_scale_cache(int group) const {
+  int qweight_offset(int c) const {
+    return qweight_base_offset_ + c;
+  }
+
+  CUTLASS_DEVICE
+  static uint32_t qword_from_vector(uint4 const& words, int c) {
+    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
+    return words_ptr[c];
+  }
+
+  CUTLASS_DEVICE
+  void cache_single_group_scales() const {
     if constexpr (!kCacheScales) {
       return;
     } else {
-      if (cached_group_ == group) {
-        return;
-      }
-
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         int const logical_n =
@@ -202,8 +205,7 @@ class Sm70U4B8IteratorB {
             c * ThreadMap::Delta::kContiguous;
         if constexpr (kFullTile) {
           half2 const* scale_vec =
-              reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
-                                             logical_n);
+              reinterpret_cast<half2 const*>(scales_ + logical_n);
           half2* cache = cached_scales_ + c * 4;
           cache[0] = scale_vec[0];
           cache[1] = scale_vec[1];
@@ -212,8 +214,7 @@ class Sm70U4B8IteratorB {
         } else if (logical_n + ThreadMap::kElementsPerAccess <=
                    params_.size_n) {
           half2 const* scale_vec =
-              reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
-                                             logical_n);
+              reinterpret_cast<half2 const*>(scales_ + logical_n);
           half2* cache = cached_scales_ + c * 4;
           cache[0] = scale_vec[0];
           cache[1] = scale_vec[1];
@@ -221,7 +222,6 @@ class Sm70U4B8IteratorB {
           cache[3] = scale_vec[3];
         }
       }
-      cached_group_ = group;
     }
   }
 
@@ -229,43 +229,41 @@ class Sm70U4B8IteratorB {
   void load_full_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+      half2 const* scale_row = nullptr;
+      if constexpr (!kCacheScales) {
+        int const logical_k =
+            k_offset_ + thread_offset_.strided() +
+            s * ThreadMap::Delta::kStrided;
+        int const group = scale_group(logical_k);
+        scale_row = reinterpret_cast<half2 const*>(
+            scales_ + group * params_.size_n + n_offset_ +
+            thread_offset_.contiguous());
+      }
+      uint4 const qwords =
+          *reinterpret_cast<uint4 const*>(qweight_ + qweight_base_offset_);
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         constexpr int kAccess = ThreadMap::kElementsPerAccess;
         int const frag_base =
             (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
-        int const qword_offset =
-            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
-
-        uint32_t const qword = qweight_[qword_offset];
+        uint32_t const qword = qword_from_vector(qwords, c);
         half2 const* scale_vec;
         if constexpr (!kCacheScales) {
-          int const logical_n =
-              n_offset_ + thread_offset_.contiguous() +
-              c * ThreadMap::Delta::kContiguous;
-          int const logical_k =
-              k_offset_ + thread_offset_.strided() +
-              s * ThreadMap::Delta::kStrided;
-          int const group = scale_group(logical_k);
-          scale_vec =
-              reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
-                                             logical_n);
+          scale_vec = scale_row + c * (ThreadMap::Delta::kContiguous / 2);
         } else {
           scale_vec = cached_scales_ + c * 4;
         }
 
-        half2 deq01_23[2];
-        half2 deq45_67[2];
-        marlin::dequant<half2, vllm::kU4B8.id(), false>(
-            static_cast<int>(qword), deq01_23);
-        marlin::dequant<half2, vllm::kU4B8.id(), false>(
-            static_cast<int>(qword >> 8), deq45_67);
-
+        half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-        frag_vec[0] = __hmul2(deq01_23[0], scale_vec[0]);
-        frag_vec[1] = __hmul2(deq01_23[1], scale_vec[1]);
-        frag_vec[2] = __hmul2(deq45_67[0], scale_vec[2]);
-        frag_vec[3] = __hmul2(deq45_67[1], scale_vec[3]);
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
+            static_cast<int>(qword), deq);
+        frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+        frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
+            static_cast<int>(qword >> 8), deq);
+        frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+        frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
       }
     }
   }
@@ -274,6 +272,17 @@ class Sm70U4B8IteratorB {
   void load_residue_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+      int const logical_k =
+          k_offset_ + thread_offset_.strided() +
+          s * ThreadMap::Delta::kStrided;
+      bool const k_valid = logical_k < tile_k_end_;
+      half2 const* scale_row = nullptr;
+      if constexpr (!kCacheScales) {
+        int const group = scale_group(logical_k);
+        scale_row = reinterpret_cast<half2 const*>(
+            scales_ + group * params_.size_n + n_offset_ +
+            thread_offset_.contiguous());
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -282,12 +291,8 @@ class Sm70U4B8IteratorB {
         int const logical_n =
             n_offset_ + thread_offset_.contiguous() +
             c * ThreadMap::Delta::kContiguous;
-        int const logical_k =
-            k_offset_ + thread_offset_.strided() +
-            s * ThreadMap::Delta::kStrided;
 
-        bool const valid = logical_k < tile_k_end_ &&
-                           logical_n + kAccess <= params_.size_n;
+        bool const valid = k_valid && logical_n + kAccess <= params_.size_n;
         if (!valid) {
           half2 const zero = __float2half2_rn(0.0f);
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
@@ -298,32 +303,25 @@ class Sm70U4B8IteratorB {
           continue;
         }
 
-        int const qword_offset =
-            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
-
+        int const qword_offset = qweight_offset(c);
         uint32_t const qword = qweight_[qword_offset];
         half2 const* scale_vec;
         if constexpr (!kCacheScales) {
-          int const group = scale_group(logical_k);
-          scale_vec =
-              reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
-                                             logical_n);
+          scale_vec = scale_row + c * (ThreadMap::Delta::kContiguous / 2);
         } else {
           scale_vec = cached_scales_ + c * 4;
         }
 
-        half2 deq01_23[2];
-        half2 deq45_67[2];
-        marlin::dequant<half2, vllm::kU4B8.id(), false>(
-            static_cast<int>(qword), deq01_23);
-        marlin::dequant<half2, vllm::kU4B8.id(), false>(
-            static_cast<int>(qword >> 8), deq45_67);
-
+        half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-        frag_vec[0] = __hmul2(deq01_23[0], scale_vec[0]);
-        frag_vec[1] = __hmul2(deq01_23[1], scale_vec[1]);
-        frag_vec[2] = __hmul2(deq45_67[0], scale_vec[2]);
-        frag_vec[3] = __hmul2(deq45_67[1], scale_vec[3]);
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
+            static_cast<int>(qword), deq);
+        frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+        frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
+            static_cast<int>(qword >> 8), deq);
+        frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+        frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
       }
     }
   }
@@ -333,10 +331,6 @@ class Sm70U4B8IteratorB {
     if (!mask_enabled_) {
       return;
     }
-
-    int const first_logical_k = k_offset_ + thread_offset_.strided();
-    int const current_group = scale_group(first_logical_k);
-    refresh_scale_cache(current_group);
 
     if constexpr (kFullTile) {
       load_full_tile(frag);

@@ -545,21 +545,29 @@ def _marlin_unpack_impl(
     num_bits = quant_type.size_bits
     pack_factor = quant_utils.get_pack_factor(num_bits)
     tile_words = (16 * 64) // pack_factor
-    packed = (q_weight.detach().cpu().numpy().astype("uint32", copy=False) & 0xFFFFFFFF).reshape(
-        size_k // 16, size_n // 64, tile_words
+    n_tiles = size_n // 64
+    packed_words = (
+        q_weight.detach().cpu().numpy().astype("uint32", copy=False)
+        & 0xFFFFFFFF
     )
     unpacked = torch.empty((size_k, size_n), dtype=torch.int32)
     unpacked_np = unpacked.numpy()
 
     if num_bits == 4:
+        packed = packed_words.reshape(size_k // 16, n_tiles * tile_words)
         for k_tile in range(size_k // 16):
             row_start = 16 * k_tile
-            for n_tile in range(size_n // 64):
-                tile = packed[k_tile, n_tile].reshape(16, 8)
+            for n_tile in range(n_tiles):
                 col_tile_start = 64 * n_tile
                 for local_k in range(16):
                     for local_n_vec in range(8):
-                        word = int(tile[local_k, local_n_vec])
+                        local_word = local_k * 8 + local_n_vec
+                        word_offset = quant_utils._sm70_u4_macro_n_offset(
+                            n_tiles,
+                            n_tile,
+                            local_word,
+                        )
+                        word = int(packed[k_tile, word_offset])
                         packed_vals = [(word >> (num_bits * idx)) & 0xF for idx in range(8)]
                         logical_vals = [0] * 8
                         for out_idx, src_idx in enumerate(quant_utils._SM70_U4_PACK_ORDER):
@@ -570,9 +578,10 @@ def _marlin_unpack_impl(
                                 col_tile_start + local_n_vec * 8 + idx,
                             ] = value
     else:
+        packed = packed_words.reshape(size_k // 16, n_tiles, tile_words)
         for k_tile in range(size_k // 16):
             row_start = 16 * k_tile
-            for n_tile in range(size_n // 64):
+            for n_tile in range(n_tiles):
                 tile = packed[k_tile, n_tile].reshape(4, 8, 2, 4)
                 col_tile_start = 64 * n_tile
                 for j in range(4):
