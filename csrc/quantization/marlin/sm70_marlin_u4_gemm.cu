@@ -174,18 +174,16 @@ class Sm70U4ZpIteratorB {
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
 
-    half2 z01_23[2];
-    half2 z45_67[2];
-    marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(zword),
-                                                   z01_23);
-    marlin::dequant<half2, vllm::kU4.id(), false>(
-        static_cast<int>(zword >> 8), z45_67);
-
     half2* bias_cache = cached_bias_ + C * 4;
-    bias_cache[0] = __hsub2(zero, __hmul2(z01_23[0], scale_cache[0]));
-    bias_cache[1] = __hsub2(zero, __hmul2(z01_23[1], scale_cache[1]));
-    bias_cache[2] = __hsub2(zero, __hmul2(z45_67[0], scale_cache[2]));
-    bias_cache[3] = __hsub2(zero, __hmul2(z45_67[1], scale_cache[3]));
+    half2 deq[2];
+    marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(zword),
+                                                   deq);
+    bias_cache[0] = __hsub2(zero, __hmul2(deq[0], scale_cache[0]));
+    bias_cache[1] = __hsub2(zero, __hmul2(deq[1], scale_cache[1]));
+    marlin::dequant<half2, vllm::kU4.id(), false>(
+        static_cast<int>(zword >> 8), deq);
+    bias_cache[2] = __hsub2(zero, __hmul2(deq[0], scale_cache[2]));
+    bias_cache[3] = __hsub2(zero, __hmul2(deq[1], scale_cache[3]));
   }
 
   CUTLASS_DEVICE
@@ -242,21 +240,18 @@ class Sm70U4ZpIteratorB {
             qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
         uint32_t const qword = qweight_[qword_offset];
 
-        half2 q01_23[2];
-        marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(qword),
-                                                       q01_23);
-
         half2 const* scale_vec = cached_scales_ + c * 4;
         half2 const* bias_vec = cached_bias_ + c * 4;
+        half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-        frag_vec[0] = __hfma2(q01_23[0], scale_vec[0], bias_vec[0]);
-        frag_vec[1] = __hfma2(q01_23[1], scale_vec[1], bias_vec[1]);
-
-        half2 q45_67[2];
+        marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(qword),
+                                                       deq);
+        frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
+        frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
         marlin::dequant<half2, vllm::kU4.id(), false>(
-            static_cast<int>(qword >> 8), q45_67);
-        frag_vec[2] = __hfma2(q45_67[0], scale_vec[2], bias_vec[2]);
-        frag_vec[3] = __hfma2(q45_67[1], scale_vec[3], bias_vec[3]);
+            static_cast<int>(qword >> 8), deq);
+        frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
+        frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
       }
     }
   }
@@ -287,21 +282,18 @@ class Sm70U4ZpIteratorB {
             qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
         uint32_t const qword = qweight_[qword_offset];
 
-        half2 q01_23[2];
-        marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(qword),
-                                                       q01_23);
-
         half2 const* scale_vec = cached_scales_ + c * 4;
         half2 const* bias_vec = cached_bias_ + c * 4;
+        half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-        frag_vec[0] = __hfma2(q01_23[0], scale_vec[0], bias_vec[0]);
-        frag_vec[1] = __hfma2(q01_23[1], scale_vec[1], bias_vec[1]);
-
-        half2 q45_67[2];
+        marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(qword),
+                                                       deq);
+        frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
+        frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
         marlin::dequant<half2, vllm::kU4.id(), false>(
-            static_cast<int>(qword >> 8), q45_67);
-        frag_vec[2] = __hfma2(q45_67[0], scale_vec[2], bias_vec[2]);
-        frag_vec[3] = __hfma2(q45_67[1], scale_vec[3], bias_vec[3]);
+            static_cast<int>(qword >> 8), deq);
+        frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
+        frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
       }
     }
   }
