@@ -285,40 +285,55 @@ at::Tensor run_sm70_cute_gemm(const at::Tensor& a, const at::Tensor& b) {
 template <int CTA_M, int CTA_N, int CTA_K, int Warps>
 struct Sm70ThreadblockWarpShape;
 
-template <>
-struct Sm70ThreadblockWarpShape<64, 64, 32, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<64, 64, CTA_K, 4> {
+  using Type = cutlass::gemm::GemmShape<32, 32, CTA_K>;
 };
 
-template <>
-struct Sm70ThreadblockWarpShape<64, 128, 32, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<64, 128, CTA_K, 4> {
+  using Type = cutlass::gemm::GemmShape<32, 64, CTA_K>;
 };
 
-template <>
-struct Sm70ThreadblockWarpShape<64, 256, 32, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<64, 128, CTA_K, 8> {
+  using Type = cutlass::gemm::GemmShape<32, 32, CTA_K>;
 };
 
-template <>
-struct Sm70ThreadblockWarpShape<128, 64, 32, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<64, 256, CTA_K, 8> {
+  using Type = cutlass::gemm::GemmShape<32, 64, CTA_K>;
 };
 
-template <>
-struct Sm70ThreadblockWarpShape<128, 128, 32, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<128, 64, CTA_K, 4> {
+  using Type = cutlass::gemm::GemmShape<64, 32, CTA_K>;
 };
 
-template <>
-struct Sm70ThreadblockWarpShape<128, 256, 32, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<128, 64, CTA_K, 8> {
+  using Type = cutlass::gemm::GemmShape<32, 32, CTA_K>;
+};
+
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<128, 128, CTA_K, 4> {
+  using Type = cutlass::gemm::GemmShape<64, 64, CTA_K>;
+};
+
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<128, 128, CTA_K, 8> {
+  using Type = cutlass::gemm::GemmShape<64, 32, CTA_K>;
+};
+
+template <int CTA_K>
+struct Sm70ThreadblockWarpShape<128, 256, CTA_K, 8> {
+  using Type = cutlass::gemm::GemmShape<64, 64, CTA_K>;
 };
 
 template <int CTA_M, int CTA_N, int CTA_K, int Warps>
 struct Sm70ThreadblockGemmTraits {
-  static_assert(CTA_K == 32,
-                "Extracted SM70 threadblock path follows CUTLASS Volta K=32");
+  static_assert(CTA_K == 32 || CTA_K == 64 || CTA_K == 128,
+                "Extracted SM70 threadblock path supports K=32, 64, or 128");
 
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
@@ -331,6 +346,12 @@ struct Sm70ThreadblockGemmTraits {
   using WarpShape =
       typename Sm70ThreadblockWarpShape<CTA_M, CTA_N, CTA_K, Warps>::Type;
   using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
+  using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
+      ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
+      ElementB, LayoutB, ElementAccumulator, LayoutC,
+      cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
+  static_assert(MmaCore::kThreads == Warps * 32,
+                "SM70 pure GEMM launch threads must match CUTLASS warp count.");
   using OutputOp = cutlass::epilogue::thread::LinearCombination<
       ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value,
       ElementAccumulator, ElementAccumulator>;
@@ -501,25 +522,35 @@ at::Tensor dispatch_sm70_cute_gemm(const at::Tensor& a, const at::Tensor& b,
     return run_sm70_cutlass_threadblock_gemm<CM, CN, CK, W>(a, b);        \
   }
 
+#define DISPATCH_THREADBLOCK_K(CM, CN, W)                                  \
+  DISPATCH_THREADBLOCK(CM, CN, 32, W)                                      \
+  DISPATCH_THREADBLOCK(CM, CN, 64, W)                                      \
+  DISPATCH_THREADBLOCK(CM, CN, 128, W)
+
 at::Tensor dispatch_sm70_cutlass_threadblock_gemm(
     const at::Tensor& a, const at::Tensor& b, int64_t cta_m, int64_t cta_n,
     int64_t cta_k, int64_t warps, int64_t /*b_path*/) {
-  DISPATCH_THREADBLOCK(64, 64, 32, 4)
-  DISPATCH_THREADBLOCK(64, 128, 32, 4)
-  DISPATCH_THREADBLOCK(64, 256, 32, 8)
-  DISPATCH_THREADBLOCK(128, 64, 32, 4)
-  DISPATCH_THREADBLOCK(128, 128, 32, 4)
-  DISPATCH_THREADBLOCK(128, 256, 32, 8)
+  DISPATCH_THREADBLOCK_K(64, 64, 4)
+  DISPATCH_THREADBLOCK_K(64, 128, 4)
+  DISPATCH_THREADBLOCK_K(64, 128, 8)
+  DISPATCH_THREADBLOCK_K(64, 256, 8)
+  DISPATCH_THREADBLOCK_K(128, 64, 4)
+  DISPATCH_THREADBLOCK_K(128, 64, 8)
+  DISPATCH_THREADBLOCK_K(128, 128, 4)
+  DISPATCH_THREADBLOCK_K(128, 128, 8)
+  DISPATCH_THREADBLOCK_K(128, 256, 8)
 
   TORCH_CHECK(false,
               "sm70_cutlass_matmul_probe: unsupported extracted CUTLASS "
               "threadblock config cta_m=", cta_m, ", cta_n=", cta_n,
               ", cta_k=", cta_k, ", warps=", warps,
-              ". Supported configs are 64x64x32/4, 64x128x32/4, "
-              "64x256x32/8, 128x64x32/4, 128x128x32/4, and "
-              "128x256x32/8.");
+              ". Supported CTA_M/CTA_N/warps shapes are 64x64/4, "
+              "64x128/4, 64x128/8, 64x256/8, 128x64/4, 128x64/8, "
+              "128x128/4, 128x128/8, and 128x256/8 with CTA_K 32, "
+              "64, or 128.");
 }
 
+#undef DISPATCH_THREADBLOCK_K
 #undef DISPATCH_THREADBLOCK
 
 at::Tensor sm70_cutlass_matmul_probe(const at::Tensor& a, const at::Tensor& b,

@@ -11,10 +11,10 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$RESULTS_DIR/${TIMESTAMP}_${TARGET}_${BENCH_PRESET}.log"
 
 case "$TARGET" in
-  matmul|dense|moe|all)
+  matmul|pure-gemm-sweep|dense|moe|all)
     ;;
   *)
-    echo "Usage: ./benchmark.sh [matmul|dense|moe|all]"
+    echo "Usage: ./benchmark.sh [matmul|pure-gemm-sweep|dense|moe|all]"
     exit 1
     ;;
 esac
@@ -38,6 +38,7 @@ export PYTHONPATH="$ROOT_DIR/python"
 read -r -a DENSE_EXTRA_ARGS <<<"${DENSE_ARGS:-}"
 read -r -a MOE_EXTRA_ARGS <<<"${MOE_ARGS:-}"
 read -r -a MATMUL_EXTRA_ARGS <<<"${MATMUL_ARGS:-}"
+read -r -a PURE_GEMM_SWEEP_EXTRA_ARGS <<<"${PURE_GEMM_SWEEP_ARGS:-}"
 
 if [[ ! -f "$ROOT_DIR/python/marlin_v100/_C.abi3.so" || ! -f "$ROOT_DIR/python/marlin_v100/_moe_C.abi3.so" ]]; then
   echo "Extensions not found. Building first..."
@@ -58,6 +59,11 @@ run_matmul() {
     "${MATMUL_EXTRA_ARGS[@]}"
 }
 
+run_pure_gemm_sweep() {
+  "$ROOT_DIR/.venv/bin/python" benchmarks/sweep_sm70_pure_gemm.py \
+    "${PURE_GEMM_SWEEP_EXTRA_ARGS[@]}"
+}
+
 run_dense() {
   "$ROOT_DIR/.venv/bin/python" benchmarks/benchmark_marlin_dense.py \
     --preset "$BENCH_PRESET" \
@@ -73,6 +79,9 @@ run_moe() {
 case "$TARGET" in
   matmul)
     run_matmul
+    ;;
+  pure-gemm-sweep)
+    run_pure_gemm_sweep
     ;;
   dense)
     run_dense
