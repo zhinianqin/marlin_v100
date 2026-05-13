@@ -36,9 +36,14 @@ class Sm70U4ZpIteratorB {
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
+  static bool const kFullTile = FullTile_;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+  static_assert(Shape::kN == kCtaN,
+                "The SM70 kU4 IteratorB expects CTA_N=128.");
+  static_assert(Shape::kK == kCtaK,
+                "The SM70 kU4 IteratorB expects CTA_K=32.");
   static_assert(ThreadMap::Iterations::kContiguous == 2,
                 "SM70 kU4 zero-point paired layout expects two contiguous "
                 "64-column B accesses per thread.");
@@ -66,11 +71,11 @@ class Sm70U4ZpIteratorB {
   uint32_t const* qzeros_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
-  int qweight_offsets_[ThreadMap::Iterations::kCount];
+  int qweight_base_offset_;
+  int qweight_strided_offsets_[ThreadMap::Iterations::kStrided];
   int k_offset_;
   int n_offset_;
   bool mask_enabled_;
-  mutable int cached_group_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
   mutable half2 cached_bias_[ThreadMap::Iterations::kContiguous * 4];
 
@@ -86,22 +91,20 @@ class Sm70U4ZpIteratorB {
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
         n_offset_(threadblock_offset.column()),
-        mask_enabled_(true),
-        cached_group_(-2) {
+        mask_enabled_(true) {
+    int const logical_k = threadblock_offset.row() + thread_offset_.strided();
+    int const logical_n =
+        threadblock_offset.column() + thread_offset_.contiguous();
+    qweight_base_offset_ =
+        qweight_offset_from_logical(params_, logical_k, logical_n);
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const idx = c + s * ThreadMap::Iterations::kContiguous;
-        int const logical_k = threadblock_offset.row() +
-                              thread_offset_.strided() +
-                              s * ThreadMap::Delta::kStrided;
-        int const logical_n = threadblock_offset.column() +
-                              thread_offset_.contiguous() +
-                              c * ThreadMap::Delta::kContiguous;
-        qweight_offsets_[idx] =
-            qweight_offset_from_logical(params_, logical_k, logical_n);
-      }
+      int const strided_k =
+          threadblock_offset.row() + thread_offset_.strided() +
+          s * ThreadMap::Delta::kStrided;
+      qweight_strided_offsets_[s] =
+          qweight_offset_from_logical(params_, strided_k, logical_n) -
+          qweight_base_offset_;
     }
   }
 
@@ -110,10 +113,7 @@ class Sm70U4ZpIteratorB {
     int const k_advance_qwords =
         (Shape::kK / kQuantTileK) * (params_.size_n * 2);
     k_offset_ += Shape::kK;
-    CUTLASS_PRAGMA_UNROLL
-    for (int idx = 0; idx < ThreadMap::Iterations::kCount; ++idx) {
-      qweight_offsets_[idx] += k_advance_qwords;
-    }
+    qweight_base_offset_ += k_advance_qwords;
     return *this;
   }
 
@@ -161,6 +161,17 @@ class Sm70U4ZpIteratorB {
            local_word * subtile_count + subtile;
   }
 
+  CUTLASS_DEVICE
+  int qweight_offset(int s, int c) const {
+    return qweight_base_offset_ + qweight_strided_offsets_[s] + c;
+  }
+
+  CUTLASS_DEVICE
+  static uint32_t qword_from_vector(uint2 const& words, int c) {
+    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
+    return words_ptr[c];
+  }
+
   template <int C>
   CUTLASS_DEVICE void cache_metadata_word(int group, int logical_n,
                                           uint32_t zword) const {
@@ -188,12 +199,8 @@ class Sm70U4ZpIteratorB {
 
   CUTLASS_DEVICE
   void refresh_metadata_cache(int group) const {
-    if (cached_group_ == group) {
-      return;
-    }
-
     int const logical_n0 = n_offset_ + thread_offset_.contiguous();
-    if constexpr (FullTile_) {
+    if constexpr (kFullTile) {
       int const qzeros_row = group * (params_.size_n / kU4ValuesPerWord);
       int const zero_word0 = logical_n0 / kU4ValuesPerWord;
       int const logical_n1 = logical_n0 + ThreadMap::Delta::kContiguous;
@@ -224,21 +231,20 @@ class Sm70U4ZpIteratorB {
         cache_metadata_word<0>(group, logical_n0, zword);
       }
     }
-    cached_group_ = group;
   }
 
   CUTLASS_DEVICE
   void load_full_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+      uint2 const qwords =
+          *reinterpret_cast<uint2 const*>(qweight_ + qweight_offset(s, 0));
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         constexpr int kAccess = ThreadMap::kElementsPerAccess;
         int const frag_base =
             (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
-        int const qword_offset =
-            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
-        uint32_t const qword = qweight_[qword_offset];
+        uint32_t const qword = qword_from_vector(qwords, c);
 
         half2 const* scale_vec = cached_scales_ + c * 4;
         half2 const* bias_vec = cached_bias_ + c * 4;
@@ -275,12 +281,16 @@ class Sm70U4ZpIteratorB {
         bool const valid = logical_k < params_.size_k &&
                            logical_n + kAccess <= params_.size_n;
         if (!valid) {
+          half2 const zero = __float2half2_rn(0.0f);
+          half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+          frag_vec[0] = zero;
+          frag_vec[1] = zero;
+          frag_vec[2] = zero;
+          frag_vec[3] = zero;
           continue;
         }
 
-        int const qword_offset =
-            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
-        uint32_t const qword = qweight_[qword_offset];
+        uint32_t const qword = qweight_[qweight_offset(s, c)];
 
         half2 const* scale_vec = cached_scales_ + c * 4;
         half2 const* bias_vec = cached_bias_ + c * 4;
@@ -304,11 +314,14 @@ class Sm70U4ZpIteratorB {
       return;
     }
 
-    int const first_logical_k = k_offset_ + thread_offset_.strided();
-    int const current_group = scale_group(first_logical_k);
+    int current_group = 0;
+    if constexpr (kGroupSize != -1) {
+      int const first_logical_k = k_offset_ + thread_offset_.strided();
+      current_group = scale_group(first_logical_k);
+    }
     refresh_metadata_cache(current_group);
 
-    if constexpr (FullTile_) {
+    if constexpr (kFullTile) {
       load_full_tile(frag);
     } else {
       load_residue_tile(frag);

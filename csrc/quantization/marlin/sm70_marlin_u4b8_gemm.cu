@@ -36,7 +36,6 @@ class Sm70U4B8IteratorB {
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
   static bool const kFullTile = FullTile_;
-  static bool const kCacheScales = GroupSize_ == -1;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
@@ -98,9 +97,6 @@ class Sm70U4B8IteratorB {
         threadblock_offset.column() + thread_offset_.contiguous();
     qweight_base_offset_ =
         qweight_offset_from_logical(params_, logical_k, logical_n);
-    if constexpr (kCacheScales) {
-      cache_single_group_scales();
-    }
   }
 
   CUTLASS_DEVICE
@@ -194,43 +190,11 @@ class Sm70U4B8IteratorB {
   }
 
   CUTLASS_DEVICE
-  void cache_single_group_scales() const {
-    if constexpr (!kCacheScales) {
-      return;
-    } else {
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const logical_n =
-            n_offset_ + thread_offset_.contiguous() +
-            c * ThreadMap::Delta::kContiguous;
-        if constexpr (kFullTile) {
-          half2 const* scale_vec =
-              reinterpret_cast<half2 const*>(scales_ + logical_n);
-          half2* cache = cached_scales_ + c * 4;
-          cache[0] = scale_vec[0];
-          cache[1] = scale_vec[1];
-          cache[2] = scale_vec[2];
-          cache[3] = scale_vec[3];
-        } else if (logical_n + ThreadMap::kElementsPerAccess <=
-                   params_.size_n) {
-          half2 const* scale_vec =
-              reinterpret_cast<half2 const*>(scales_ + logical_n);
-          half2* cache = cached_scales_ + c * 4;
-          cache[0] = scale_vec[0];
-          cache[1] = scale_vec[1];
-          cache[2] = scale_vec[2];
-          cache[3] = scale_vec[3];
-        }
-      }
-    }
-  }
-
-  CUTLASS_DEVICE
   void load_full_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
       half2 const* scale_row = nullptr;
-      if constexpr (!kCacheScales) {
+      if constexpr (kGroupSize != -1) {
         int const logical_k =
             k_offset_ + thread_offset_.strided() +
             s * ThreadMap::Delta::kStrided;
@@ -248,7 +212,7 @@ class Sm70U4B8IteratorB {
             (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
         uint32_t const qword = qword_from_vector(qwords, c);
         half2 const* scale_vec;
-        if constexpr (!kCacheScales) {
+        if constexpr (kGroupSize != -1) {
           scale_vec = scale_row + c * (ThreadMap::Delta::kContiguous / 2);
         } else {
           scale_vec = cached_scales_ + c * 4;
@@ -277,7 +241,7 @@ class Sm70U4B8IteratorB {
           s * ThreadMap::Delta::kStrided;
       bool const k_valid = logical_k < tile_k_end_;
       half2 const* scale_row = nullptr;
-      if constexpr (!kCacheScales) {
+      if constexpr (kGroupSize != -1) {
         int const group = scale_group(logical_k);
         scale_row = reinterpret_cast<half2 const*>(
             scales_ + group * params_.size_n + n_offset_ +
@@ -306,7 +270,7 @@ class Sm70U4B8IteratorB {
         int const qword_offset = qweight_offset(c);
         uint32_t const qword = qweight_[qword_offset];
         half2 const* scale_vec;
-        if constexpr (!kCacheScales) {
+        if constexpr (kGroupSize != -1) {
           scale_vec = scale_row + c * (ThreadMap::Delta::kContiguous / 2);
         } else {
           scale_vec = cached_scales_ + c * 4;
@@ -330,6 +294,33 @@ class Sm70U4B8IteratorB {
   void load(Fragment& frag) const {
     if (!mask_enabled_) {
       return;
+    }
+
+    if constexpr (kGroupSize == -1) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+        int const logical_n =
+            n_offset_ + thread_offset_.contiguous() +
+            c * ThreadMap::Delta::kContiguous;
+        if constexpr (kFullTile) {
+          half2 const* scale_vec =
+              reinterpret_cast<half2 const*>(scales_ + logical_n);
+          half2* cache = cached_scales_ + c * 4;
+          cache[0] = scale_vec[0];
+          cache[1] = scale_vec[1];
+          cache[2] = scale_vec[2];
+          cache[3] = scale_vec[3];
+        } else if (logical_n + ThreadMap::kElementsPerAccess <=
+                   params_.size_n) {
+          half2 const* scale_vec =
+              reinterpret_cast<half2 const*>(scales_ + logical_n);
+          half2* cache = cached_scales_ + c * 4;
+          cache[0] = scale_vec[0];
+          cache[1] = scale_vec[1];
+          cache[2] = scale_vec[2];
+          cache[3] = scale_vec[3];
+        }
+      }
     }
 
     if constexpr (kFullTile) {
