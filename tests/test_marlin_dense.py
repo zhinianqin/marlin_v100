@@ -840,7 +840,43 @@ def test_marlin_dense_uint8_zp_bias_rejects_bias_without_flag():
         )
 
 
-def test_marlin_dense_uint8b128_rejects_dense_sm70_dispatch():
+def test_marlin_dense_uint8b128_rejects_zp_bias_metadata():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+    w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+        w, scalar_types.uint8b128, 128, False
+    )
+    zp_bias = torch.zeros_like(scales)
+
+    with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zp_bias,
+            g_idx,
+            sort_indices,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint8b128.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            True,
+        )
+
+
+def test_marlin_dense_uint8b128_rejects_use_zp_bias_without_metadata():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -851,7 +887,7 @@ def test_marlin_dense_uint8b128_rejects_dense_sm70_dispatch():
         w, scalar_types.uint8b128, 128, False
     )
 
-    with pytest.raises(RuntimeError, match="only uint4, uint4b8, and uint8"):
+    with pytest.raises(RuntimeError, match="use_zp_bias is true"):
         ops.marlin_gemm(
             a,
             None,
@@ -871,7 +907,7 @@ def test_marlin_dense_uint8b128_rejects_dense_sm70_dispatch():
             True,
             False,
             True,
-            False,
+            True,
         )
 
 

@@ -36,6 +36,7 @@ _DENSE_QUANT_TYPE_CANDIDATES = {
     "uint4": scalar_types.uint4,
     "uint4b8": scalar_types.uint4b8,
     "uint8": scalar_types.uint8,
+    "uint8b128": scalar_types.uint8b128,
 }
 QUANT_TYPES = {
     name: _DENSE_QUANT_TYPE_CANDIDATES[name]

@@ -43,6 +43,11 @@ torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_zp_bias, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size);
+torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
+                                      torch::Tensor& b_q_weight,
+                                      torch::Tensor& b_scales, int64_t size_m,
+                                      int64_t size_n, int64_t size_k,
+                                      int64_t group_size);
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -610,10 +615,10 @@ torch::Tensor marlin_gemm(
               "SM70 build only supports float16 outputs.");
   TORCH_CHECK(s_type == vllm::kFloat16,
               "SM70 build only supports float16 scales.");
-  TORCH_CHECK(
-      b_type == vllm::kU4 || b_type == vllm::kU4B8 || b_type == vllm::kU8,
-      "SM70 CUTLASS prototype currently implements only uint4, uint4b8, "
-      "and uint8 dense weights. TODO: reintroduce uint8b128 implementation.");
+  TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
+                  b_type == vllm::kU8 || b_type == vllm::kU8B128,
+              "SM70 CUTLASS prototype currently implements only uint4, "
+              "uint4b8, uint8, and uint8b128 dense weights.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -878,6 +883,17 @@ torch::Tensor marlin_gemm(
         "zero-point bias.");
     return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales, b_zp_bias, size_m,
                                size_n, size_k, group_size);
+  }
+
+  if (b_type == vllm::kU8B128) {
+    TORCH_CHECK(
+        size_k % 32 == 0,
+        "SM70 CUTLASS uint8b128 dense prototype requires size_k % 32 == 0.");
+    TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+                "SM70 CUTLASS uint8b128 prototype does not support "
+                "zero-point bias metadata.");
+    return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
+                                   size_k, group_size);
   }
 
   TORCH_CHECK(!has_zp_bias && !use_zp_bias,

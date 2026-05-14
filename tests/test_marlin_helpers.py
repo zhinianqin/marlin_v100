@@ -36,6 +36,7 @@ _ROUNDTRIP_TOLERANCES = {
 _REPACK_QUANT_TYPES = {
     "uint4b8": scalar_types.uint4b8,
     "uint8": scalar_types.uint8,
+    "uint8b128": scalar_types.uint8b128,
 }
 _GROUP_SIZES = (-1, 32, 64, 128)
 _ROUNDTRIP_CASES = [
