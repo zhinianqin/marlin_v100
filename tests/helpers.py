@@ -50,6 +50,7 @@ class ScalarType:
 class scalar_types:
     uint4 = ScalarType(0, 4, False, 0)
     uint4b8 = ScalarType(0, 4, False, 8)
+    uint8 = ScalarType(0, 8, False, 0)
     uint8b128 = ScalarType(0, 8, False, 128)
 
 
@@ -79,7 +80,7 @@ def _supported_quant_types() -> tuple[ScalarType, ...]:
 
 
 def _supported_unpack_quant_types() -> tuple[ScalarType, ...]:
-    return (scalar_types.uint4, scalar_types.uint4b8, scalar_types.uint8b128)
+    return (scalar_types.uint4, scalar_types.uint4b8, scalar_types.uint8, scalar_types.uint8b128)
 
 
 def pack_rows(
@@ -362,6 +363,26 @@ def _quantize_uint4_with_zero_point(
     return q, scales.to(weight.dtype), zero_points.contiguous()
 
 
+def _quantize_uint8_with_zero_point(
+    weight: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    size_k, size_n = weight.shape
+    if group_size == -1:
+        group_size = size_k
+    if size_k % group_size != 0:
+        raise ValueError(f"group_size={group_size} must divide size_k={size_k}")
+
+    groups = size_k // group_size
+    reshaped = weight.to(torch.float32).reshape(groups, group_size, size_n)
+    mins = reshaped.amin(dim=1)
+    maxs = reshaped.amax(dim=1)
+    scales = ((maxs - mins) / 255.0).clamp_min(1e-6)
+    zero_points = torch.round(-mins / scales).clamp(0, 255).to(torch.int32)
+    q = torch.round(reshaped / scales.unsqueeze(1) + zero_points.unsqueeze(1))
+    q = q.clamp(0, 255).to(torch.int32).reshape(size_k, size_n)
+    return q, scales.to(weight.dtype), zero_points.contiguous()
+
+
 def _make_group_ids(size_k: int, group_size: int, device: torch.device) -> torch.Tensor:
     actual_group_size = size_k if group_size == -1 else group_size
     return torch.arange(size_k, device=device, dtype=torch.int) // actual_group_size
@@ -532,6 +553,48 @@ def marlin_quantize_uint4_zp_bias(
     return weight, marlin_q_weight, marlin_scales, marlin_zp_bias, dequantized
 
 
+def marlin_quantize_uint8_zp_bias(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_dense_group_size(group_size)
+    size_k, size_n = weight.shape
+    q_weight, scales, zero_points = _quantize_uint8_with_zero_point(weight, group_size)
+    weight_perm = quant_utils.get_weight_perm(scalar_types.uint8.size_bits, is_a_8bit=False)
+    marlin_q_weight = quant_utils.marlin_weights(
+        q_weight,
+        size_k,
+        size_n,
+        scalar_types.uint8.size_bits,
+        weight_perm,
+        is_a_8bit=False,
+    )
+    marlin_scales = dense.marlin_permute_scales(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    zp_bias = (-zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
+    marlin_zp_bias = dense.marlin_permute_scales(
+        zp_bias,
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    dequantized = marlin_dequantize_uint8_zp_bias(
+        marlin_q_weight,
+        marlin_scales,
+        marlin_zp_bias,
+        size_k,
+        size_n,
+        group_size,
+    )
+    return weight, marlin_q_weight, marlin_scales, marlin_zp_bias, dequantized
+
+
 def marlin_dequantize_uint4_zp(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
@@ -599,6 +662,40 @@ def marlin_dequantize_uint4_zp_bias(
     return dequantized
 
 
+def marlin_dequantize_uint8_zp_bias(
+    q_weight: torch.Tensor,
+    scales: torch.Tensor,
+    zp_bias: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    perm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    unpacked = _marlin_unpack_impl(q_weight, size_k, size_n, scalar_types.uint8).to(torch.float32)
+    unpermuted_scales = _marlin_unpermute_scales_impl(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+    ).to(torch.float32)
+    unpermuted_zp_bias = _marlin_unpermute_scales_impl(
+        zp_bias,
+        size_k,
+        size_n,
+        group_size,
+    ).to(torch.float32)
+    if group_size == -1:
+        group_size = size_k
+    expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
+    expanded_zp_bias = unpermuted_zp_bias.repeat_interleave(group_size, dim=0)[:size_k]
+    dequantized = (unpacked * expanded_scales + expanded_zp_bias).to(torch.float16)
+    if perm is not None and perm.numel() > 0:
+        logical = torch.empty_like(dequantized)
+        logical[perm.to(torch.long)] = dequantized
+        return logical
+    return dequantized
+
+
 def marlin_unpack(
     q_weight: torch.Tensor,
     size_k: int,
@@ -607,7 +704,7 @@ def marlin_unpack(
 ) -> torch.Tensor:
     if quant_type not in _supported_unpack_quant_types():
         raise ValueError(
-            "Local marlin_v100 helper currently supports uint4, uint4b8, and uint8b128 unpacking."
+            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, and uint8b128 unpacking."
         )
     return _marlin_unpack_impl(q_weight, size_k, size_n, quant_type)
 
@@ -654,30 +751,29 @@ def _marlin_unpack_impl(
                                 col_tile_start + local_n_vec * 8 + idx,
                             ] = value
     else:
-        packed = packed_words.reshape(size_k // 16, n_tiles, tile_words)
+        packed = packed_words.reshape(size_k // 16, n_tiles * tile_words)
         for k_tile in range(size_k // 16):
             row_start = 16 * k_tile
             for n_tile in range(n_tiles):
-                tile = packed[k_tile, n_tile].reshape(4, 8, 2, 4)
                 col_tile_start = 64 * n_tile
-                for j in range(4):
-                    col_block_start = col_tile_start + 16 * j
-                    for atom_rowcol in range(8):
-                        col0 = col_block_start + atom_rowcol
-                        col1 = col0 + 8
-                        for row_group, rows in enumerate(_SM70_ROW_GROUPS):
-                            word0 = int(tile[j, atom_rowcol, 0, row_group])
-                            word1 = int(tile[j, atom_rowcol, 1, row_group])
-                            packed_vals0 = [(word0 >> (num_bits * idx)) & 0xFF for idx in range(4)]
-                            packed_vals1 = [(word1 >> (num_bits * idx)) & 0xFF for idx in range(4)]
-                            logical_vals0 = [0] * 4
-                            logical_vals1 = [0] * 4
-                            for out_idx, src_idx in enumerate(quant_utils._SM70_U8_PACK_ORDER):
-                                logical_vals0[src_idx] = packed_vals0[out_idx]
-                                logical_vals1[src_idx] = packed_vals1[out_idx]
-                            for idx, row in enumerate(rows):
-                                unpacked_np[row_start + row, col0] = logical_vals0[idx]
-                                unpacked_np[row_start + row, col1] = logical_vals1[idx]
+                for local_k in range(16):
+                    for local_n_word in range(16):
+                        local_word = local_k * 16 + local_n_word
+                        word_offset = quant_utils._sm70_u8_macro_n_offset(
+                            n_tiles,
+                            n_tile,
+                            local_word,
+                        )
+                        word = int(packed[k_tile, word_offset])
+                        packed_vals = [(word >> (num_bits * idx)) & 0xFF for idx in range(4)]
+                        logical_vals = [0] * 4
+                        for out_idx, src_idx in enumerate(quant_utils._SM70_U8_PACK_ORDER):
+                            logical_vals[src_idx] = packed_vals[out_idx]
+                        for idx, value in enumerate(logical_vals):
+                            unpacked_np[
+                                row_start + local_k,
+                                col_tile_start + local_n_word * 4 + idx,
+                            ] = value
 
     return unpacked.to(q_weight.device)
 
@@ -691,7 +787,7 @@ def marlin_unpermute_scales(
 ) -> torch.Tensor:
     if quant_type not in _supported_unpack_quant_types():
         raise ValueError(
-            "Local marlin_v100 helper currently supports uint4, uint4b8, and uint8b128 scale unpermute."
+            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, and uint8b128 scale unpermute."
         )
     return _marlin_unpermute_scales_impl(scales, size_k, size_n, group_size)
 

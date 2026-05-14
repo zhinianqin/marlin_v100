@@ -117,6 +117,47 @@ __global__ void awq_marlin_repack_kernel(
       return;
     }
 
+    if constexpr (!is_a_8bit && num_bits == 8) {
+      int word_idx = threadIdx.x;
+      if (word_idx >= tile_size) {
+        return;
+      }
+
+      int local_k = word_idx / 16;
+      int local_n_word = word_idx % 16;
+
+      constexpr int sh_stride = tile_n_ints;
+      int4* sh_stage_ptr = sh + stage_size * pipe;
+      uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
+      uint32_t packed_src =
+          sh_stage_int_ptr[local_k * sh_stride + local_n_word];
+
+      constexpr int undo_pack[4] = {0, 2, 1, 3};
+      constexpr int pack_idx[4] = {0, 2, 1, 3};
+
+      uint32_t vals[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        vals[i] = (packed_src >> (undo_pack[i] * 8)) & 0xFF;
+      }
+
+      uint32_t res = 0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        res |= vals[pack_idx[i]] << (i * 8);
+      }
+
+      int const macro_n_tile = n_tile_id / 4;
+      int const macro_first_n_tile = macro_n_tile * 4;
+      int const subtile = n_tile_id - macro_first_n_tile;
+      int const subtile_count = min(4, n_tiles - macro_first_n_tile);
+      int const local_word = local_k * 16 + local_n_word;
+      int const macro_offset =
+          macro_n_tile * 4 * tile_size + local_word * subtile_count + subtile;
+      out_ptr[k_tile_id * n_tiles * tile_size + macro_offset] = res;
+      return;
+    }
+
     auto warp_id = threadIdx.x / 32;
     auto th_id = threadIdx.x % 32;
 

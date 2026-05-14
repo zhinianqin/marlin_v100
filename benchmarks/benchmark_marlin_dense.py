@@ -28,13 +28,14 @@ from tests.helpers import (
     marlin_make_workspace_new,
     marlin_quantize,
     marlin_quantize_uint4_zp_bias,
+    marlin_quantize_uint8_zp_bias,
     scalar_types,
 )
 
 _DENSE_QUANT_TYPE_CANDIDATES = {
     "uint4": scalar_types.uint4,
     "uint4b8": scalar_types.uint4b8,
-    "uint8b128": scalar_types.uint8b128,
+    "uint8": scalar_types.uint8,
 }
 QUANT_TYPES = {
     name: _DENSE_QUANT_TYPE_CANDIDATES[name]
@@ -197,6 +198,14 @@ def run_case(
         if act_order:
             return None
         _weight, q_weight, scales, b_zp_bias, weight_ref = marlin_quantize_uint4_zp_bias(
+            weight, group_size
+        )
+        g_idx = torch.empty(0, dtype=torch.int, device=device)
+        sort_indices = torch.empty(0, dtype=torch.int, device=device)
+    elif quant_name == "uint8":
+        if act_order:
+            return None
+        _weight, q_weight, scales, b_zp_bias, weight_ref = marlin_quantize_uint8_zp_bias(
             weight, group_size
         )
         g_idx = torch.empty(0, dtype=torch.int, device=device)

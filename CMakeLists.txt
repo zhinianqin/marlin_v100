@@ -107,6 +107,7 @@ set(MARLIN_SRCS
    "csrc/quantization/marlin/sm70_cutlass_matmul_probe.cu"
    "csrc/quantization/marlin/sm70_marlin_u4b8_gemm.cu"
    "csrc/quantization/marlin/sm70_marlin_u4_gemm.cu"
+   "csrc/quantization/marlin/sm70_marlin_u8_gemm.cu"
    "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
    "csrc/quantization/marlin/gptq_marlin_repack.cu"
    "csrc/quantization/marlin/awq_marlin_repack.cu")

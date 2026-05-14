@@ -128,22 +128,17 @@ def _pack_sm70_native_tile(q_tile: np.ndarray, num_bits: int) -> np.ndarray:
         return packed.reshape(-1)
 
     if num_bits == 8:
-        packed = np.empty((4, 8, 2, 4), dtype=np.uint32)
-        for j in range(4):
-            col_base = 16 * j
-            for atom_rowcol in range(8):
-                col0 = col_base + atom_rowcol
-                col1 = col0 + 8
-                for row_group, rows in enumerate(_SM70_ROW_GROUPS):
-                    vals0 = [int(q_tile[row, col0]) for row in rows]
-                    vals1 = [int(q_tile[row, col1]) for row in rows]
-                    word0 = 0
-                    word1 = 0
-                    for out_idx, src_idx in enumerate(_SM70_U8_PACK_ORDER):
-                        word0 |= vals0[src_idx] << (num_bits * out_idx)
-                        word1 |= vals1[src_idx] << (num_bits * out_idx)
-                    packed[j, atom_rowcol, 0, row_group] = np.uint32(word0)
-                    packed[j, atom_rowcol, 1, row_group] = np.uint32(word1)
+        packed = np.empty((16, 16), dtype=np.uint32)
+        for local_k in range(16):
+            for local_n_word in range(16):
+                vals = [
+                    int(q_tile[local_k, local_n_word * 4 + n])
+                    for n in range(4)
+                ]
+                word = 0
+                for out_idx, src_idx in enumerate(_SM70_U8_PACK_ORDER):
+                    word |= vals[src_idx] << (num_bits * out_idx)
+                packed[local_k, local_n_word] = np.uint32(word)
         return packed.reshape(-1)
 
     raise ValueError(f"Unsupported num_bits={num_bits}")
@@ -159,6 +154,23 @@ def _sm70_u4_macro_n_offset(
     subtile = n_tile - macro_first_n_tile
     subtile_count = min(_SM70_U4_MACRO_N_TILES, n_tiles - macro_first_n_tile)
     tile_words = 16 * 64 // get_pack_factor(4)
+    return (
+        macro_n_tile * _SM70_U4_MACRO_N_TILES * tile_words
+        + local_word * subtile_count
+        + subtile
+    )
+
+
+def _sm70_u8_macro_n_offset(
+    n_tiles: int,
+    n_tile: int,
+    local_word: int,
+) -> int:
+    macro_n_tile = n_tile // _SM70_U4_MACRO_N_TILES
+    macro_first_n_tile = macro_n_tile * _SM70_U4_MACRO_N_TILES
+    subtile = n_tile - macro_first_n_tile
+    subtile_count = min(_SM70_U4_MACRO_N_TILES, n_tiles - macro_first_n_tile)
+    tile_words = 16 * 64 // get_pack_factor(8)
     return (
         macro_n_tile * _SM70_U4_MACRO_N_TILES * tile_words
         + local_word * subtile_count
@@ -187,38 +199,29 @@ def marlin_weights(
     tile_words = (16 * 64) // pack_factor
     n_tiles = size_n // 64
 
-    if num_bits == 4:
-        packed = np.empty((size_k // 16, n_tiles * tile_words), dtype=np.uint32)
-        for k_tile in range(size_k // 16):
-            row_start = 16 * k_tile
-            row_stop = row_start + 16
-            for n_tile in range(n_tiles):
-                col_start = 64 * n_tile
-                col_stop = col_start + 64
-                tile = _pack_sm70_native_tile(
-                    q_w_np[row_start:row_stop, col_start:col_stop],
-                    num_bits,
-                )
-                for local_word, word in enumerate(tile):
-                    word_offset = _sm70_u4_macro_n_offset(
-                        n_tiles,
-                        n_tile,
-                        local_word,
-                    )
-                    packed[k_tile, word_offset] = word
-        return torch.from_numpy(packed.astype(np.int32)).to(q_w.device)
-
-    packed = np.empty((size_k // 16, n_tiles, tile_words), dtype=np.uint32)
-
+    packed = np.empty((size_k // 16, n_tiles * tile_words), dtype=np.uint32)
     for k_tile in range(size_k // 16):
         row_start = 16 * k_tile
         row_stop = row_start + 16
         for n_tile in range(n_tiles):
             col_start = 64 * n_tile
             col_stop = col_start + 64
-            packed[k_tile, n_tile] = _pack_sm70_native_tile(
+            tile = _pack_sm70_native_tile(
                 q_w_np[row_start:row_stop, col_start:col_stop],
                 num_bits,
             )
-
-    return torch.from_numpy(packed.reshape(size_k // 16, -1).astype(np.int32)).to(q_w.device)
+            for local_word, word in enumerate(tile):
+                if num_bits == 4:
+                    word_offset = _sm70_u4_macro_n_offset(
+                        n_tiles,
+                        n_tile,
+                        local_word,
+                    )
+                else:
+                    word_offset = _sm70_u8_macro_n_offset(
+                        n_tiles,
+                        n_tile,
+                        local_word,
+                    )
+                packed[k_tile, word_offset] = word
+    return torch.from_numpy(packed.astype(np.int32)).to(q_w.device)

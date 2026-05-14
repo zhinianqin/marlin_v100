@@ -37,7 +37,8 @@ class ArchitectureSupport:
 QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
     "uint4": QuantTypeSupport(name="uint4", dense_supported=True, moe_supported=True),
     "uint4b8": QuantTypeSupport(name="uint4b8", dense_supported=True, moe_supported=True),
-    "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=False, moe_supported=True),
+    "uint8": QuantTypeSupport(name="uint8", dense_supported=True, moe_supported=False),
+    "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=False, moe_supported=False),
     "fp8": QuantTypeSupport(
         name="fp8",
         dense_supported=True,
@@ -105,6 +106,7 @@ def _encode_scalar_type_id(
 _QUANT_TYPE_IDS = {
     "uint4": _encode_scalar_type_id(0, 4, False, 0),
     "uint4b8": _encode_scalar_type_id(0, 4, False, 8),
+    "uint8": _encode_scalar_type_id(0, 8, False, 0),
     "uint8b128": _encode_scalar_type_id(0, 8, False, 128),
 }
 
