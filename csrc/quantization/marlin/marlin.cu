@@ -34,7 +34,7 @@ torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
 torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zeros, int64_t size_m,
+                                  torch::Tensor& b_zp_bias, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size);
 
@@ -62,12 +62,12 @@ torch::Tensor marlin_gemm(
     torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
     torch::Tensor& b_q_weight,
     std::optional<torch::Tensor> const& b_bias_or_none, torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& b_zp_bias_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
     std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool use_zp_bias) {
   TORCH_CHECK_NOT_IMPLEMENTED(false,
                               "marlin_gemm(..) requires an SM70 build.");
   return torch::empty({1, 1});
@@ -534,12 +534,12 @@ torch::Tensor marlin_gemm(
     std::optional<torch::Tensor> const& b_bias_or_none, torch::Tensor& b_scales,
     std::optional<torch::Tensor> const& a_scales_or_none,
     std::optional<torch::Tensor> const& global_scale_or_none,
-    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& b_zp_bias_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
     std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool use_zp_bias) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -608,7 +608,6 @@ torch::Tensor marlin_gemm(
       b_type == vllm::kU4 || b_type == vllm::kU4B8,
       "SM70 CUTLASS prototype currently implements only uint4 and uint4b8 "
       "dense weights. TODO: reintroduce uint8b128 implementation.");
-  TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -777,36 +776,37 @@ torch::Tensor marlin_gemm(
     b_bias = torch::empty({0}, options);
   }
 
-  torch::Tensor b_zeros;
-  if (b_zeros_or_none.has_value()) {
-    b_zeros = b_zeros_or_none.value();
-    TORCH_CHECK(b_zeros.device().is_cuda(), "b_zeros is not on GPU");
-    TORCH_CHECK(b_zeros.is_contiguous(), "b_zeros is not contiguous");
+  torch::Tensor b_zp_bias;
+  if (b_zp_bias_or_none.has_value()) {
+    b_zp_bias = b_zp_bias_or_none.value();
+    TORCH_CHECK(b_zp_bias.device().is_cuda(), "b_zp_bias is not on GPU");
+    TORCH_CHECK(b_zp_bias.is_contiguous(),
+                "b_zp_bias is not contiguous");
   } else {
-    b_zeros = torch::empty({0}, options);
+    b_zp_bias = torch::empty({0}, options);
   }
-  bool has_zp = b_zeros.size(-1) > 0;
+  bool has_zp_bias = b_zp_bias.size(-1) > 0;
 
-  // Verify b_zeros
-  if (has_zp) {
-    int rank = b_zeros.sizes().size();
-    TORCH_CHECK(rank == 2, "b_zeros rank = ", rank, " is not 2");
-    if (is_zp_float) {
-      TORCH_CHECK(b_zeros.size(1) == size_n,
-                  "b_zeros dim 1 = ", b_zeros.size(1),
-                  " is not size_n = ", size_n);
-      TORCH_CHECK(num_groups == b_zeros.size(0),
-                  "b_zeros dim 0 = ", b_zeros.size(0),
-                  " is not num_groups = ", num_groups);
-      TORCH_CHECK(num_groups != -1, "num_groups must be != -1");
-    } else {
-      TORCH_CHECK(b_zeros.size(0) == num_groups,
-                  "b_zeros dim 0 = ", b_zeros.size(0),
-                  " is not num_groups = ", num_groups);
-      TORCH_CHECK(b_zeros.size(1) == size_n / pack_factor,
-                  "b_zeros dim 1 = ", b_zeros.size(1),
-                  " is not size_n / pack_factor = ", size_n / pack_factor);
-    }
+  // Verify precomputed zero-point bias metadata for dense uint4.
+  if (has_zp_bias) {
+    TORCH_CHECK(use_zp_bias,
+                "SM70 CUTLASS dense prototype received b_zp_bias but "
+                "use_zp_bias is false. Packed integer zero-points are not "
+                "supported on the dense SM70 uint4 path.");
+    int rank = b_zp_bias.sizes().size();
+    TORCH_CHECK(rank == 2, "b_zp_bias rank = ", rank, " is not 2");
+    TORCH_CHECK(b_zp_bias.scalar_type() == at::ScalarType::Half,
+                "SM70 CUTLASS uint4 dense prototype expects fp16 "
+                "precomputed zero-point bias.");
+    TORCH_CHECK(b_zp_bias.size(1) == size_n,
+                "b_zp_bias dim 1 = ", b_zp_bias.size(1),
+                " is not size_n = ", size_n);
+    TORCH_CHECK(num_groups == b_zp_bias.size(0),
+                "b_zp_bias dim 0 = ", b_zp_bias.size(0),
+                " is not num_groups = ", num_groups);
+  } else {
+    TORCH_CHECK(!use_zp_bias,
+                "use_zp_bias is true but b_zp_bias was not provided.");
   }
 
   // Verify workspace size
@@ -855,28 +855,29 @@ torch::Tensor marlin_gemm(
   if (b_type == vllm::kU4) {
     TORCH_CHECK(size_k % 32 == 0,
                 "SM70 CUTLASS uint4 dense prototype requires size_k % 32 == 0.");
-    TORCH_CHECK(has_zp,
-                "SM70 CUTLASS uint4 dense prototype requires integer zero-points.");
-    TORCH_CHECK(!is_zp_float,
-                "SM70 CUTLASS uint4 dense prototype does not support float zero-points.");
-    return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
+    TORCH_CHECK(
+        has_zp_bias && use_zp_bias,
+        "SM70 CUTLASS uint4 dense prototype requires fp16 precomputed "
+        "zero-point bias.");
+    return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zp_bias, size_m,
                                size_n, size_k, group_size);
   }
 
-  TORCH_CHECK(!has_zp,
-              "SM70 CUTLASS uint4b8 prototype does not support zero-points.");
+  TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+              "SM70 CUTLASS uint4b8 prototype does not support zero-point "
+              "bias metadata.");
   return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                size_k, group_size);
 
   marlin::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
-      global_scale.data_ptr(), b_zeros.data_ptr(), g_idx.data_ptr(),
+      global_scale.data_ptr(), b_zp_bias.data_ptr(), g_idx.data_ptr(),
       perm.data_ptr(), a_tmp.data_ptr(), size_m, size_n, size_k, a.stride(0),
       workspace.data_ptr(), a_type, b_type, c_type, s_type, has_bias,
-      has_act_order, is_k_full, has_zp, num_groups, group_size, dev,
+      has_act_order, is_k_full, has_zp_bias, num_groups, group_size, dev,
       at::cuda::getCurrentCUDAStream(dev), thread_k, thread_n, sms,
-      use_atomic_add, use_fp32_reduce, is_zp_float);
+      use_atomic_add, use_fp32_reduce, use_zp_bias);
 
   return c;
 }

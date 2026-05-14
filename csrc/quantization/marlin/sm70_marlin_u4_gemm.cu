@@ -28,10 +28,9 @@ constexpr int kQuantTileK = 16;
 constexpr int kQuantTileN = 64;
 constexpr int kU4ValuesPerWord = 8;
 constexpr int kU4WordsPerTile = kQuantTileK * kQuantTileN / kU4ValuesPerWord;
-constexpr int kZeroWordsPerCtaN = kCtaN / kU4ValuesPerWord;
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_, bool FullTile_>
-class Sm70U4ZpIteratorB {
+class Sm70U4ZpBiasIteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
@@ -45,14 +44,14 @@ class Sm70U4ZpIteratorB {
   static_assert(Shape::kK == kCtaK,
                 "The SM70 kU4 IteratorB expects CTA_K=32.");
   static_assert(ThreadMap::Iterations::kContiguous == 2,
-                "SM70 kU4 zero-point paired layout expects two contiguous "
+                "SM70 kU4 scale+bias layout expects two contiguous "
                 "64-column B accesses per thread.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
-                "SM70 kU4 zero-point paired layout expects 64-column "
+                "SM70 kU4 scale+bias layout expects 64-column "
                 "contiguous iterator delta.");
   static_assert(ThreadMap::kElementsPerAccess == kU4ValuesPerWord,
-                "SM70 kU4 zero-point paired layout expects one packed "
-                "zero word per access.");
+                "SM70 kU4 scale+bias layout expects one packed int4 word per "
+                "access.");
 
   struct Params {
     int size_k;
@@ -68,7 +67,7 @@ class Sm70U4ZpIteratorB {
  private:
   uint32_t const* qweight_;
   half const* scales_;
-  uint32_t const* qzeros_;
+  half const* zp_bias_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
   int qweight_offsets_[ThreadMap::Iterations::kCount];
@@ -82,12 +81,12 @@ class Sm70U4ZpIteratorB {
 
  public:
   CUTLASS_DEVICE
-  Sm70U4ZpIteratorB(Params const& params, uint32_t const* qweight,
-                   half const* scales, uint32_t const* qzeros, int thread_id,
-                   cutlass::MatrixCoord const& threadblock_offset)
+  Sm70U4ZpBiasIteratorB(Params const& params, uint32_t const* qweight,
+                        half const* scales, half const* zp_bias, int thread_id,
+                        cutlass::MatrixCoord const& threadblock_offset)
       : qweight_(qweight),
         scales_(scales),
-        qzeros_(qzeros),
+        zp_bias_(zp_bias),
         params_(params),
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
@@ -112,8 +111,8 @@ class Sm70U4ZpIteratorB {
       }
     }
     if constexpr (kGroupSize == -1) {
-      // GroupSize=-1 keeps scale/zero metadata stable for every K tile.
-      // Precompute scale and bias once before the MMA mainloop.
+      // GroupSize=-1 keeps scale and precomputed zero-point bias stable for
+      // every K tile. Cache both planes once before the MMA mainloop.
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         int const cache_n =
@@ -125,19 +124,6 @@ class Sm70U4ZpIteratorB {
           }
         }
 
-        int const zero_word = cache_n / kU4ValuesPerWord;
-        int const zero_tile = zero_word / kZeroWordsPerCtaN;
-        int const zero_tile_base = zero_tile * kZeroWordsPerCtaN;
-        int const zero_local_word = zero_word - zero_tile_base;
-        int const zero_half_words =
-            kZeroWordsPerCtaN / ThreadMap::Iterations::kContiguous;
-        int const zero_paired_word =
-            (zero_local_word % zero_half_words) *
-                ThreadMap::Iterations::kContiguous +
-            zero_local_word / zero_half_words;
-        uint32_t const zword = qzeros_[zero_tile_base + zero_paired_word];
-
-        half2 const zero = __float2half2_rn(0.0f);
         half2 const* scale_vec =
             reinterpret_cast<half2 const*>(scales_ + cache_n);
         half2* scale_cache = cached_scales_ + c * 4;
@@ -146,22 +132,19 @@ class Sm70U4ZpIteratorB {
         scale_cache[2] = scale_vec[2];
         scale_cache[3] = scale_vec[3];
 
+        half2 const* bias_vec =
+            reinterpret_cast<half2 const*>(zp_bias_ + cache_n);
         half2* bias_cache = cached_bias_ + c * 4;
-        half2 deq[2];
-        marlin::dequant<half2, vllm::kU4.id(), false>(
-            static_cast<int>(zword), deq);
-        bias_cache[0] = __hsub2(zero, __hmul2(deq[0], scale_cache[0]));
-        bias_cache[1] = __hsub2(zero, __hmul2(deq[1], scale_cache[1]));
-        marlin::dequant<half2, vllm::kU4.id(), false>(
-            static_cast<int>(zword >> 8), deq);
-        bias_cache[2] = __hsub2(zero, __hmul2(deq[0], scale_cache[2]));
-        bias_cache[3] = __hsub2(zero, __hmul2(deq[1], scale_cache[3]));
+        bias_cache[0] = bias_vec[0];
+        bias_cache[1] = bias_vec[1];
+        bias_cache[2] = bias_vec[2];
+        bias_cache[3] = bias_vec[3];
       }
     }
   }
 
   CUTLASS_DEVICE
-  Sm70U4ZpIteratorB& operator++() {
+  Sm70U4ZpBiasIteratorB& operator++() {
     int const k_advance = next_k_advance_;
     int const k_advance_qwords =
         (k_advance / kQuantTileK) * (params_.size_n * 2);
@@ -227,73 +210,34 @@ class Sm70U4ZpIteratorB {
            local_word * subtile_count + subtile;
   }
 
-  template <int C>
-  CUTLASS_DEVICE void cache_metadata_word(int group, int logical_n,
-                                          uint32_t zword) const {
-    half2 const zero = __float2half2_rn(0.0f);
-    half2 const* scale_vec =
-        reinterpret_cast<half2 const*>(scales_ + group * params_.size_n +
-                                       logical_n);
-    half2* scale_cache = cached_scales_ + C * 4;
-    scale_cache[0] = scale_vec[0];
-    scale_cache[1] = scale_vec[1];
-    scale_cache[2] = scale_vec[2];
-    scale_cache[3] = scale_vec[3];
-
-    half2* bias_cache = cached_bias_ + C * 4;
-    half2 deq[2];
-    marlin::dequant<half2, vllm::kU4.id(), false>(static_cast<int>(zword),
-                                                   deq);
-    bias_cache[0] = __hsub2(zero, __hmul2(deq[0], scale_cache[0]));
-    bias_cache[1] = __hsub2(zero, __hmul2(deq[1], scale_cache[1]));
-    marlin::dequant<half2, vllm::kU4.id(), false>(
-        static_cast<int>(zword >> 8), deq);
-    bias_cache[2] = __hsub2(zero, __hmul2(deq[0], scale_cache[2]));
-    bias_cache[3] = __hsub2(zero, __hmul2(deq[1], scale_cache[3]));
-  }
-
   CUTLASS_DEVICE
   void cache_current_group_metadata(int group) const {
-    // Unlike u4b8, u4 must cache both scales and zero-point-derived bias.
-    // Keep the paired qzero load and C-specialized cache writes here: this
-    // matches the physical zero layout, avoids per-contiguous qzero address
-    // arithmetic in the MMA hot path, and recovered positive-group throughput
-    // versus the more generic u4b8-style loop.
-    int const logical_n0 = n_offset_ + thread_offset_.contiguous();
-    if constexpr (kFullTile) {
-      int const qzeros_row = group * (params_.size_n / kU4ValuesPerWord);
-      int const zero_word0 = logical_n0 / kU4ValuesPerWord;
-      int const logical_n1 = logical_n0 + ThreadMap::Delta::kContiguous;
-      int const zero_tile = zero_word0 / kZeroWordsPerCtaN;
-      int const zero_tile_base = zero_tile * kZeroWordsPerCtaN;
-      int const zero_local_word = zero_word0 - zero_tile_base;
-      uint2 const zpair = *reinterpret_cast<uint2 const*>(
-          qzeros_ + qzeros_row + zero_tile_base + zero_local_word * 2);
-      cache_metadata_word<0>(group, logical_n0, zpair.x);
-      cache_metadata_word<1>(group, logical_n1, zpair.y);
-    } else if (logical_n0 + ThreadMap::kElementsPerAccess <= params_.size_n) {
-      int const qzeros_row = group * (params_.size_n / kU4ValuesPerWord);
-      int const zero_word0 = logical_n0 / kU4ValuesPerWord;
-      int const logical_n1 = logical_n0 + ThreadMap::Delta::kContiguous;
-      bool const has_second_half =
-          logical_n1 + ThreadMap::kElementsPerAccess <= params_.size_n;
-
-      if (has_second_half) {
-        int const zero_tile = zero_word0 / kZeroWordsPerCtaN;
-        int const zero_tile_base = zero_tile * kZeroWordsPerCtaN;
-        int const zero_local_word = zero_word0 - zero_tile_base;
-        uint2 const zpair = *reinterpret_cast<uint2 const*>(
-            qzeros_ + qzeros_row + zero_tile_base + zero_local_word * 2);
-        cache_metadata_word<0>(group, logical_n0, zpair.x);
-        cache_metadata_word<1>(group, logical_n1, zpair.y);
-      } else {
-        int const zero_tile = zero_word0 / kZeroWordsPerCtaN;
-        int const zero_tile_base = zero_tile * kZeroWordsPerCtaN;
-        int const zero_local_word = zero_word0 - zero_tile_base;
-        uint32_t const zword =
-            qzeros_[qzeros_row + zero_tile_base + zero_local_word * 2];
-        cache_metadata_word<0>(group, logical_n0, zword);
+    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+      int const cache_n =
+          n_offset_ + thread_offset_.contiguous() +
+          c * ThreadMap::Delta::kContiguous;
+      if constexpr (!kFullTile) {
+        if (cache_n + ThreadMap::kElementsPerAccess > params_.size_n) {
+          continue;
+        }
       }
+
+      half2 const* scale_vec = reinterpret_cast<half2 const*>(
+          scales_ + group * params_.size_n + cache_n);
+      half2* scale_cache = cached_scales_ + c * 4;
+      scale_cache[0] = scale_vec[0];
+      scale_cache[1] = scale_vec[1];
+      scale_cache[2] = scale_vec[2];
+      scale_cache[3] = scale_vec[3];
+
+      half2 const* bias_vec = reinterpret_cast<half2 const*>(
+          zp_bias_ + group * params_.size_n + cache_n);
+      half2* bias_cache = cached_bias_ + c * 4;
+      bias_cache[0] = bias_vec[0];
+      bias_cache[1] = bias_vec[1];
+      bias_cache[2] = bias_vec[2];
+      bias_cache[3] = bias_vec[3];
     }
   }
 
@@ -394,7 +338,7 @@ class Sm70U4ZpIteratorB {
 };
 
 template <int GroupSize, bool FullTile>
-struct Sm70U4ZpGemmTraits {
+struct Sm70U4ZpBiasGemmTraits {
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
@@ -415,7 +359,7 @@ struct Sm70U4ZpGemmTraits {
       cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
       ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
       128 / cutlass::sizeof_bits<ElementA>::value>;
-  using IteratorB = Sm70U4ZpIteratorB<
+  using IteratorB = Sm70U4ZpBiasIteratorB<
       ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
       FullTile>;
   using Mma = cutlass::gemm::threadblock::MmaPipelined<
@@ -450,9 +394,9 @@ void sm70_marlin_u4_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
-    uint32_t const* __restrict__ b_zeros,
+    cutlass::half_t const* __restrict__ b_zp_bias,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
-  using Traits = Sm70U4ZpGemmTraits<GroupSize, FullTile>;
+  using Traits = Sm70U4ZpBiasGemmTraits<GroupSize, FullTile>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -480,7 +424,7 @@ void sm70_marlin_u4_gemm_kernel(
       typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales),
-      reinterpret_cast<uint32_t const*>(b_zeros), thread_idx, tb_offset_B);
+      reinterpret_cast<half const*>(b_zp_bias), thread_idx, tb_offset_B);
 
   Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
   typename Mma::FragmentC accumulators;
@@ -506,11 +450,11 @@ void sm70_marlin_u4_gemm_kernel(
 template <int GroupSize, bool FullTile>
 torch::Tensor launch_sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
+    torch::Tensor& b_scales, torch::Tensor& b_zp_bias, int64_t size_m,
     int64_t size_n, int64_t size_k) {
   auto kernel = sm70_marlin_u4_gemm_kernel<GroupSize, FullTile>;
   size_t smem_bytes =
-      sizeof(typename Sm70U4ZpGemmTraits<GroupSize, FullTile>::SharedStorage);
+      sizeof(typename Sm70U4ZpBiasGemmTraits<GroupSize, FullTile>::SharedStorage);
   if (smem_bytes >= (48u << 10)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -526,7 +470,7 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
-      reinterpret_cast<uint32_t const*>(b_zeros.data_ptr<int32_t>()),
+      reinterpret_cast<cutlass::half_t const*>(b_zp_bias.data_ptr<at::Half>()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
       static_cast<int>(size_m), static_cast<int>(size_n),
       static_cast<int>(size_k), static_cast<int>(a.stride(0)));
@@ -537,21 +481,21 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
 template <bool FullTile>
 torch::Tensor launch_sm70_marlin_u4_gemm_group_size(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
+    torch::Tensor& b_scales, torch::Tensor& b_zp_bias, int64_t size_m,
     int64_t size_n, int64_t size_k, int64_t group_size) {
   switch (group_size) {
     case -1:
       return launch_sm70_marlin_u4_gemm<-1, FullTile>(
-          a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k);
+          a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k);
     case 32:
       return launch_sm70_marlin_u4_gemm<32, FullTile>(
-          a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k);
+          a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k);
     case 64:
       return launch_sm70_marlin_u4_gemm<64, FullTile>(
-          a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k);
+          a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k);
     case 128:
       return launch_sm70_marlin_u4_gemm<128, FullTile>(
-          a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k);
+          a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k);
     default:
       TORCH_CHECK(false,
                   "SM70 CUTLASS uint4 prototype supports only group_size "
@@ -564,7 +508,7 @@ torch::Tensor launch_sm70_marlin_u4_gemm_group_size(
 torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zeros, int64_t size_m,
+                                  torch::Tensor& b_zp_bias, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
@@ -572,10 +516,10 @@ torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
   bool const full_tile = (size_k % kCtaK == 0 && size_n % kCtaN == 0);
   if (full_tile) {
     return launch_sm70_marlin_u4_gemm_group_size<true>(
-        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k,
+        a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k,
         group_size);
   }
   return launch_sm70_marlin_u4_gemm_group_size<false>(
-      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k,
+      a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k,
       group_size);
 }

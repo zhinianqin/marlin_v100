@@ -18,6 +18,7 @@ from tests.helpers import (
     marlin_make_workspace_new,
     marlin_quantize,
     marlin_quantize_uint4_zp,
+    marlin_quantize_uint4_zp_bias,
     scalar_types,
 )
 
@@ -299,7 +300,7 @@ def _run_dense_uint4_zp_accuracy_case(
 
     a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zero_points, dequantized = marlin_quantize_uint4_zp(
+    _w, q_w, scales, zp_bias, dequantized = marlin_quantize_uint4_zp_bias(
         w, group_size
     )
     output = ops.marlin_gemm(
@@ -310,7 +311,7 @@ def _run_dense_uint4_zp_accuracy_case(
         scales,
         None,
         None,
-        zero_points,
+        zp_bias,
         None,
         None,
         marlin_make_workspace_new(a.device),
@@ -321,7 +322,7 @@ def _run_dense_uint4_zp_accuracy_case(
         True,
         False,
         True,
-        False,
+        True,
     )
     reference = torch.matmul(a.to(torch.float32), dequantized.to(torch.float32)).to(
         torch.float16
@@ -552,16 +553,16 @@ def test_marlin_dense_uint4_zp_small_tile_matches_reference(repack_impl: str):
     )
 
 
-def test_marlin_dense_uint4_zp_requires_zero_points():
+def test_marlin_dense_uint4_zp_requires_bias():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, _zero_points, _dequantized = marlin_quantize_uint4_zp(w, 128)
+    _w, q_w, scales, _zp_bias, _dequantized = marlin_quantize_uint4_zp_bias(w, 128)
 
-    with pytest.raises(RuntimeError, match="requires integer zero-points"):
+    with pytest.raises(RuntimeError, match="requires fp16 precomputed zero-point bias"):
         ops.marlin_gemm(
             a,
             None,
@@ -585,16 +586,16 @@ def test_marlin_dense_uint4_zp_requires_zero_points():
         )
 
 
-def test_marlin_dense_uint4_zp_rejects_float_zero_points():
+def test_marlin_dense_uint4_zp_rejects_packed_zero_points():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zero_points, _dequantized = marlin_quantize_uint4_zp(w, 128)
+    _w, q_w, scales, packed_zero_points, _dequantized = marlin_quantize_uint4_zp(w, 128)
 
-    with pytest.raises(RuntimeError, match="does not support float zero-points"):
+    with pytest.raises(RuntimeError, match="fp16 precomputed zero-point bias"):
         ops.marlin_gemm(
             a,
             None,
@@ -603,7 +604,7 @@ def test_marlin_dense_uint4_zp_rejects_float_zero_points():
             scales,
             None,
             None,
-            zero_points.to(torch.float16),
+            packed_zero_points,
             None,
             None,
             marlin_make_workspace_new(a.device),
@@ -615,6 +616,75 @@ def test_marlin_dense_uint4_zp_rejects_float_zero_points():
             False,
             True,
             True,
+        )
+
+
+def test_marlin_dense_uint4b8_rejects_zp_bias_metadata():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+    w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+        w, scalar_types.uint4b8, 128, False
+    )
+    zp_bias = torch.zeros_like(scales)
+
+    with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zp_bias,
+            g_idx,
+            sort_indices,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint4b8.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            True,
+        )
+
+
+def test_marlin_dense_uint4_zp_rejects_bias_without_flag():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+    w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+    _w, q_w, scales, zp_bias, _dequantized = marlin_quantize_uint4_zp_bias(w, 128)
+
+    with pytest.raises(RuntimeError, match="use_zp_bias is false"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zp_bias,
+            None,
+            None,
+            marlin_make_workspace_new(a.device),
+            scalar_types.uint4.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            True,
+            False,
         )
 
 
@@ -626,7 +696,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
     size_k = 256
     a = torch.randn((16, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zero_points, _dequantized = marlin_quantize_uint4_zp(w, 64)
+    _w, q_w, scales, zp_bias, _dequantized = marlin_quantize_uint4_zp_bias(w, 64)
     g_idx = (torch.arange(size_k, device=a.device, dtype=torch.int32) // 64).contiguous()
     perm = torch.arange(size_k, device=a.device, dtype=torch.int32)
 
@@ -639,7 +709,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
             scales,
             None,
             None,
-            zero_points,
+            zp_bias,
             g_idx,
             perm,
             marlin_make_workspace_new(a.device),
@@ -650,7 +720,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
             True,
             False,
             True,
-            False,
+            True,
         )
 
 

@@ -490,6 +490,48 @@ def marlin_quantize_uint4_zp(
     return weight, marlin_q_weight, marlin_scales, packed_zero_points, dequantized
 
 
+def marlin_quantize_uint4_zp_bias(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_dense_group_size(group_size)
+    size_k, size_n = weight.shape
+    q_weight, scales, zero_points = _quantize_uint4_with_zero_point(weight, group_size)
+    weight_perm = quant_utils.get_weight_perm(scalar_types.uint4.size_bits, is_a_8bit=False)
+    marlin_q_weight = quant_utils.marlin_weights(
+        q_weight,
+        size_k,
+        size_n,
+        scalar_types.uint4.size_bits,
+        weight_perm,
+        is_a_8bit=False,
+    )
+    marlin_scales = dense.marlin_permute_scales(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    zp_bias = (-zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
+    marlin_zp_bias = dense.marlin_permute_scales(
+        zp_bias,
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    dequantized = marlin_dequantize_uint4_zp_bias(
+        marlin_q_weight,
+        marlin_scales,
+        marlin_zp_bias,
+        size_k,
+        size_n,
+        group_size,
+    )
+    return weight, marlin_q_weight, marlin_scales, marlin_zp_bias, dequantized
+
+
 def marlin_dequantize_uint4_zp(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
@@ -516,6 +558,40 @@ def marlin_dequantize_uint4_zp(
     expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
     expanded_zero_points = unpacked_zero_points.repeat_interleave(group_size, dim=0)[:size_k]
     dequantized = ((unpacked - expanded_zero_points) * expanded_scales).to(torch.float16)
+    if perm is not None and perm.numel() > 0:
+        logical = torch.empty_like(dequantized)
+        logical[perm.to(torch.long)] = dequantized
+        return logical
+    return dequantized
+
+
+def marlin_dequantize_uint4_zp_bias(
+    q_weight: torch.Tensor,
+    scales: torch.Tensor,
+    zp_bias: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    perm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    unpacked = _marlin_unpack_impl(q_weight, size_k, size_n, scalar_types.uint4).to(torch.float32)
+    unpermuted_scales = _marlin_unpermute_scales_impl(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+    ).to(torch.float32)
+    unpermuted_zp_bias = _marlin_unpermute_scales_impl(
+        zp_bias,
+        size_k,
+        size_n,
+        group_size,
+    ).to(torch.float32)
+    if group_size == -1:
+        group_size = size_k
+    expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
+    expanded_zp_bias = unpermuted_zp_bias.repeat_interleave(group_size, dim=0)[:size_k]
+    dequantized = (unpacked * expanded_scales + expanded_zp_bias).to(torch.float16)
     if perm is not None and perm.numel() > 0:
         logical = torch.empty_like(dequantized)
         logical[perm.to(torch.long)] = dequantized
