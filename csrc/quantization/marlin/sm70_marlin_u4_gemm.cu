@@ -20,9 +20,9 @@
 namespace {
 
 constexpr int kCtaM = 128;
-constexpr int kCtaN = 128;
+constexpr int kCtaN = 256;
 constexpr int kCtaK = 32;
-constexpr int kWarps = 4;
+constexpr int kWarps = 8;
 constexpr int kThreads = kWarps * 32;
 constexpr int kQuantTileK = 16;
 constexpr int kQuantTileN = 64;
@@ -40,17 +40,17 @@ class Sm70U4ZpBiasIteratorB {
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
   static_assert(Shape::kN == kCtaN,
-                "The SM70 kU4 IteratorB expects CTA_N=128.");
+                "The SM70 kU4 IteratorB expects CTA_N=256.");
   static_assert(Shape::kK == kCtaK,
                 "The SM70 kU4 IteratorB expects CTA_K=32.");
-  static_assert(ThreadMap::Iterations::kContiguous == 2,
-                "SM70 kU4 scale+bias layout expects two contiguous "
-                "64-column B accesses per thread.");
+  static_assert(ThreadMap::Iterations::kStrided == 1,
+                "The SM70 kU4 IteratorB expects one K-strided iteration.");
+  static_assert(ThreadMap::Iterations::kContiguous == 4,
+                "The SM70 kU4 IteratorB expects four 64-column accesses.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
-                "SM70 kU4 scale+bias layout expects 64-column "
-                "contiguous iterator delta.");
+                "The SM70 kU4 IteratorB expects 64-column deltas.");
   static_assert(ThreadMap::kElementsPerAccess == kU4ValuesPerWord,
-                "SM70 kU4 scale+bias layout expects one packed int4 word per "
+                "The SM70 kU4 IteratorB expects one packed int4 word per "
                 "access.");
 
   struct Params {
@@ -70,7 +70,7 @@ class Sm70U4ZpBiasIteratorB {
   half const* zp_bias_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
-  int qweight_offsets_[ThreadMap::Iterations::kCount];
+  int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
   int tile_k_end_;
@@ -95,21 +95,11 @@ class Sm70U4ZpBiasIteratorB {
                     initial_k_advance(params.size_k)),
         next_k_advance_(initial_k_advance(params.size_k)),
         mask_enabled_(true) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const idx = c + s * ThreadMap::Iterations::kContiguous;
-        int const logical_k = threadblock_offset.row() +
-                              thread_offset_.strided() +
-                              s * ThreadMap::Delta::kStrided;
-        int const logical_n = threadblock_offset.column() +
-                              thread_offset_.contiguous() +
-                              c * ThreadMap::Delta::kContiguous;
-        qweight_offsets_[idx] =
-            qweight_offset_from_logical(params_, logical_k, logical_n);
-      }
-    }
+    int const logical_k = threadblock_offset.row() + thread_offset_.strided();
+    int const logical_n =
+        threadblock_offset.column() + thread_offset_.contiguous();
+    qweight_base_offset_ =
+        qweight_offset_from_logical(params_, logical_k, logical_n);
     if constexpr (kGroupSize == -1) {
       // GroupSize=-1 keeps scale and precomputed zero-point bias stable for
       // every K tile. Cache both planes once before the MMA mainloop.
@@ -153,10 +143,7 @@ class Sm70U4ZpBiasIteratorB {
     tile_k_end_ = next_tile_k_end < params_.size_k ? next_tile_k_end
                                                    : params_.size_k;
     next_k_advance_ = Shape::kK;
-    CUTLASS_PRAGMA_UNROLL
-    for (int idx = 0; idx < ThreadMap::Iterations::kCount; ++idx) {
-      qweight_offsets_[idx] += k_advance_qwords;
-    }
+    qweight_base_offset_ += k_advance_qwords;
     return *this;
   }
 
@@ -211,6 +198,17 @@ class Sm70U4ZpBiasIteratorB {
   }
 
   CUTLASS_DEVICE
+  int qweight_offset(int c) const {
+    return qweight_base_offset_ + c;
+  }
+
+  CUTLASS_DEVICE
+  static uint32_t qword_from_vector(uint4 const& words, int c) {
+    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
+    return words_ptr[c];
+  }
+
+  CUTLASS_DEVICE
   void cache_current_group_metadata(int group) const {
     CUTLASS_PRAGMA_UNROLL
     for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
@@ -245,19 +243,19 @@ class Sm70U4ZpBiasIteratorB {
   void load_full_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+      uint4 const qwords =
+          *reinterpret_cast<uint4 const*>(qweight_ + qweight_base_offset_);
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         constexpr int kAccess = ThreadMap::kElementsPerAccess;
         int const frag_base =
             (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
-        int const qword_offset =
-            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
-        uint32_t const qword = qweight_[qword_offset];
+        uint32_t const qword = qword_from_vector(qwords, c);
+        half2 const* scale_vec = cached_scales_ + c * 4;
+        half2 const* bias_vec = cached_bias_ + c * 4;
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-        half2 const* scale_vec = cached_scales_ + c * 4;
-        half2 const* bias_vec = cached_bias_ + c * 4;
         marlin::dequant<half2, vllm::kU4.id(), false>(
             static_cast<int>(qword), deq);
         frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
@@ -272,6 +270,10 @@ class Sm70U4ZpBiasIteratorB {
 
   CUTLASS_DEVICE
   void load_residue_tile(Fragment& frag) const {
+    // Current 128x256x32 / 8-warp u4 scale+bias residue instances for
+    // GroupSize=32/64/128 compile at 255 REG with a small spill. Keep the
+    // structure aligned with u4b8; residue spill cleanup is tracked
+    // separately from the full-tile hot path.
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
       int const logical_k =
@@ -298,14 +300,13 @@ class Sm70U4ZpBiasIteratorB {
           continue;
         }
 
-        int const qword_offset =
-            qweight_offsets_[c + s * ThreadMap::Iterations::kContiguous];
+        int const qword_offset = qweight_offset(c);
         uint32_t const qword = qweight_[qword_offset];
+        half2 const* scale_vec = cached_scales_ + c * 4;
+        half2 const* bias_vec = cached_bias_ + c * 4;
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-        half2 const* scale_vec = cached_scales_ + c * 4;
-        half2 const* bias_vec = cached_bias_ + c * 4;
         marlin::dequant<half2, vllm::kU4.id(), false>(
             static_cast<int>(qword), deq);
         frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
