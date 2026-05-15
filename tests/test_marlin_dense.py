@@ -27,6 +27,23 @@ _DENSE_SUPPORTED_QUANT_NAMES = frozenset(
     supported_dense_quant_type_names(("uint4", "uint4b8", "uint8", "uint8b128"))
 )
 _GROUP_SIZES = (-1, 32, 64, 128)
+_CTA_GEOMETRY_CASES = (
+    ("32x128x4", 32, 128),
+    ("32x256x4", 32, 256),
+    ("64x64x4", 32, 64),
+    ("64x128x4", 32, 128),
+    ("64x128x8", 32, 128),
+    ("64x256x4", 32, 256),
+    ("64x256x8", 32, 256),
+    ("128x64x4", 32, 64),
+    ("128x64x8", 32, 64),
+    ("128x128x4", 32, 128),
+    ("128x128x8", 32, 128),
+    ("128x256x8", 32, 256),
+    ("256x64x4", 32, 64),
+    ("256x64x8", 32, 64),
+    ("256x128x8", 32, 128),
+)
 _FLOAT16_ACTIVATION_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
 )
@@ -611,6 +628,47 @@ def test_marlin_dense_uint4b8_size_m_24_uses_32_row_bucket_matches_reference(
     )
 
 
+@pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
+def test_marlin_dense_uint4b8_env_cta_geometry_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    cta_geometry: str,
+    size_m: int,
+    size_n: int,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4B8_CTA", cta_geometry)
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        repack_impl="gptq",
+        group_size=128,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=size_m,
+        size_k=256,
+        size_n=size_n,
+    )
+
+
+def test_marlin_dense_uint4b8_env_cta_geometry_rejects_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4B8_CTA", "32x64x4")
+    with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U4B8_CTA"):
+        _run_dense_accuracy_case(
+            scalar_types.uint4b8,
+            repack_impl="gptq",
+            group_size=128,
+            act_order=False,
+            is_k_full=True,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=32,
+            size_k=256,
+            size_n=64,
+        )
+
+
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint4_zp_accuracy(group_size: int, repack_impl: str):
@@ -674,6 +732,41 @@ def test_marlin_dense_uint4_zp_residue_n_matches_reference(repack_impl: str):
     )
 
 
+@pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
+def test_marlin_dense_uint4_zp_env_cta_geometry_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    cta_geometry: str,
+    size_m: int,
+    size_n: int,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_CTA", cta_geometry)
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=size_m,
+        size_k=256,
+        size_n=size_n,
+    )
+
+
+def test_marlin_dense_uint4_zp_env_cta_geometry_rejects_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_CTA", "32x64x4")
+    with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U4_CTA"):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=32,
+            size_k=256,
+            size_n=64,
+        )
+
+
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint8_zp_bias_accuracy(group_size: int, repack_impl: str):
@@ -709,6 +802,41 @@ def test_marlin_dense_uint8_zp_bias_residue_n_matches_reference(repack_impl: str
         size_k=256,
         size_n=128,
     )
+
+
+@pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
+def test_marlin_dense_uint8_zp_bias_env_cta_geometry_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    cta_geometry: str,
+    size_m: int,
+    size_n: int,
+):
+    monkeypatch.setenv("SM70_MARLIN_U8_CTA", cta_geometry)
+    _run_dense_uint8_zp_bias_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=size_m,
+        size_k=256,
+        size_n=size_n,
+    )
+
+
+def test_marlin_dense_uint8_zp_bias_env_cta_geometry_rejects_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SM70_MARLIN_U8_CTA", "32x64x4")
+    with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U8_CTA"):
+        _run_dense_uint8_zp_bias_accuracy_case(
+            repack_impl="gptq",
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=32,
+            size_k=256,
+            size_n=64,
+        )
 
 
 def test_marlin_dense_uint4_zp_requires_bias():
@@ -1138,6 +1266,45 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
             size_k=256,
             size_n=128,
         )
+
+    @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
+    def test_marlin_dense_uint8b128_env_cta_geometry_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        cta_geometry: str,
+        size_m: int,
+        size_n: int,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_U8B128_CTA", cta_geometry)
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            repack_impl="gptq",
+            group_size=128,
+            act_order=False,
+            is_k_full=True,
+            rtol=4e-2,
+            atol=2e-1,
+            size_m=size_m,
+            size_k=256,
+            size_n=size_n,
+        )
+
+    def test_marlin_dense_uint8b128_env_cta_geometry_rejects_unsupported(
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_U8B128_CTA", "32x64x4")
+        with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U8B128_CTA"):
+            _run_dense_accuracy_case(
+                scalar_types.uint8b128,
+                repack_impl="gptq",
+                group_size=128,
+                act_order=False,
+                is_k_full=True,
+                rtol=4e-2,
+                atol=2e-1,
+                size_m=32,
+                size_k=256,
+                size_n=64,
+            )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)

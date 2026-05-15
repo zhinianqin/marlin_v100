@@ -8,6 +8,9 @@
 
 #include <cuda_fp16.h>
 #include <torch/library.h>
+#include <cstdlib>
+#include <sstream>
+#include <string>
 #include <type_traits>
 
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -19,13 +22,14 @@
 
 namespace {
 
-constexpr int kCtaM = 128;
-constexpr int kCtaN = 256;
 constexpr int kCtaK = 32;
-constexpr int kWarps = 8;
-constexpr int kThreads = kWarps * 32;
+constexpr int kDefaultCtaM = 128;
+constexpr int kDefaultCtaN = 256;
+constexpr int kDefaultWarps = 8;
 constexpr int kQuantTileK = 16;
 constexpr int kQuantTileN = 64;
+constexpr int kMacroNTiles = 4;
+constexpr int kMacroN = kQuantTileN * kMacroNTiles;
 constexpr int kU8ValuesPerWord = 4;
 constexpr int kU8ValuesPerAccess = 8;
 constexpr int kU8WordsPerTile = kQuantTileK * kQuantTileN / kU8ValuesPerWord;
@@ -35,6 +39,84 @@ enum class Sm70TileMode {
   ResidueNOnly,
   ResidueKOnly,
   ResidueKAndN,
+};
+
+template <int CtaM, int CtaN, int Warps>
+struct Sm70U8B128WarpShape;
+
+template <>
+struct Sm70U8B128WarpShape<32, 128, 4> {
+  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<32, 256, 4> {
+  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<64, 64, 4> {
+  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<64, 128, 4> {
+  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<64, 128, 8> {
+  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<64, 256, 4> {
+  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<64, 256, 8> {
+  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<128, 64, 4> {
+  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<128, 64, 8> {
+  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<128, 128, 4> {
+  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<128, 128, 8> {
+  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<128, 256, 8> {
+  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<256, 64, 4> {
+  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<256, 64, 8> {
+  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
+};
+
+template <>
+struct Sm70U8B128WarpShape<256, 128, 8> {
+  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
 };
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_,
@@ -55,14 +137,14 @@ class Sm70U8B128IteratorB {
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
-  static_assert(Shape::kN == kCtaN,
-                "The SM70 kU8B128 IteratorB expects CTA_N=256.");
   static_assert(Shape::kK == kCtaK,
                 "The SM70 kU8B128 IteratorB expects CTA_K=32.");
-  static_assert(ThreadMap::Iterations::kStrided == 1,
-                "The SM70 kU8B128 IteratorB expects one K-strided iteration.");
-  static_assert(ThreadMap::Iterations::kContiguous == 4,
-                "The SM70 kU8B128 IteratorB expects four 64-column accesses.");
+  static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
+                "The SM70 kU8B128 IteratorB expects CTA_N in {64, 128, 256}.");
+  static_assert(ThreadMap::Iterations::kContiguous ==
+                    Shape::kN / kQuantTileN,
+                "The SM70 kU8B128 IteratorB expects one contiguous iteration "
+                "per 64-column quant tile.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
                 "The SM70 kU8B128 IteratorB expects 64-column deltas.");
   static_assert(ThreadMap::kElementsPerAccess == kU8ValuesPerAccess,
@@ -190,13 +272,14 @@ class Sm70U8B128IteratorB {
     int const k_tile = logical_k / kQuantTileK;
     int const local_k = logical_k - k_tile * kQuantTileK;
     int const n_tile = logical_n / kQuantTileN;
-    int const macro_n_tile = n_tile / 4;
-    int const macro_first_n_tile = macro_n_tile * 4;
+    int const macro_n_tile = n_tile / kMacroNTiles;
+    int const macro_first_n_tile = macro_n_tile * kMacroNTiles;
     int const subtile = n_tile - macro_first_n_tile;
-    int subtile_count = 4;
+    int subtile_count = kMacroNTiles;
     if constexpr (kResidueN) {
       subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
-      subtile_count = subtile_count < 4 ? subtile_count : 4;
+      subtile_count =
+          subtile_count < kMacroNTiles ? subtile_count : kMacroNTiles;
     }
     int const local_n_word =
         (logical_n - n_tile * kQuantTileN) / kU8ValuesPerWord;
@@ -204,31 +287,56 @@ class Sm70U8B128IteratorB {
                            local_n_word;
 
     return k_tile * (params.size_n * 4) +
-           macro_n_tile * 4 * kU8WordsPerTile +
+           macro_n_tile * kMacroNTiles * kU8WordsPerTile +
            local_word * subtile_count + subtile;
   }
 
   CUTLASS_DEVICE
-  int qweight_word_stride() const {
+  static int qweight_word_stride_from_logical(Params const& params,
+                                              int logical_n) {
     if constexpr (kResidueN) {
-      int const n_tile =
-          (n_offset_ + thread_offset_.contiguous()) / kQuantTileN;
-      int const macro_n_tile = n_tile / 4;
-      int const macro_first_n_tile = macro_n_tile * 4;
-      int subtile_count = params_.size_n / kQuantTileN - macro_first_n_tile;
-      return subtile_count < 4 ? subtile_count : 4;
+      int const n_tile = logical_n / kQuantTileN;
+      int const macro_n_tile = n_tile / kMacroNTiles;
+      int const macro_first_n_tile = macro_n_tile * kMacroNTiles;
+      int subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
+      return subtile_count < kMacroNTiles ? subtile_count : kMacroNTiles;
     } else {
-      return 4;
+      return kMacroNTiles;
     }
   }
 
   CUTLASS_DEVICE
-  int qweight_offset(int c, int word) const {
-    return qweight_base_offset_ + word * qweight_word_stride() + c;
+  int qweight_word_stride(int c) const {
+    int const logical_n =
+        n_offset_ + thread_offset_.contiguous() +
+        c * ThreadMap::Delta::kContiguous;
+    return qweight_word_stride_from_logical(params_, logical_n);
+  }
+
+  CUTLASS_DEVICE
+  int qweight_offset(int s, int c, int word) const {
+    if constexpr (ThreadMap::Iterations::kStrided == 1) {
+      return qweight_base_offset_ + word * qweight_word_stride(c) + c;
+    } else {
+      int const logical_k =
+          k_offset_ + thread_offset_.strided() +
+          s * ThreadMap::Delta::kStrided;
+      int const logical_n =
+          n_offset_ + thread_offset_.contiguous() +
+          c * ThreadMap::Delta::kContiguous;
+      return qweight_offset_from_logical(params_, logical_k, logical_n) +
+             word * qweight_word_stride_from_logical(params_, logical_n);
+    }
   }
 
   CUTLASS_DEVICE
   static uint32_t qword_from_vector(uint4 const& words, int c) {
+    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
+    return words_ptr[c];
+  }
+
+  CUTLASS_DEVICE
+  static uint32_t qword_from_vector(uint2 const& words, int c) {
     uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
     return words_ptr[c];
   }
@@ -262,18 +370,64 @@ class Sm70U8B128IteratorB {
   void load_full_tile(Fragment& frag) const {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-      uint4 const qwords0 =
-          *reinterpret_cast<uint4 const*>(qweight_ + qweight_base_offset_);
-      uint4 const qwords1 = *reinterpret_cast<uint4 const*>(
-          qweight_ + qweight_base_offset_ + ThreadMap::Iterations::kContiguous);
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+      if constexpr (ThreadMap::Iterations::kContiguous == 4) {
+        uint4 const qwords0 =
+            *reinterpret_cast<uint4 const*>(qweight_ + qweight_offset(s, 0, 0));
+        uint4 const qwords1 =
+            *reinterpret_cast<uint4 const*>(qweight_ + qweight_offset(s, 0, 1));
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+          constexpr int kAccess = ThreadMap::kElementsPerAccess;
+          int const frag_base =
+              (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
+          uint32_t const qword0 = qword_from_vector(qwords0, c);
+          uint32_t const qword1 = qword_from_vector(qwords1, c);
+          half2 const* scale_vec = cached_scales_ + c * 4;
+
+          half2 deq[2];
+          half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+          marlin::dequant<half2, vllm::kU8B128.id(), false>(
+              static_cast<int>(qword0), deq);
+          frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+          marlin::dequant<half2, vllm::kU8B128.id(), false>(
+              static_cast<int>(qword1), deq);
+          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
+        }
+      } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
+        uint2 const qwords0 =
+            *reinterpret_cast<uint2 const*>(qweight_ + qweight_offset(s, 0, 0));
+        uint2 const qwords1 =
+            *reinterpret_cast<uint2 const*>(qweight_ + qweight_offset(s, 0, 1));
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+          constexpr int kAccess = ThreadMap::kElementsPerAccess;
+          int const frag_base =
+              (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
+          uint32_t const qword0 = qword_from_vector(qwords0, c);
+          uint32_t const qword1 = qword_from_vector(qwords1, c);
+          half2 const* scale_vec = cached_scales_ + c * 4;
+
+          half2 deq[2];
+          half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
+          marlin::dequant<half2, vllm::kU8B128.id(), false>(
+              static_cast<int>(qword0), deq);
+          frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+          marlin::dequant<half2, vllm::kU8B128.id(), false>(
+              static_cast<int>(qword1), deq);
+          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
+        }
+      } else {
+        static_assert(ThreadMap::Iterations::kContiguous == 1,
+                      "Unsupported SM70 kU8B128 contiguous iteration count.");
+        uint32_t const qword0 = qweight_[qweight_offset(s, 0, 0)];
+        uint32_t const qword1 = qweight_[qweight_offset(s, 0, 1)];
         constexpr int kAccess = ThreadMap::kElementsPerAccess;
-        int const frag_base =
-            (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
-        uint32_t const qword0 = qword_from_vector(qwords0, c);
-        uint32_t const qword1 = qword_from_vector(qwords1, c);
-        half2 const* scale_vec = cached_scales_ + c * 4;
+        int const frag_base = s * kAccess;
+        half2 const* scale_vec = cached_scales_;
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
@@ -325,8 +479,8 @@ class Sm70U8B128IteratorB {
           continue;
         }
 
-        uint32_t const qword0 = qweight_[qweight_offset(c, 0)];
-        uint32_t const qword1 = qweight_[qweight_offset(c, 1)];
+        uint32_t const qword0 = qweight_[qweight_offset(s, c, 0)];
+        uint32_t const qword1 = qweight_[qweight_offset(s, c, 1)];
         half2 const* scale_vec = cached_scales_ + c * 4;
 
         half2 deq[2];
@@ -362,8 +516,15 @@ class Sm70U8B128IteratorB {
   }
 };
 
-template <int GroupSize, Sm70TileMode TileMode>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          Sm70TileMode TileMode>
 struct Sm70U8B128GemmTraits {
+  static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
+                "SM70 kU8B128 supports CTA_M in {32, 64, 128, 256}.");
+  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
+                "SM70 kU8B128 supports CTA_N in {64, 128, 256}.");
+  static_assert(Warps == 4 || Warps == 8,
+                "SM70 kU8B128 supports 4 or 8 warps.");
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
@@ -371,14 +532,16 @@ struct Sm70U8B128GemmTraits {
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
-  using ThreadblockShape = cutlass::gemm::GemmShape<kCtaM, kCtaN, kCtaK>;
-  using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+  using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, kCtaK>;
+  using WarpShape = typename Sm70U8B128WarpShape<CtaM, CtaN, Warps>::Type;
+  static_assert(WarpShape::kM <= 64 && WarpShape::kN <= 64,
+                "SM70 kU8B128 keeps per-warp M/N no larger than 64.");
   using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
   using MmaCore = cutlass::gemm::threadblock::DefaultMmaCore<
       ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
       ElementB, LayoutB, ElementAccumulator, LayoutC,
       cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
-  static_assert(MmaCore::kThreads == kThreads,
+  static_assert(MmaCore::kThreads == Warps * 32,
                 "SM70 kU8B128 launch threads must match CUTLASS warp count.");
   using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
       cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
@@ -413,14 +576,16 @@ struct Sm70U8B128GemmTraits {
   };
 };
 
-template <int GroupSize, Sm70TileMode TileMode>
-__global__ __launch_bounds__(kThreads, 1)
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          Sm70TileMode TileMode>
+__global__ __launch_bounds__(Warps * 32, 1)
 void sm70_marlin_u8b128_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
-  using Traits = Sm70U8B128GemmTraits<GroupSize, TileMode>;
+  using Traits =
+      Sm70U8B128GemmTraits<CtaM, CtaN, Warps, GroupSize, TileMode>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -432,10 +597,10 @@ void sm70_marlin_u8b128_gemm_kernel(
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_idx = threadIdx.x % 32;
 
-  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * kCtaM, 0};
-  cutlass::MatrixCoord tb_offset_B{0, int(blockIdx.y) * kCtaN};
-  cutlass::MatrixCoord tb_offset_C{int(blockIdx.x) * kCtaM,
-                                   int(blockIdx.y) * kCtaN};
+  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CtaM, 0};
+  cutlass::MatrixCoord tb_offset_B{0, int(blockIdx.y) * CtaN};
+  cutlass::MatrixCoord tb_offset_C{int(blockIdx.x) * CtaM,
+                                   int(blockIdx.y) * CtaN};
 
   typename Traits::LayoutA layout_a(lda);
   typename Traits::LayoutC layout_c(n);
@@ -468,24 +633,93 @@ void sm70_marlin_u8b128_gemm_kernel(
   epilogue(output_op, iterator_D, accumulators, iterator_C);
 }
 
+struct Sm70U8B128CtaGeometry {
+  int cta_m;
+  int cta_n;
+  int warps;
+};
+
+Sm70U8B128CtaGeometry parse_sm70_marlin_u8b128_cta_geometry() {
+  char const* env = std::getenv("SM70_MARLIN_U8B128_CTA");
+  if (env == nullptr || env[0] == '\0') {
+    return {kDefaultCtaM, kDefaultCtaN, kDefaultWarps};
+  }
+
+  std::string spec(env);
+  for (char& ch : spec) {
+    if (ch == 'x' || ch == 'X' || ch == '*' || ch == ',') {
+      ch = ' ';
+    }
+  }
+
+  int cta_m = 0;
+  int cta_n = 0;
+  int warps = 0;
+  std::string extra;
+  std::istringstream stream(spec);
+  TORCH_CHECK(
+      (stream >> cta_m >> cta_n >> warps) && !(stream >> extra),
+      "SM70_MARLIN_U8B128_CTA must use format CTA_MxCTA_NxWarps, for "
+      "example 128x256x8. Got: ",
+      env);
+  return {cta_m, cta_n, warps};
+}
+
+bool sm70_marlin_u8b128_cta_geometry_supported(
+    Sm70U8B128CtaGeometry geometry) {
+  int const cta_m = geometry.cta_m;
+  int const cta_n = geometry.cta_n;
+  int const warps = geometry.warps;
+  return (cta_m == 32 && cta_n == 128 && warps == 4) ||
+         (cta_m == 32 && cta_n == 256 && warps == 4) ||
+         (cta_m == 64 && cta_n == 64 && warps == 4) ||
+         (cta_m == 64 && cta_n == 128 && warps == 4) ||
+         (cta_m == 64 && cta_n == 128 && warps == 8) ||
+         (cta_m == 64 && cta_n == 256 && warps == 4) ||
+         (cta_m == 64 && cta_n == 256 && warps == 8) ||
+         (cta_m == 128 && cta_n == 64 && warps == 4) ||
+         (cta_m == 128 && cta_n == 64 && warps == 8) ||
+         (cta_m == 128 && cta_n == 128 && warps == 4) ||
+         (cta_m == 128 && cta_n == 128 && warps == 8) ||
+         (cta_m == 128 && cta_n == 256 && warps == 8) ||
+         (cta_m == 256 && cta_n == 64 && warps == 4) ||
+         (cta_m == 256 && cta_n == 64 && warps == 8) ||
+         (cta_m == 256 && cta_n == 128 && warps == 8);
+}
+
+void check_sm70_marlin_u8b128_cta_geometry(
+    Sm70U8B128CtaGeometry geometry) {
+  TORCH_CHECK(
+      sm70_marlin_u8b128_cta_geometry_supported(geometry),
+      "Unsupported SM70_MARLIN_U8B128_CTA=", geometry.cta_m, "x",
+      geometry.cta_n, "x", geometry.warps,
+      ". Supported geometries are 32x128x4, 32x256x4, 64x64x4, "
+      "64x128x4, 64x128x8, 64x256x4, 64x256x8, 128x64x4, "
+      "128x64x8, 128x128x4, 128x128x8, 128x256x8, 256x64x4, "
+      "256x64x8, and 256x128x8.");
+}
+
 }  // namespace
 
-template <int GroupSize, Sm70TileMode TileMode>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          Sm70TileMode TileMode>
 torch::Tensor launch_sm70_marlin_u8b128_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k) {
-  auto kernel = sm70_marlin_u8b128_gemm_kernel<GroupSize, TileMode>;
+  auto kernel =
+      sm70_marlin_u8b128_gemm_kernel<CtaM, CtaN, Warps, GroupSize, TileMode>;
   size_t smem_bytes =
-      sizeof(typename Sm70U8B128GemmTraits<GroupSize, TileMode>::SharedStorage);
+      sizeof(typename Sm70U8B128GemmTraits<
+             CtaM, CtaN, Warps, GroupSize, TileMode>::SharedStorage);
   if (smem_bytes >= (48u << 10)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(smem_bytes)));
   }
 
-  dim3 grid(static_cast<unsigned>((size_m + kCtaM - 1) / kCtaM),
-            static_cast<unsigned>((size_n + kCtaN - 1) / kCtaN));
-  dim3 block(kThreads);
+  dim3 grid(static_cast<unsigned>((size_m + CtaM - 1) / CtaM),
+            static_cast<unsigned>((size_n + CtaN - 1) / CtaN));
+  dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
   kernel<<<grid, block, smem_bytes, stream>>>(
@@ -499,23 +733,27 @@ torch::Tensor launch_sm70_marlin_u8b128_gemm(
   return c;
 }
 
-template <Sm70TileMode TileMode>
+template <int CtaM, int CtaN, int Warps, Sm70TileMode TileMode>
 torch::Tensor launch_sm70_marlin_u8b128_gemm_group_size(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
     int64_t group_size) {
   switch (group_size) {
     case -1:
-      return launch_sm70_marlin_u8b128_gemm<-1, TileMode>(
+      return launch_sm70_marlin_u8b128_gemm<
+          CtaM, CtaN, Warps, -1, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 32:
-      return launch_sm70_marlin_u8b128_gemm<32, TileMode>(
+      return launch_sm70_marlin_u8b128_gemm<
+          CtaM, CtaN, Warps, 32, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 64:
-      return launch_sm70_marlin_u8b128_gemm<64, TileMode>(
+      return launch_sm70_marlin_u8b128_gemm<
+          CtaM, CtaN, Warps, 64, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 128:
-      return launch_sm70_marlin_u8b128_gemm<128, TileMode>(
+      return launch_sm70_marlin_u8b128_gemm<
+          CtaM, CtaN, Warps, 128, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     default:
       TORCH_CHECK(false,
@@ -526,6 +764,40 @@ torch::Tensor launch_sm70_marlin_u8b128_gemm_group_size(
   return c;
 }
 
+template <int CtaM, int CtaN, int Warps>
+torch::Tensor launch_sm70_marlin_u8b128_gemm_geometry(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, int64_t size_m, int64_t size_n,
+    int64_t size_k, int64_t group_size) {
+  bool const residue_k = size_k % kCtaK != 0;
+  bool const residue_n = size_n % CtaN != 0 || size_n % kMacroN != 0;
+  if (!residue_k && !residue_n) {
+    return launch_sm70_marlin_u8b128_gemm_group_size<
+        CtaM, CtaN, Warps, Sm70TileMode::FullTile>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  }
+  if (!residue_k) {
+    return launch_sm70_marlin_u8b128_gemm_group_size<
+        CtaM, CtaN, Warps, Sm70TileMode::ResidueNOnly>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  }
+  if (!residue_n) {
+    return launch_sm70_marlin_u8b128_gemm_group_size<
+        CtaM, CtaN, Warps, Sm70TileMode::ResidueKOnly>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  }
+  return launch_sm70_marlin_u8b128_gemm_group_size<
+      CtaM, CtaN, Warps, Sm70TileMode::ResidueKAndN>(
+      a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+}
+
+#define DISPATCH_SM70_U8B128_CTA(CM, CN, W)                              \
+  if (geometry.cta_m == CM && geometry.cta_n == CN &&                     \
+      geometry.warps == W) {                                              \
+    return launch_sm70_marlin_u8b128_gemm_geometry<CM, CN, W>(            \
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);   \
+  }
+
 torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
                                       torch::Tensor& b_q_weight,
                                       torch::Tensor& b_scales, int64_t size_m,
@@ -533,24 +805,27 @@ torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
                                       int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  bool const residue_k = size_k % kCtaK != 0;
-  bool const residue_n = size_n % kCtaN != 0;
-  if (!residue_k && !residue_n) {
-    return launch_sm70_marlin_u8b128_gemm_group_size<
-        Sm70TileMode::FullTile>(
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
-  }
-  if (!residue_k) {
-    return launch_sm70_marlin_u8b128_gemm_group_size<
-        Sm70TileMode::ResidueNOnly>(
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
-  }
-  if (!residue_n) {
-    return launch_sm70_marlin_u8b128_gemm_group_size<
-        Sm70TileMode::ResidueKOnly>(
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
-  }
-  return launch_sm70_marlin_u8b128_gemm_group_size<
-      Sm70TileMode::ResidueKAndN>(
-      a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  Sm70U8B128CtaGeometry const geometry =
+      parse_sm70_marlin_u8b128_cta_geometry();
+  check_sm70_marlin_u8b128_cta_geometry(geometry);
+
+  DISPATCH_SM70_U8B128_CTA(32, 128, 4)
+  DISPATCH_SM70_U8B128_CTA(32, 256, 4)
+  DISPATCH_SM70_U8B128_CTA(64, 64, 4)
+  DISPATCH_SM70_U8B128_CTA(64, 128, 4)
+  DISPATCH_SM70_U8B128_CTA(64, 128, 8)
+  DISPATCH_SM70_U8B128_CTA(64, 256, 4)
+  DISPATCH_SM70_U8B128_CTA(64, 256, 8)
+  DISPATCH_SM70_U8B128_CTA(128, 64, 4)
+  DISPATCH_SM70_U8B128_CTA(128, 64, 8)
+  DISPATCH_SM70_U8B128_CTA(128, 128, 4)
+  DISPATCH_SM70_U8B128_CTA(128, 128, 8)
+  DISPATCH_SM70_U8B128_CTA(128, 256, 8)
+  DISPATCH_SM70_U8B128_CTA(256, 64, 4)
+  DISPATCH_SM70_U8B128_CTA(256, 64, 8)
+  DISPATCH_SM70_U8B128_CTA(256, 128, 8)
+
+  TORCH_CHECK(false, "Unreachable SM70 uint8b128 CTA geometry dispatch.");
 }
+
+#undef DISPATCH_SM70_U8B128_CTA
