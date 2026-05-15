@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
 from common import check_cuda_ready, timestamp
 from marlin_v100 import ops
 
@@ -23,48 +24,56 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_ROOT = ROOT / "benchmarks" / "results"
 EXTENSION_PATH = ROOT / "python" / "marlin_v100" / "_C.abi3.so"
 
-CTA_M_CANDIDATES = (64, 128)
-CTA_N_CANDIDATES = (64, 128, 256)
-CTA_K_CANDIDATES = (32, 64, 128)
+CTA_M_CANDIDATES = (32, 64, 128, 256, 512)
+CTA_N_CANDIDATES = (64, 128, 256, 512)
+CTA_K = 32
+CTA_K_CANDIDATES = (CTA_K,)
 WARP_CANDIDATES = (4, 8)
 STAGES = 2
 A_PATH_CUTLASS_THREADBLOCK = 2
 B_PATH_CUTLASS_SHARED = 0
 V100_PEAK_TFLOPS = 125.0
 
-DEFAULT_MKN = (
-    (5120, 4096, 4096),
-    (4096, 4096, 4096),
-    (2048, 4096, 4096),
-    (1024, 4096, 4096),
-    (512, 4096, 4096),
-    (256, 4096, 4096),
-    (128, 4096, 4096),
-    (5120, 8192, 4096),
-    (5120, 2048, 4096),
-    (5120, 1024, 4096),
-    (5120, 512, 4096),
-    (5120, 256, 4096),
-    (5120, 4096, 8192),
-    (5120, 4096, 2048),
-    (5120, 4096, 1024),
-    (5120, 4096, 512),
-    (5120, 4096, 256),
-)
+DEFAULT_BATCH_SIZES = (32, 64, 128, 256, 512, 1024, 2048, 4096, 5120)
+DEFAULT_N_SWEEP = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 12288, 22016)
+DEFAULT_K_SWEEP = (512, 1024, 2048, 4096, 8192, 11008)
+
+
+def default_mkn_shapes() -> tuple[tuple[int, int, int], ...]:
+    shapes: set[tuple[int, int, int]] = set()
+    dense_models = DENSE_PRESETS["full"]["models"]
+    for model in dense_models:
+        for size_k, size_n in DENSE_WEIGHT_SHAPES[str(model)]:
+            for size_m in DEFAULT_BATCH_SIZES:
+                shapes.add((size_m, size_n, size_k))
+
+    shapes.update((5120, size_n, 4096) for size_n in DEFAULT_N_SWEEP)
+    shapes.update((5120, 4096, size_k) for size_k in DEFAULT_K_SWEEP)
+    return tuple(sorted(shapes))
+
+
+DEFAULT_MKN = default_mkn_shapes()
 
 SUPPORTED_THREADBLOCK_CONFIGS = {
-    (cta_m, cta_n, cta_k, warps)
-    for cta_k in CTA_K_CANDIDATES
+    (cta_m, cta_n, CTA_K, warps)
     for cta_m, cta_n, warps in (
+        (32, 128, 4),
+        (32, 256, 4),
         (64, 64, 4),
         (64, 128, 4),
         (64, 128, 8),
+        (64, 256, 4),
         (64, 256, 8),
+        (64, 512, 8),
         (128, 64, 4),
         (128, 64, 8),
         (128, 128, 4),
         (128, 128, 8),
         (128, 256, 8),
+        (256, 64, 4),
+        (256, 64, 8),
+        (256, 128, 8),
+        (512, 64, 8),
     )
 }
 
@@ -108,7 +117,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mkn-file", type=Path, help="Text file with one M,N,K per line.")
     parser.add_argument("--cta-m", nargs="+", type=int, default=list(CTA_M_CANDIDATES))
     parser.add_argument("--cta-n", nargs="+", type=int, default=list(CTA_N_CANDIDATES))
-    parser.add_argument("--cta-k", nargs="+", type=int, default=list(CTA_K_CANDIDATES))
+    parser.add_argument(
+        "--cta-k",
+        nargs="+",
+        type=int,
+        default=list(CTA_K_CANDIDATES),
+        help="Compatibility option. The pure GEMM sweep only supports CTA_K=32.",
+    )
     parser.add_argument("--warps", nargs="+", type=int, default=list(WARP_CANDIDATES))
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--warmup-iters", type=int, default=10)
@@ -131,7 +146,10 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Record unsupported geometry and invalid shape rows.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if any(cta_k != CTA_K for cta_k in args.cta_k):
+        parser.error("pure GEMM sweep only supports CTA_K=32")
+    return args
 
 
 def parse_mkn(value: str) -> tuple[int, int, int]:
@@ -359,11 +377,10 @@ def time_probe(fn, warmup_iters: int, iters: int) -> dict[str, float]:
 
 def candidate_configs(args: argparse.Namespace) -> list[tuple[int, int, int, int]]:
     return [
-        (cta_m, cta_n, cta_k, warps)
-        for cta_m, cta_n, cta_k, warps in product(
+        (cta_m, cta_n, CTA_K, warps)
+        for cta_m, cta_n, warps in product(
             args.cta_m,
             args.cta_n,
-            args.cta_k,
             args.warps,
         )
     ]
@@ -393,7 +410,10 @@ def read_raw_records(raw_path: Path) -> list[dict[str, Any]]:
     for line in raw_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        records.append(json.loads(line))
+        record = json.loads(line)
+        if int(record.get("CTA_K", CTA_K)) != CTA_K:
+            continue
+        records.append(record)
     return records
 
 

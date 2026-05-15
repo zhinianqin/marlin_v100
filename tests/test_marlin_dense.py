@@ -69,7 +69,7 @@ def test_sm70_cutlass_matmul_probe_matches_torch_mm():
     a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
     b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
 
-    output = ops.sm70_cutlass_matmul_probe(a, b, 32, 64, 64, 4, 2, 0, 0)
+    output = ops.sm70_cutlass_matmul_probe(a, b, 32, 64, 32, 4, 2, 0, 0)
     reference = torch.mm(a, b)
 
     assert output.shape == reference.shape
@@ -88,6 +88,39 @@ def test_sm70_cutlass_matmul_probe_threadblock_path_matches_torch_mm():
 
     assert output.shape == reference.shape
     torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    ("cta_m", "cta_n", "warps"),
+    [
+        (32, 256, 4),
+        (256, 128, 8),
+        (512, 64, 8),
+    ],
+)
+def test_sm70_cutlass_matmul_probe_extended_threadblock_shapes_match_torch_mm(
+    cta_m: int, cta_n: int, warps: int
+):
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    a = torch.randn((cta_m, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, cta_n), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_probe(a, b, cta_m, cta_n, 32, warps, 2, 2, 0)
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+def test_sm70_cutlass_matmul_probe_rejects_unsupported_threadblock_shape():
+    _require_marlin_cuda()
+    a = torch.randn((512, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 512), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="unsupported extracted CUTLASS"):
+        ops.sm70_cutlass_matmul_probe(a, b, 512, 512, 32, 8, 2, 2, 0)
 
 
 def test_sm70_cutlass_matmul_probe_rejects_direct_a_path():

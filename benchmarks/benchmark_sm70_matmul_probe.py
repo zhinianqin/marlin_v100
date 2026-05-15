@@ -18,7 +18,8 @@ from marlin_v100 import ops
 
 CTA_M_CANDIDATES = (8, 16, 32, 64, 128)
 CTA_N_CANDIDATES = (32, 64, 128, 256)
-CTA_K_CANDIDATES = (64, 128)
+CTA_K = 32
+CTA_K_CANDIDATES = (CTA_K,)
 WARP_CANDIDATES = (4, 8)
 STAGE_CANDIDATES = (2,)
 A_PATH_IDS = {
@@ -46,7 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=5e-2)
     parser.add_argument("--cta-m", nargs="+", type=int, help="CTA M candidates.")
     parser.add_argument("--cta-n", nargs="+", type=int, help="CTA N candidates.")
-    parser.add_argument("--cta-k", nargs="+", type=int, help="CTA K candidates.")
+    parser.add_argument(
+        "--cta-k",
+        nargs="+",
+        type=int,
+        help="CTA K candidates. Only CTA_K=32 is supported by benchmark defaults.",
+    )
     parser.add_argument("--warps", nargs="+", type=int, help="Warp-count candidates.")
     parser.add_argument(
         "--a-paths",
@@ -66,7 +72,10 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Print unsupported candidate rows instead of silently skipping them.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.cta_k and any(cta_k != CTA_K for cta_k in args.cta_k):
+        parser.error("SM70 matmul benchmark only supports CTA_K=32")
+    return args
 
 
 def tflops_from_us(m: int, n: int, k: int, latency_us: float) -> float:
