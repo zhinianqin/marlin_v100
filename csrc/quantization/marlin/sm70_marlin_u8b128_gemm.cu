@@ -30,13 +30,28 @@ constexpr int kU8ValuesPerWord = 4;
 constexpr int kU8ValuesPerAccess = 8;
 constexpr int kU8WordsPerTile = kQuantTileK * kQuantTileN / kU8ValuesPerWord;
 
-template <typename Shape_, typename ThreadMap_, int GroupSize_, bool FullTile_>
+enum class Sm70TileMode {
+  FullTile,
+  ResidueNOnly,
+  ResidueKOnly,
+  ResidueKAndN,
+};
+
+template <typename Shape_, typename ThreadMap_, int GroupSize_,
+          Sm70TileMode TileMode_>
 class Sm70U8B128IteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
-  static bool const kFullTile = FullTile_;
+  static constexpr Sm70TileMode kTileMode = TileMode_;
+  static constexpr bool kFullTile = kTileMode == Sm70TileMode::FullTile;
+  static constexpr bool kResidueN =
+      kTileMode == Sm70TileMode::ResidueNOnly ||
+      kTileMode == Sm70TileMode::ResidueKAndN;
+  static constexpr bool kResidueK =
+      kTileMode == Sm70TileMode::ResidueKOnly ||
+      kTileMode == Sm70TileMode::ResidueKAndN;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
@@ -73,8 +88,6 @@ class Sm70U8B128IteratorB {
   int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
-  int tile_k_end_;
-  int next_k_advance_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
 
@@ -89,9 +102,6 @@ class Sm70U8B128IteratorB {
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
         n_offset_(threadblock_offset.column()),
-        tile_k_end_(threadblock_offset.row() +
-                    initial_k_advance(params.size_k)),
-        next_k_advance_(initial_k_advance(params.size_k)),
         mask_enabled_(true) {
     int const logical_k = threadblock_offset.row() + thread_offset_.strided();
     int const logical_n =
@@ -106,7 +116,7 @@ class Sm70U8B128IteratorB {
         int const cache_n =
             n_offset_ + thread_offset_.contiguous() +
             c * ThreadMap::Delta::kContiguous;
-        if constexpr (!kFullTile) {
+        if constexpr (kResidueN) {
           if (cache_n + ThreadMap::kElementsPerAccess > params_.size_n) {
             continue;
           }
@@ -125,14 +135,10 @@ class Sm70U8B128IteratorB {
 
   CUTLASS_DEVICE
   Sm70U8B128IteratorB& operator++() {
-    int const k_advance = next_k_advance_;
+    int const k_advance = current_k_advance();
     int const k_advance_qwords =
         (k_advance / kQuantTileK) * (params_.size_n * 4);
     k_offset_ += k_advance;
-    int const next_tile_k_end = k_offset_ + Shape::kK;
-    tile_k_end_ = next_tile_k_end < params_.size_k ? next_tile_k_end
-                                                   : params_.size_k;
-    next_k_advance_ = Shape::kK;
     qweight_base_offset_ += k_advance_qwords;
     return *this;
   }
@@ -148,9 +154,21 @@ class Sm70U8B128IteratorB {
   void enable_mask() { mask_enabled_ = true; }
 
   CUTLASS_DEVICE
-  static int initial_k_advance(int size_k) {
-    int const residue_k = size_k % Shape::kK;
-    return residue_k == 0 ? Shape::kK : residue_k;
+  int current_k_advance() const {
+    if constexpr (kResidueK) {
+      int const residue_k = params_.size_k % Shape::kK;
+      return k_offset_ == 0 && residue_k != 0 ? residue_k : Shape::kK;
+    } else {
+      return Shape::kK;
+    }
+  }
+
+  CUTLASS_DEVICE
+  int current_tile_k_end() const {
+    static_assert(kResidueK,
+                  "current_tile_k_end is only used by K-residue kernels.");
+    int const tile_k_end = k_offset_ + current_k_advance();
+    return tile_k_end < params_.size_k ? tile_k_end : params_.size_k;
   }
 
   CUTLASS_DEVICE
@@ -175,8 +193,11 @@ class Sm70U8B128IteratorB {
     int const macro_n_tile = n_tile / 4;
     int const macro_first_n_tile = macro_n_tile * 4;
     int const subtile = n_tile - macro_first_n_tile;
-    int subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
-    subtile_count = subtile_count < 4 ? subtile_count : 4;
+    int subtile_count = 4;
+    if constexpr (kResidueN) {
+      subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
+      subtile_count = subtile_count < 4 ? subtile_count : 4;
+    }
     int const local_n_word =
         (logical_n - n_tile * kQuantTileN) / kU8ValuesPerWord;
     int const local_word = local_k * (kQuantTileN / kU8ValuesPerWord) +
@@ -189,12 +210,16 @@ class Sm70U8B128IteratorB {
 
   CUTLASS_DEVICE
   int qweight_word_stride() const {
-    int const n_tile =
-        (n_offset_ + thread_offset_.contiguous()) / kQuantTileN;
-    int const macro_n_tile = n_tile / 4;
-    int const macro_first_n_tile = macro_n_tile * 4;
-    int subtile_count = params_.size_n / kQuantTileN - macro_first_n_tile;
-    return subtile_count < 4 ? subtile_count : 4;
+    if constexpr (kResidueN) {
+      int const n_tile =
+          (n_offset_ + thread_offset_.contiguous()) / kQuantTileN;
+      int const macro_n_tile = n_tile / 4;
+      int const macro_first_n_tile = macro_n_tile * 4;
+      int subtile_count = params_.size_n / kQuantTileN - macro_first_n_tile;
+      return subtile_count < 4 ? subtile_count : 4;
+    } else {
+      return 4;
+    }
   }
 
   CUTLASS_DEVICE
@@ -215,14 +240,16 @@ class Sm70U8B128IteratorB {
       int const cache_n =
           n_offset_ + thread_offset_.contiguous() +
           c * ThreadMap::Delta::kContiguous;
-      if constexpr (!kFullTile) {
+      if constexpr (kResidueN) {
         if (cache_n + ThreadMap::kElementsPerAccess > params_.size_n) {
           continue;
         }
       }
 
-      half2 const* scale_vec = reinterpret_cast<half2 const*>(
-          scales_ + group * params_.size_n + cache_n);
+      int const metadata_offset = group * params_.size_n + cache_n;
+      uint4 const scale_words =
+          *reinterpret_cast<uint4 const*>(scales_ + metadata_offset);
+      half2 const* scale_vec = reinterpret_cast<half2 const*>(&scale_words);
       half2* cache = cached_scales_ + c * 4;
       cache[0] = scale_vec[0];
       cache[1] = scale_vec[1];
@@ -264,26 +291,30 @@ class Sm70U8B128IteratorB {
 
   CUTLASS_DEVICE
   void load_residue_tile(Fragment& frag) const {
-    // Current 128x256x32 / 8-warp u8b128 residue instances may run close to
-    // the register ceiling because each access carries two qweight words plus
-    // N/K predicates. Keep this aligned with u4b8; full-tile remains the hot
-    // path for performance work.
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-      int const logical_k =
-          k_offset_ + thread_offset_.strided() +
-          s * ThreadMap::Delta::kStrided;
-      bool const k_valid = logical_k < tile_k_end_;
+      bool k_valid = true;
+      if constexpr (kResidueK) {
+        int const logical_k =
+            k_offset_ + thread_offset_.strided() +
+            s * ThreadMap::Delta::kStrided;
+        k_valid = logical_k < current_tile_k_end();
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
         constexpr int kAccess = ThreadMap::kElementsPerAccess;
         int const frag_base =
             (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
-        int const logical_n =
-            n_offset_ + thread_offset_.contiguous() +
-            c * ThreadMap::Delta::kContiguous;
 
-        bool const valid = k_valid && logical_n + kAccess <= params_.size_n;
+        bool n_valid = true;
+        if constexpr (kResidueN) {
+          int const logical_n =
+              n_offset_ + thread_offset_.contiguous() +
+              c * ThreadMap::Delta::kContiguous;
+          n_valid = logical_n + kAccess <= params_.size_n;
+        }
+
+        bool const valid = k_valid && n_valid;
         if (!valid) {
           half2 const zero = __float2half2_rn(0.0f);
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
@@ -331,7 +362,7 @@ class Sm70U8B128IteratorB {
   }
 };
 
-template <int GroupSize, bool FullTile>
+template <int GroupSize, Sm70TileMode TileMode>
 struct Sm70U8B128GemmTraits {
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
@@ -355,7 +386,7 @@ struct Sm70U8B128GemmTraits {
       128 / cutlass::sizeof_bits<ElementA>::value>;
   using IteratorB = Sm70U8B128IteratorB<
       ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
-      FullTile>;
+      TileMode>;
   using Mma = cutlass::gemm::threadblock::MmaPipelined<
       ThreadblockShape, IteratorA, typename MmaCore::SmemIteratorA, IteratorB,
       typename MmaCore::SmemIteratorB, ElementAccumulator, LayoutC,
@@ -382,14 +413,14 @@ struct Sm70U8B128GemmTraits {
   };
 };
 
-template <int GroupSize, bool FullTile>
+template <int GroupSize, Sm70TileMode TileMode>
 __global__ __launch_bounds__(kThreads, 1)
 void sm70_marlin_u8b128_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
-  using Traits = Sm70U8B128GemmTraits<GroupSize, FullTile>;
+  using Traits = Sm70U8B128GemmTraits<GroupSize, TileMode>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -439,13 +470,13 @@ void sm70_marlin_u8b128_gemm_kernel(
 
 }  // namespace
 
-template <int GroupSize, bool FullTile>
+template <int GroupSize, Sm70TileMode TileMode>
 torch::Tensor launch_sm70_marlin_u8b128_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k) {
-  auto kernel = sm70_marlin_u8b128_gemm_kernel<GroupSize, FullTile>;
+  auto kernel = sm70_marlin_u8b128_gemm_kernel<GroupSize, TileMode>;
   size_t smem_bytes =
-      sizeof(typename Sm70U8B128GemmTraits<GroupSize, FullTile>::SharedStorage);
+      sizeof(typename Sm70U8B128GemmTraits<GroupSize, TileMode>::SharedStorage);
   if (smem_bytes >= (48u << 10)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -468,23 +499,23 @@ torch::Tensor launch_sm70_marlin_u8b128_gemm(
   return c;
 }
 
-template <bool FullTile>
+template <Sm70TileMode TileMode>
 torch::Tensor launch_sm70_marlin_u8b128_gemm_group_size(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
     int64_t group_size) {
   switch (group_size) {
     case -1:
-      return launch_sm70_marlin_u8b128_gemm<-1, FullTile>(
+      return launch_sm70_marlin_u8b128_gemm<-1, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 32:
-      return launch_sm70_marlin_u8b128_gemm<32, FullTile>(
+      return launch_sm70_marlin_u8b128_gemm<32, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 64:
-      return launch_sm70_marlin_u8b128_gemm<64, FullTile>(
+      return launch_sm70_marlin_u8b128_gemm<64, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     case 128:
-      return launch_sm70_marlin_u8b128_gemm<128, FullTile>(
+      return launch_sm70_marlin_u8b128_gemm<128, TileMode>(
           a, c, b_q_weight, b_scales, size_m, size_n, size_k);
     default:
       TORCH_CHECK(false,
@@ -502,11 +533,24 @@ torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
                                       int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  bool const full_tile = (size_k % kCtaK == 0 && size_n % kCtaN == 0);
-  if (full_tile) {
-    return launch_sm70_marlin_u8b128_gemm_group_size<true>(
+  bool const residue_k = size_k % kCtaK != 0;
+  bool const residue_n = size_n % kCtaN != 0;
+  if (!residue_k && !residue_n) {
+    return launch_sm70_marlin_u8b128_gemm_group_size<
+        Sm70TileMode::FullTile>(
         a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
   }
-  return launch_sm70_marlin_u8b128_gemm_group_size<false>(
+  if (!residue_k) {
+    return launch_sm70_marlin_u8b128_gemm_group_size<
+        Sm70TileMode::ResidueNOnly>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  }
+  if (!residue_n) {
+    return launch_sm70_marlin_u8b128_gemm_group_size<
+        Sm70TileMode::ResidueKOnly>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  }
+  return launch_sm70_marlin_u8b128_gemm_group_size<
+      Sm70TileMode::ResidueKAndN>(
       a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
 }

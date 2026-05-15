@@ -523,6 +523,24 @@ def test_marlin_dense_uint4b8_residue_k_single_group_matches_reference(
     )
 
 
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4b8_residue_k_and_n_single_group_matches_reference(
+    repack_impl: str,
+):
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        repack_impl=repack_impl,
+        group_size=-1,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=144,
+        size_n=128,
+    )
+
+
 def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -643,6 +661,19 @@ def test_marlin_dense_uint4_zp_small_tile_matches_reference(repack_impl: str):
     )
 
 
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint4_zp_residue_n_matches_reference(repack_impl: str):
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=128,
+    )
+
+
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint8_zp_bias_accuracy(group_size: int, repack_impl: str):
@@ -663,6 +694,19 @@ def test_marlin_dense_uint8_zp_bias_small_tile_matches_reference(repack_impl: st
         atol=2.5e-1,
         size_m=8,
         size_k=128,
+        size_n=128,
+    )
+
+
+@pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+def test_marlin_dense_uint8_zp_bias_residue_n_matches_reference(repack_impl: str):
+    _run_dense_uint8_zp_bias_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
         size_n=128,
     )
 
@@ -1077,6 +1121,21 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
             atol=2e-1,
             size_m=8,
             size_k=128,
+            size_n=128,
+        )
+
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_marlin_dense_uint8b128_residue_n_matches_reference(repack_impl: str):
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            repack_impl=repack_impl,
+            group_size=128,
+            act_order=False,
+            is_k_full=True,
+            rtol=4e-2,
+            atol=2e-1,
+            size_m=8,
+            size_k=256,
             size_n=128,
         )
 
