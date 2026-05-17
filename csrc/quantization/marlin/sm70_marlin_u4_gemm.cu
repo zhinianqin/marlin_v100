@@ -379,10 +379,10 @@ class Sm70U4ZpBiasIteratorB {
         }
       }
 
-      if constexpr (kFullTile) {
-      cache_metadata_lane_vectors(c, group, cache_n);
-      } else {
+      if constexpr (kTileMode != Sm70TileMode::FullTile || Shape::kN == 256) {
         cache_metadata_vector_words(c, group, cache_n);
+      } else {
+        cache_metadata_lane_vectors(c, group, cache_n);
       }
     }
   }
