@@ -327,21 +327,21 @@ class Sm70U4ZpBiasIteratorB {
 
   CUTLASS_DEVICE
   void cache_metadata_lane_vectors(int c, int group, int cache_n) const {
-    half2 const* scale_vec =
-        reinterpret_cast<half2 const*>(scales_ +
-                                       group * params_.size_n + cache_n);
-    cached_scales_[c * 4 + 0] = scale_vec[0];
-    cached_scales_[c * 4 + 1] = scale_vec[1];
-    cached_scales_[c * 4 + 2] = scale_vec[2];
-    cached_scales_[c * 4 + 3] = scale_vec[3];
+    half2 const* scale_vec = reinterpret_cast<half2 const*>(
+        scales_ + group * params_.size_n + cache_n);
+    half2* scale_cache = cached_scales_ + c * 4;
+    scale_cache[0] = scale_vec[0];
+    scale_cache[1] = scale_vec[1];
+    scale_cache[2] = scale_vec[2];
+    scale_cache[3] = scale_vec[3];
 
-    half2 const* bias_vec =
-        reinterpret_cast<half2 const*>(zp_bias_ +
-                                       group * params_.size_n + cache_n);
-    cached_bias_[c * 4 + 0] = bias_vec[0];
-    cached_bias_[c * 4 + 1] = bias_vec[1];
-    cached_bias_[c * 4 + 2] = bias_vec[2];
-    cached_bias_[c * 4 + 3] = bias_vec[3];
+    half2 const* bias_vec = reinterpret_cast<half2 const*>(
+        zp_bias_ + group * params_.size_n + cache_n);
+    half2* bias_cache = cached_bias_ + c * 4;
+    bias_cache[0] = bias_vec[0];
+    bias_cache[1] = bias_vec[1];
+    bias_cache[2] = bias_vec[2];
+    bias_cache[3] = bias_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -380,7 +380,7 @@ class Sm70U4ZpBiasIteratorB {
       }
 
       if constexpr (kFullTile) {
-        cache_metadata_lane_vectors(c, group, cache_n);
+      cache_metadata_lane_vectors(c, group, cache_n);
       } else {
         cache_metadata_vector_words(c, group, cache_n);
       }
