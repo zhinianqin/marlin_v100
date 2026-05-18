@@ -9,7 +9,7 @@ from marlin_v100.calibration import (
     source_target_label,
     supported_dense_quant_type_names,
 )
-from marlin_v100 import ops
+from marlin_v100 import dense, ops
 from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
@@ -17,6 +17,7 @@ from tests.helpers import (
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
     marlin_quantize,
+    marlin_quantize_nvfp4,
     marlin_quantize_uint4_zp,
     marlin_quantize_uint4_zp_bias,
     marlin_quantize_uint8_zp_bias,
@@ -24,7 +25,7 @@ from tests.helpers import (
 )
 
 _DENSE_SUPPORTED_QUANT_NAMES = frozenset(
-    supported_dense_quant_type_names(("uint4", "uint4b8", "uint8", "uint8b128", "fp8"))
+    supported_dense_quant_type_names(("uint4", "uint4b8", "uint8", "uint8b128", "fp8", "nvfp4"))
 )
 _GROUP_SIZES = (-1, 32, 64, 128)
 _CTA_GEOMETRY_CASES = (
@@ -335,6 +336,49 @@ def _run_fp8_dense_accuracy_case(
         size_n=w.shape[1],
         group_size=group_size,
         quant_type=scalar_types.float8_e4m3fn,
+    ).to(torch.float16)
+
+    assert torch.isfinite(output).all()
+    assert not torch.all(output == 0)
+    assert output.float().std().item() > 0
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
+def _run_nvfp4_dense_accuracy_case(
+    *,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+    rtol: float = 5e-2,
+    atol: float = 2.5e-1,
+) -> None:
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
+        marlin_quantize_nvfp4(w, 16)
+    )
+    output = dense.run_marlin_gemm(
+        a,
+        q_w,
+        scales,
+        scalar_types.float4_e2m1f.id,
+        a.shape[0],
+        w.shape[1],
+        w.shape[0],
+        workspace=marlin_make_workspace_new(a.device),
+        global_scale=global_scale,
+        g_idx=g_idx,
+        perm=sort_indices,
+        is_k_full=True,
+        use_fp32_reduce=True,
+    )
+    reference = torch.matmul(
+        a.to(torch.float32),
+        weight_ref.to(torch.float32),
     ).to(torch.float16)
 
     assert torch.isfinite(output).all()
@@ -1630,7 +1674,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="does not support nvfp4 global_scale"):
+        with pytest.raises(RuntimeError, match="supports global_scale only for preconverted nvfp4"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -1714,6 +1758,253 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 sort_indices,
                 workspace,
                 scalar_types.float8_e4m3fn.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                False,
+                False,
+                True,
+                False,
+            )
+
+
+if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
+
+    def test_marlin_dense_nvfp4_weight_accuracy():
+        _run_nvfp4_dense_accuracy_case()
+
+    def test_marlin_dense_nvfp4_weight_residue_n_matches_reference():
+        _run_nvfp4_dense_accuracy_case(
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
+
+    @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
+    def test_marlin_dense_nvfp4_env_cta_geometry_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        cta_geometry: str,
+        size_m: int,
+        size_n: int,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_NVFP4_CTA", cta_geometry)
+        _run_nvfp4_dense_accuracy_case(
+            size_m=size_m,
+            size_k=256,
+            size_n=size_n,
+        )
+
+    def test_marlin_dense_nvfp4_env_cta_geometry_rejects_unsupported(
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_NVFP4_CTA", "32x64x4")
+        with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_NVFP4_CTA"):
+            _run_nvfp4_dense_accuracy_case(
+                size_m=32,
+                size_k=256,
+                size_n=64,
+            )
+
+    def test_marlin_dense_nvfp4_rejects_raw_fp8_scales_and_missing_global_scale():
+        _require_marlin_cuda()
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+
+        a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+        w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+        _weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
+            marlin_quantize_nvfp4(w, 16)
+        )
+        raw_fp8_scales = (scales.to(torch.float32) / 128.0).to(torch.float8_e4m3fn)
+        workspace = marlin_make_workspace_new(a.device)
+
+        with pytest.raises(RuntimeError, match="preconverted float16 NVFP4 scales"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                raw_fp8_scales,
+                None,
+                global_scale,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        with pytest.raises(RuntimeError, match="requires fp32 global_scale"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                None,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        with pytest.raises(RuntimeError, match="expects fp32 global_scale"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                global_scale.to(torch.float16),
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+    def test_marlin_dense_nvfp4_rejects_unsupported_group_size_and_metadata():
+        _require_marlin_cuda()
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+
+        a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
+        w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
+        _weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
+            marlin_quantize_nvfp4(w, 16)
+        )
+        workspace = marlin_make_workspace_new(a.device)
+
+        with pytest.raises(RuntimeError, match="supports only group_size 16"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales[:8].contiguous(),
+                None,
+                global_scale,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        with pytest.raises(RuntimeError, match="act_order is not supported"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                global_scale,
+                None,
+                torch.zeros(w.shape[0], device="cuda", dtype=torch.int),
+                torch.arange(w.shape[0], device="cuda", dtype=torch.int),
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        with pytest.raises(RuntimeError, match="does not support bias"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
+                scales,
+                None,
+                global_scale,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                False,
+            )
+
+        with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                global_scale,
+                torch.zeros_like(scales),
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
+                a.shape[0],
+                w.shape[1],
+                w.shape[0],
+                True,
+                False,
+                True,
+                True,
+            )
+
+        with pytest.raises(RuntimeError, match="requires full-K"):
+            ops.marlin_gemm(
+                a,
+                None,
+                q_w,
+                None,
+                scales,
+                None,
+                global_scale,
+                None,
+                g_idx,
+                sort_indices,
+                workspace,
+                scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
                 w.shape[0],

@@ -47,8 +47,7 @@ QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
     "nvfp4": QuantTypeSupport(
         name="nvfp4",
         dense_supported=True,
-        moe_supported=True,
-        requires_fp8_kernels=True,
+        moe_supported=False,
         requires_nvfp4_global_scale=True,
     ),
     "mxfp4": QuantTypeSupport(
@@ -60,13 +59,14 @@ QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
 }
 
 _ARCHITECTURE_SUPPORT: dict[tuple[int, int], ArchitectureSupport] = {
-    # SM70 supports int quantized paths plus dense FP8 weight-only dequant into
-    # the regular FP16 MMA path. FP8 activation, NVFP4, and MXFP4 remain absent.
+    # SM70 supports int quantized paths plus dense FP8/NVFP4 weight-only
+    # dequant into the regular FP16 MMA path. FP8 activation and MXFP4 remain
+    # absent.
     (7, 0): ArchitectureSupport(
         target_capability=(7, 0),
         dense_group_sizes=(-1, 32, 64, 128),
         allow_fp8_kernels=False,
-        allow_nvfp4_global_scale=False,
+        allow_nvfp4_global_scale=True,
         allow_mxfp4=False,
         allow_act_order=False,
     ),
@@ -108,6 +108,7 @@ _QUANT_TYPE_IDS = {
     "uint8": _encode_scalar_type_id(0, 8, False, 0),
     "uint8b128": _encode_scalar_type_id(0, 8, False, 128),
     "fp8": _encode_scalar_type_id(4, 3, True, 0, True, 2),
+    "nvfp4": _encode_scalar_type_id(2, 1, True, 0, True, 0),
 }
 
 
@@ -340,12 +341,22 @@ def validate_dense_marlin_call(
 ) -> dict[str, int | bool]:
     quant_group_size = infer_dense_group_size(size_k, num_groups)
     act_order = validate_act_order_metadata(g_idx, perm, size_k=size_k)
-    runtime_group_size = resolve_dense_runtime_group_size(
-        quant_group_size,
-        act_order=act_order,
-        is_k_full=is_k_full,
-        target_capability=target_capability,
-    )
+    quant_name = quant_type_name_from_id(b_type_id)
+    if quant_name == "nvfp4":
+        if act_order:
+            raise ValueError("nvfp4 dense weight-only path does not support act_order.")
+        if not is_k_full:
+            raise ValueError("nvfp4 dense weight-only path requires is_k_full=True.")
+        if quant_group_size != 16:
+            raise ValueError("nvfp4 dense weight-only path supports only group_size 16.")
+        runtime_group_size = 16
+    else:
+        runtime_group_size = resolve_dense_runtime_group_size(
+            quant_group_size,
+            act_order=act_order,
+            is_k_full=is_k_full,
+            target_capability=target_capability,
+        )
     if act_order:
         if not is_supported_act_order_type_id(b_type_id):
             raise ValueError(
@@ -353,7 +364,7 @@ def validate_dense_marlin_call(
             )
         if is_k_full and num_groups <= 1:
             raise ValueError("act_order with is_k_full=True requires more than one scale group.")
-    if quant_type_name_from_id(b_type_id) == "fp8" and runtime_group_size not in (-1, 128):
+    if quant_name == "fp8" and runtime_group_size not in (-1, 128):
         raise ValueError("fp8 dense weight-only path supports only group_size -1 or 128.")
     return {
         "act_order": act_order,

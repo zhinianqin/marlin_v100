@@ -14,8 +14,10 @@ from marlin_v100.calibration import (
 from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
+    fp4_e2m1_weight_to_marlin_weight,
     fp8_weight_to_marlin_weight,
     make_moe_model_like_inputs,
+    marlin_dequantize_nvfp4,
     marlin_dequantize_uint4_zp,
     marlin_dequantize_uint4_zp_bias,
     marlin_dequantize_uint8_zp_bias,
@@ -23,6 +25,7 @@ from tests.helpers import (
     marlin_unpack,
     marlin_quantize,
     marlin_quantize_fp8,
+    marlin_quantize_nvfp4,
     marlin_quantize_experts_uint4_zp_with_metadata,
     marlin_quantize_experts,
     marlin_quantize_experts_with_metadata,
@@ -65,6 +68,13 @@ def test_fp8_scalar_type_id_matches_vllm_encoding():
     assert quant_type_name_from_id(scalar_types.float8_e4m3fn.id) == "fp8"
 
 
+def test_nvfp4_scalar_type_id_matches_vllm_encoding():
+    expected_id = (2 << 0) | (1 << 8) | (1 << 16) | (1 << 49)
+
+    assert scalar_types.float4_e2m1f.id == expected_id
+    assert quant_type_name_from_id(scalar_types.float4_e2m1f.id) == "nvfp4"
+
+
 @pytest.mark.parametrize("size_n", (64, 128, 256))
 def test_fp8_marlin_weight_pack_unpack_preserves_raw_bytes(size_n: int):
     size_k = 16
@@ -80,6 +90,22 @@ def test_fp8_marlin_weight_pack_unpack_preserves_raw_bytes(size_n: int):
     )
 
     assert torch.equal(unpacked.to(torch.uint8), raw)
+
+
+@pytest.mark.parametrize("size_n", (64, 128, 256))
+def test_nvfp4_marlin_weight_pack_unpack_preserves_raw_nibbles(size_n: int):
+    size_k = 16
+    raw = torch.arange(size_k * size_n, dtype=torch.int32).reshape(size_k, size_n) % 16
+
+    packed = fp4_e2m1_weight_to_marlin_weight(raw)
+    unpacked = marlin_unpack(
+        packed,
+        size_k,
+        size_n,
+        scalar_types.float4_e2m1f,
+    )
+
+    assert torch.equal(unpacked, raw)
 
 
 @pytest.mark.parametrize(
@@ -114,6 +140,36 @@ def test_marlin_quantize_fp8_uses_fused_scales_and_dequantizes(
     assert torch.isfinite(dequantized).all()
     assert (scales > 1.0).all()
     torch.testing.assert_close(dequantized, weight, atol=5.0e-1, rtol=5.0e-1)
+
+
+def test_marlin_quantize_nvfp4_uses_fp16_scales_and_global_scale():
+    torch.manual_seed(0)
+    weight = torch.randn((256, 128), dtype=torch.float16)
+
+    weight_ref, q_weight, scales, global_scale, g_idx, sort_indices, rand_perm = (
+        marlin_quantize_nvfp4(weight, 16)
+    )
+    dequantized = marlin_dequantize_nvfp4(
+        q_weight,
+        scales,
+        global_scale,
+        size_k=weight.shape[0],
+        size_n=weight.shape[1],
+        group_size=16,
+    )
+
+    assert scales.shape == (weight.shape[0] // 16, weight.shape[1])
+    assert scales.dtype == torch.float16
+    assert global_scale.shape == (1,)
+    assert global_scale.dtype == torch.float32
+    assert g_idx.numel() == 0
+    assert sort_indices.numel() == 0
+    assert torch.equal(rand_perm, torch.arange(weight.shape[0], dtype=torch.int))
+    assert torch.isfinite(weight_ref).all()
+    assert torch.isfinite(dequantized).all()
+    assert (scales > 1.0).all()
+    torch.testing.assert_close(dequantized, weight_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(weight_ref, weight, atol=5.0e-1, rtol=5.0e-1)
 
 
 def _require_repack_cuda() -> None:

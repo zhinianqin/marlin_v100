@@ -100,10 +100,10 @@ DENSE_ARGS="--models smoke --batch-sizes 16 --warmup-iters 1 --iters 1" \
 此时全局 `--group-sizes` 默认仍是：
 
 ```text
--1 32 64 128
+-1 32 64 128 16
 ```
 
-但 FP8 只会生成 `-1` 和 `128`，不会生成 unsupported 的 `32/64` case。
+其中 `16` 只是 benchmark 层为 NVFP4 预留的 case；FP8 仍只会生成 `-1` 和 `128`，不会生成 unsupported 的 `32/64` case。
 
 FP8 kernel 已经支持独立 CTA geometry env override：
 

@@ -38,6 +38,7 @@ from marlin_v100 import dense, ops
 from tests.helpers import (
     marlin_make_workspace_new,
     marlin_quantize,
+    marlin_quantize_nvfp4,
     marlin_quantize_uint4_zp_bias,
     marlin_quantize_uint8_zp_bias,
     scalar_types,
@@ -49,13 +50,15 @@ _DENSE_QUANT_TYPE_CANDIDATES = {
     "uint8": scalar_types.uint8,
     "uint8b128": scalar_types.uint8b128,
     "fp8": scalar_types.float8_e4m3fn,
+    "nvfp4": scalar_types.float4_e2m1f,
 }
 QUANT_TYPES = {
     name: _DENSE_QUANT_TYPE_CANDIDATES[name]
     for name in supported_dense_quant_type_names(_DENSE_QUANT_TYPE_CANDIDATES)
 }
 GROUP_SIZE_CANDIDATES = (-1, 32, 64, 128)
-GROUP_SIZES = supported_dense_group_sizes(GROUP_SIZE_CANDIDATES)
+RUNTIME_GROUP_SIZES = supported_dense_group_sizes(GROUP_SIZE_CANDIDATES)
+GROUP_SIZES = tuple(dict.fromkeys((*RUNTIME_GROUP_SIZES, 16)))
 LAUNCH_DOMINATED_FLOPS = 1_000_000_000
 
 
@@ -119,11 +122,21 @@ def _is_supported_dense_benchmark_case(
 ) -> bool:
     if group_size != -1 and size_k % group_size != 0:
         return False
+    if quant_name != "nvfp4" and group_size == 16:
+        return False
     if act_order and is_k_full and group_size == -1:
         return False
     if quant_name == "fp8":
         return (
             group_size in (-1, 128)
+            and not act_order
+            and is_k_full
+            and size_k % 32 == 0
+            and size_n % 64 == 0
+        )
+    if quant_name == "nvfp4":
+        return (
+            group_size == 16
             and not act_order
             and is_k_full
             and size_k % 32 == 0
@@ -168,7 +181,8 @@ def parse_args() -> argparse.Namespace:
         default=list(GROUP_SIZES),
         help=(
             "Group sizes to benchmark for the current source target "
-            f"({source_target_label()}; supported defaults={list(support.dense_group_sizes)})."
+            f"({source_target_label()}; supported defaults={list(support.dense_group_sizes)}, "
+            "plus nvfp4-only 16)."
         ),
     )
     parser.add_argument(
@@ -235,6 +249,7 @@ def run_case(
     a = torch.randn((size_m, size_k), device=device, dtype=torch.float16)
     weight = torch.randn((size_k, size_n), device=device, dtype=torch.float16)
     b_zp_bias = None
+    global_scale = None
     if quant_name == "uint4":
         if act_order:
             return None
@@ -251,6 +266,10 @@ def run_case(
         )
         g_idx = torch.empty(0, dtype=torch.int, device=device)
         sort_indices = torch.empty(0, dtype=torch.int, device=device)
+    elif quant_name == "nvfp4":
+        weight_ref, q_weight, scales, global_scale, g_idx, sort_indices, _ = (
+            marlin_quantize_nvfp4(weight, group_size)
+        )
     else:
         weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
             weight, quant_type, group_size, act_order
@@ -274,6 +293,7 @@ def run_case(
             size_k,
             workspace=workspace,
             b_zp_bias=b_zp_bias,
+            global_scale=global_scale,
             g_idx=g_idx,
             perm=sort_indices,
             is_k_full=is_k_full,
@@ -309,6 +329,7 @@ def run_case(
                 workspace=workspace,
                 c=marlin_output,
                 b_zp_bias=b_zp_bias,
+                global_scale=global_scale,
                 g_idx=g_idx,
                 perm=sort_indices,
                 is_k_full=is_k_full,
