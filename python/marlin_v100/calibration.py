@@ -42,8 +42,7 @@ QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
     "fp8": QuantTypeSupport(
         name="fp8",
         dense_supported=True,
-        moe_supported=True,
-        requires_fp8_kernels=True,
+        moe_supported=False,
     ),
     "nvfp4": QuantTypeSupport(
         name="nvfp4",
@@ -61,8 +60,8 @@ QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
 }
 
 _ARCHITECTURE_SUPPORT: dict[tuple[int, int], ArchitectureSupport] = {
-    # SM70 is limited to int quantized paths. Kernel generators and runtime
-    # checks explicitly reject fp8 and nvfp4-specific flows.
+    # SM70 supports int quantized paths plus dense FP8 weight-only dequant into
+    # the regular FP16 MMA path. FP8 activation, NVFP4, and MXFP4 remain absent.
     (7, 0): ArchitectureSupport(
         target_capability=(7, 0),
         dense_group_sizes=(-1, 32, 64, 128),
@@ -108,6 +107,7 @@ _QUANT_TYPE_IDS = {
     "uint4b8": _encode_scalar_type_id(0, 4, False, 8),
     "uint8": _encode_scalar_type_id(0, 8, False, 0),
     "uint8b128": _encode_scalar_type_id(0, 8, False, 128),
+    "fp8": _encode_scalar_type_id(4, 3, True, 0, True, 2),
 }
 
 
@@ -353,6 +353,8 @@ def validate_dense_marlin_call(
             )
         if is_k_full and num_groups <= 1:
             raise ValueError("act_order with is_k_full=True requires more than one scale group.")
+    if quant_type_name_from_id(b_type_id) == "fp8" and runtime_group_size not in (-1, 128):
+        raise ValueError("fp8 dense weight-only path supports only group_size -1 or 128.")
     return {
         "act_order": act_order,
         "quant_group_size": quant_group_size,

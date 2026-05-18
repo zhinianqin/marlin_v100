@@ -5,15 +5,26 @@ from collections import defaultdict
 
 import torch
 
-from benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
-from common import (
-    banner,
-    check_cuda_ready,
-    format_float,
-    print_table,
-    time_cuda_callable,
-    timestamp,
-)
+try:
+    from benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
+    from common import (
+        banner,
+        check_cuda_ready,
+        format_float,
+        print_table,
+        time_cuda_callable,
+        timestamp,
+    )
+except ModuleNotFoundError:
+    from benchmarks.benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
+    from benchmarks.common import (
+        banner,
+        check_cuda_ready,
+        format_float,
+        print_table,
+        time_cuda_callable,
+        timestamp,
+    )
 from marlin_v100.calibration import (
     architecture_support,
     format_capability,
@@ -37,6 +48,7 @@ _DENSE_QUANT_TYPE_CANDIDATES = {
     "uint4b8": scalar_types.uint4b8,
     "uint8": scalar_types.uint8,
     "uint8b128": scalar_types.uint8b128,
+    "fp8": scalar_types.float8_e4m3fn,
 }
 QUANT_TYPES = {
     name: _DENSE_QUANT_TYPE_CANDIDATES[name]
@@ -95,6 +107,29 @@ def tflops_from_us(flops: int, latency_us: float) -> float:
 
 def is_launch_dominated(flops: int) -> bool:
     return flops < LAUNCH_DOMINATED_FLOPS
+
+
+def _is_supported_dense_benchmark_case(
+    quant_name: str,
+    group_size: int,
+    act_order: bool,
+    is_k_full: bool,
+    size_k: int,
+    size_n: int,
+) -> bool:
+    if group_size != -1 and size_k % group_size != 0:
+        return False
+    if act_order and is_k_full and group_size == -1:
+        return False
+    if quant_name == "fp8":
+        return (
+            group_size in (-1, 128)
+            and not act_order
+            and is_k_full
+            and size_k % 32 == 0
+            and size_n % 64 == 0
+        )
+    return True
 
 
 def parse_args() -> argparse.Namespace:
@@ -185,9 +220,14 @@ def run_case(
     warmup_iters: int,
     iters: int,
 ) -> dict[str, object] | None:
-    if group_size != -1 and size_k % group_size != 0:
-        return None
-    if act_order and is_k_full and group_size == -1:
+    if not _is_supported_dense_benchmark_case(
+        quant_name=quant_name,
+        group_size=group_size,
+        act_order=act_order,
+        is_k_full=is_k_full,
+        size_k=size_k,
+        size_n=size_n,
+    ):
         return None
 
     quant_type = QUANT_TYPES[quant_name]
@@ -391,12 +431,17 @@ def main() -> None:
         for size_k, size_n in DENSE_WEIGHT_SHAPES[model]:
             for quant_name in args.quant_types:
                 for group_size in args.group_sizes:
-                    if group_size != -1 and size_k % group_size != 0:
-                        continue
                     for act_order in act_order_values:
                         is_k_full_values = requested_is_k_full if act_order else [True]
                         for is_k_full in is_k_full_values:
-                            if act_order and is_k_full and group_size == -1:
+                            if not _is_supported_dense_benchmark_case(
+                                quant_name=quant_name,
+                                group_size=group_size,
+                                act_order=act_order,
+                                is_k_full=is_k_full,
+                                size_k=size_k,
+                                size_n=size_n,
+                            ):
                                 continue
                             for size_m in batch_sizes:
                                 case_specs.append(

@@ -48,6 +48,11 @@ torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
                                       torch::Tensor& b_scales, int64_t size_m,
                                       int64_t size_n, int64_t size_k,
                                       int64_t group_size);
+torch::Tensor sm70_marlin_fp8_gemm(torch::Tensor& a, torch::Tensor& c,
+                                   torch::Tensor& b_q_weight,
+                                   torch::Tensor& b_scales, int64_t size_m,
+                                   int64_t size_n, int64_t size_k,
+                                   int64_t group_size);
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -616,9 +621,10 @@ torch::Tensor marlin_gemm(
   TORCH_CHECK(s_type == vllm::kFloat16,
               "SM70 build only supports float16 scales.");
   TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
-                  b_type == vllm::kU8 || b_type == vllm::kU8B128,
+                  b_type == vllm::kU8 || b_type == vllm::kU8B128 ||
+                  b_type == vllm::kFE4M3fn,
               "SM70 CUTLASS prototype currently implements only uint4, "
-              "uint4b8, uint8, and uint8b128 dense weights.");
+              "uint4b8, uint8, uint8b128, and fp8_e4m3fn dense weights.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -657,6 +663,8 @@ torch::Tensor marlin_gemm(
 
   TORCH_CHECK(b_scales.device().is_cuda(), "b_scales is not on GPU");
   TORCH_CHECK(b_scales.is_contiguous(), "b_scales is not contiguous");
+  TORCH_CHECK(b_scales.scalar_type() == at::ScalarType::Half,
+              "SM70 build only supports float16 scales.");
 
   torch::Tensor a_scales;
   auto options = torch::TensorOptions().dtype(c_dtype).device(a.device());
@@ -690,6 +698,8 @@ torch::Tensor marlin_gemm(
     c = c_or_none.value();
     TORCH_CHECK(c.device().is_cuda(), "c is not on GPU");
     TORCH_CHECK(c.is_contiguous(), "c is not contiguous");
+    TORCH_CHECK(c.scalar_type() == at::ScalarType::Half,
+                "SM70 build only supports float16 outputs.");
     TORCH_CHECK(c.size(0) == size_m, "Shape mismatch: c.size(0) = ", c.size(0),
                 ", size_m = ", size_m);
     TORCH_CHECK(c.size(1) == size_n, "Shape mismatch: c.size(1) = ", c.size(1),
@@ -822,8 +832,9 @@ torch::Tensor marlin_gemm(
 
   // Verify workspace size
   TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
-              "size_n = ", size_n, ", is not divisible by min_thread_n = ",
-              MARLIN_NAMESPACE_NAME::min_thread_n);
+              "SM70 CUTLASS dense prototype requires size_n % 64 == 0. "
+              "size_n = ",
+              size_n, ", min_thread_n = ", MARLIN_NAMESPACE_NAME::min_thread_n);
 
   int min_workspace_size = sms;
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
@@ -894,6 +905,21 @@ torch::Tensor marlin_gemm(
                 "zero-point bias metadata.");
     return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                    size_k, group_size);
+  }
+
+  if (b_type == vllm::kFE4M3fn) {
+    TORCH_CHECK(
+        size_k % 32 == 0,
+        "SM70 CUTLASS fp8 dense prototype requires size_k % 32 == 0.");
+    TORCH_CHECK(group_size == -1 || group_size == 128,
+                "SM70 CUTLASS fp8 prototype supports only group_size -1 or "
+                "128. Got ",
+                group_size);
+    TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+                "SM70 CUTLASS fp8 prototype does not support zero-point "
+                "bias metadata.");
+    return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
+                                size_k, group_size);
   }
 
   TORCH_CHECK(!has_zp_bias && !use_zp_bias,

@@ -6,6 +6,7 @@ torch = pytest.importorskip("torch")
 
 from marlin_v100 import dense, moe, ops
 from marlin_v100.calibration import (
+    quant_type_name_from_id,
     source_target_capability,
     source_target_label,
     supported_dense_quant_type_names,
@@ -13,12 +14,15 @@ from marlin_v100.calibration import (
 from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
+    fp8_weight_to_marlin_weight,
     make_moe_model_like_inputs,
     marlin_dequantize_uint4_zp,
     marlin_dequantize_uint4_zp_bias,
     marlin_dequantize_uint8_zp_bias,
     marlin_dequantize,
+    marlin_unpack,
     marlin_quantize,
+    marlin_quantize_fp8,
     marlin_quantize_experts_uint4_zp_with_metadata,
     marlin_quantize_experts,
     marlin_quantize_experts_with_metadata,
@@ -52,6 +56,64 @@ _REPACK_QUANT_CASES = [
     pytest.param(_REPACK_QUANT_TYPES[name], id=name)
     for name in supported_dense_quant_type_names(_REPACK_QUANT_TYPES)
 ]
+
+
+def test_fp8_scalar_type_id_matches_vllm_encoding():
+    expected_id = (4 << 0) | (3 << 8) | (1 << 16) | (1 << 49) | (2 << 50)
+
+    assert scalar_types.float8_e4m3fn.id == expected_id
+    assert quant_type_name_from_id(scalar_types.float8_e4m3fn.id) == "fp8"
+
+
+@pytest.mark.parametrize("size_n", (64, 128, 256))
+def test_fp8_marlin_weight_pack_unpack_preserves_raw_bytes(size_n: int):
+    size_k = 16
+    raw = torch.arange(size_k * size_n, dtype=torch.uint8).reshape(size_k, size_n)
+    fp8_weight = raw.view(torch.float8_e4m3fn)
+
+    packed = fp8_weight_to_marlin_weight(fp8_weight)
+    unpacked = marlin_unpack(
+        packed,
+        size_k,
+        size_n,
+        scalar_types.float8_e4m3fn,
+    )
+
+    assert torch.equal(unpacked.to(torch.uint8), raw)
+
+
+@pytest.mark.parametrize(
+    ("group_size", "expected_groups"),
+    ((-1, 1), (128, 2)),
+)
+def test_marlin_quantize_fp8_uses_fused_scales_and_dequantizes(
+    group_size: int,
+    expected_groups: int,
+):
+    torch.manual_seed(0)
+    weight = torch.randn((256, 128), dtype=torch.float16)
+
+    _weight, q_weight, scales, g_idx, sort_indices, rand_perm = marlin_quantize_fp8(
+        weight,
+        group_size,
+    )
+    dequantized = marlin_dequantize(
+        q_weight,
+        scales,
+        size_k=weight.shape[0],
+        size_n=weight.shape[1],
+        group_size=group_size,
+        quant_type=scalar_types.float8_e4m3fn,
+    )
+
+    assert scales.shape == (expected_groups, weight.shape[1])
+    assert scales.dtype == torch.float16
+    assert g_idx.numel() == 0
+    assert sort_indices.numel() == 0
+    assert torch.equal(rand_perm, torch.arange(weight.shape[0], dtype=torch.int))
+    assert torch.isfinite(dequantized).all()
+    assert (scales > 1.0).all()
+    torch.testing.assert_close(dequantized, weight, atol=5.0e-1, rtol=5.0e-1)
 
 
 def _require_repack_cuda() -> None:

@@ -52,6 +52,7 @@ class scalar_types:
     uint4b8 = ScalarType(0, 4, False, 8)
     uint8 = ScalarType(0, 8, False, 0)
     uint8b128 = ScalarType(0, 8, False, 128)
+    float8_e4m3fn = ScalarType(4, 3, True, 0, True, 2)
 
 
 _REPACK_IMPL_CASES = (
@@ -80,7 +81,17 @@ def _supported_quant_types() -> tuple[ScalarType, ...]:
 
 
 def _supported_unpack_quant_types() -> tuple[ScalarType, ...]:
-    return (scalar_types.uint4, scalar_types.uint4b8, scalar_types.uint8, scalar_types.uint8b128)
+    return (
+        scalar_types.uint4,
+        scalar_types.uint4b8,
+        scalar_types.uint8,
+        scalar_types.uint8b128,
+        scalar_types.float8_e4m3fn,
+    )
+
+
+def _is_fp8_quant_type(quant_type: ScalarType) -> bool:
+    return quant_type == scalar_types.float8_e4m3fn
 
 
 def pack_rows(
@@ -383,6 +394,53 @@ def _quantize_uint8_with_zero_point(
     return q, scales.to(weight.dtype), zero_points.contiguous()
 
 
+def _fp8_fused_exponent_bias_into_scales(scales: torch.Tensor) -> torch.Tensor:
+    return scales * 256.0
+
+
+def fp8_weight_to_marlin_weight(fp8_weight: torch.Tensor) -> torch.Tensor:
+    if fp8_weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"Expected torch.float8_e4m3fn weight, got {fp8_weight.dtype}")
+    if fp8_weight.ndim != 2:
+        raise ValueError(f"Expected 2D FP8 weight, got rank {fp8_weight.ndim}")
+
+    size_k, size_n = fp8_weight.shape
+    raw_bytes = fp8_weight.contiguous().view(torch.uint8).to(torch.int32)
+    weight_perm = quant_utils.get_weight_perm(8, is_a_8bit=False)
+    return quant_utils.marlin_weights(
+        raw_bytes,
+        size_k,
+        size_n,
+        8,
+        weight_perm,
+        is_a_8bit=False,
+    )
+
+
+def _quantize_fp8_weight(
+    weight: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    size_k, size_n = weight.shape
+    if group_size == -1:
+        runtime_group_size = size_k
+    elif group_size == 128:
+        runtime_group_size = group_size
+    else:
+        raise ValueError("FP8 dense helper supports only group_size=-1 or 128.")
+    if size_k % runtime_group_size != 0:
+        raise ValueError(f"group_size={runtime_group_size} must divide size_k={size_k}")
+
+    groups = size_k // runtime_group_size
+    reshaped = weight.to(torch.float32).reshape(groups, runtime_group_size, size_n)
+    scales = (reshaped.abs().amax(dim=1) / 448.0).clamp_min(1e-6)
+    fp8_weight = (reshaped / scales.unsqueeze(1)).to(torch.float8_e4m3fn).reshape(
+        size_k, size_n
+    )
+    repeated_scales = scales.repeat_interleave(runtime_group_size, dim=0)[:size_k]
+    dequantized = (fp8_weight.to(torch.float32) * repeated_scales).to(torch.float16)
+    return fp8_weight, scales.to(weight.dtype), dequantized
+
+
 def _make_group_ids(size_k: int, group_size: int, device: torch.device) -> torch.Tensor:
     actual_group_size = size_k if group_size == -1 else group_size
     return torch.arange(size_k, device=device, dtype=torch.int) // actual_group_size
@@ -412,6 +470,9 @@ def marlin_quantize(
     group_size: int,
     act_order: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _is_fp8_quant_type(quant_type):
+        return marlin_quantize_fp8(weight, group_size, act_order)
+
     if quant_type not in _supported_quant_types():
         raise ValueError("Local marlin_v100 helper currently supports uint4b8 and uint8b128 only.")
     validate_dense_group_size(group_size)
@@ -446,6 +507,32 @@ def marlin_quantize(
     return weight, marlin_q_weight, marlin_scales, g_idx, sort_indices, rand_perm
 
 
+def marlin_quantize_fp8(
+    weight: torch.Tensor,
+    group_size: int,
+    act_order: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if act_order:
+        raise ValueError("SM70 FP8 dense helper does not support act_order.")
+    if group_size not in (-1, 128):
+        raise ValueError("SM70 FP8 dense helper supports only group_size=-1 or 128.")
+
+    size_k, size_n = weight.shape
+    fp8_weight, scales, _dequantized = _quantize_fp8_weight(weight, group_size)
+    marlin_q_weight = fp8_weight_to_marlin_weight(fp8_weight)
+    marlin_scales = dense.marlin_permute_scales(
+        _fp8_fused_exponent_bias_into_scales(scales).to(torch.float16),
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    g_idx = marlin_make_empty_g_idx(weight.device)
+    sort_indices = torch.empty(0, dtype=torch.int, device=weight.device)
+    rand_perm = torch.arange(size_k, dtype=torch.int, device=weight.device)
+    return weight, marlin_q_weight, marlin_scales, g_idx, sort_indices, rand_perm
+
+
 def marlin_dequantize(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
@@ -455,13 +542,23 @@ def marlin_dequantize(
     quant_type: ScalarType,
     perm: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if quant_type not in _supported_quant_types():
-        raise ValueError("Local marlin_v100 helper currently supports uint4b8 and uint8b128 only.")
+    if quant_type not in _supported_quant_types() and not _is_fp8_quant_type(quant_type):
+        raise ValueError("Local marlin_v100 helper currently supports uint4b8, uint8b128, and fp8 only.")
     unpacked = marlin_unpack(q_weight, size_k, size_n, quant_type).to(torch.float32)
     unpermuted_scales = marlin_unpermute_scales(scales, size_k, size_n, group_size, quant_type)
     if group_size == -1:
         group_size = size_k
     expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
+    if _is_fp8_quant_type(quant_type):
+        fp8_values = unpacked.to(torch.uint8).contiguous().view(torch.float8_e4m3fn)
+        dequantized = (fp8_values.to(torch.float32) * (expanded_scales.to(torch.float32) / 256.0)).to(
+            torch.float16
+        )
+        if perm is not None and perm.numel() > 0:
+            logical = torch.empty_like(dequantized)
+            logical[perm.to(torch.long)] = dequantized
+            return logical
+        return dequantized
     dequantized = ((unpacked - float(quant_type.bias)) * expanded_scales.to(torch.float32)).to(
         torch.float16
     )
@@ -704,7 +801,7 @@ def marlin_unpack(
 ) -> torch.Tensor:
     if quant_type not in _supported_unpack_quant_types():
         raise ValueError(
-            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, and uint8b128 unpacking."
+            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, uint8b128, and fp8 unpacking."
         )
     return _marlin_unpack_impl(q_weight, size_k, size_n, quant_type)
 
@@ -787,7 +884,7 @@ def marlin_unpermute_scales(
 ) -> torch.Tensor:
     if quant_type not in _supported_unpack_quant_types():
         raise ValueError(
-            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, and uint8b128 scale unpermute."
+            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, uint8b128, and fp8 scale unpermute."
         )
     return _marlin_unpermute_scales_impl(scales, size_k, size_n, group_size)
 

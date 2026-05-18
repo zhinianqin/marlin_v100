@@ -480,7 +480,7 @@ __global__ void Marlin(
         }
       }
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
       if constexpr (moe_block_size >= 16)
         local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
