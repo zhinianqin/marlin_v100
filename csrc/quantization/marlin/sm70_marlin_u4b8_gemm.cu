@@ -1,5 +1,8 @@
 #include "core/registration.h"
 #include "quantization/marlin/dequant.h"
+#include "quantization/marlin/sm70_dense_common.cuh"
+#include "quantization/marlin/sm70_dense_gemm.cuh"
+#include "quantization/marlin/sm70_dense_iterator_utils.cuh"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -20,103 +23,29 @@
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 
+using marlin::sm70_dense::Sm70DenseCtaGeometry;
+using marlin::sm70_dense::Sm70DenseGemmTraits;
+using marlin::sm70_dense::Sm70TileMode;
+using marlin::sm70_dense::check_sm70_dense_cta_geometry;
+using marlin::sm70_dense::configure_dynamic_smem;
+using marlin::sm70_dense::cta_grid;
+using marlin::sm70_dense::dispatch_geometry;
+using marlin::sm70_dense::initial_k_advance;
+using marlin::sm70_dense::kCtaK;
+using marlin::sm70_dense::kMacroN;
+using marlin::sm70_dense::kMacroNTiles;
+using marlin::sm70_dense::kQuantTileK;
+using marlin::sm70_dense::kQuantTileN;
+using marlin::sm70_dense::kSm70TileModeFullTile;
+using marlin::sm70_dense::kSm70TileModeResidueK;
+using marlin::sm70_dense::kSm70TileModeResidueN;
+using marlin::sm70_dense::parse_sm70_dense_cta_geometry;
+using marlin::sm70_dense::qword_from_vector;
+using marlin::sm70_dense::u4_qweight_offset_from_logical;
+
 namespace {
 
-constexpr int kCtaK = 32;
-constexpr int kDefaultCtaM = 128;
-constexpr int kDefaultCtaN = 256;
-constexpr int kDefaultWarps = 8;
-constexpr int kQuantTileK = 16;
-constexpr int kQuantTileN = 64;
-constexpr int kMacroNTiles = 4;
-constexpr int kMacroN = kQuantTileN * kMacroNTiles;
 constexpr int kU4ValuesPerWord = 8;
-constexpr int kU4WordsPerTile = kQuantTileK * kQuantTileN / kU4ValuesPerWord;
-
-enum class Sm70TileMode {
-  FullTile,
-  ResidueNOnly,
-  ResidueKOnly,
-  ResidueKAndN,
-};
-
-template <int CtaM, int CtaN, int Warps>
-struct Sm70U4B8WarpShape;
-
-template <>
-struct Sm70U4B8WarpShape<32, 128, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<32, 256, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<64, 64, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<64, 128, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<64, 128, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<64, 256, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<64, 256, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<128, 64, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<128, 64, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<128, 128, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<128, 128, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<128, 256, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<256, 64, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<256, 64, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
-};
-
-template <>
-struct Sm70U4B8WarpShape<256, 128, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_,
           Sm70TileMode TileMode_>
@@ -126,13 +55,9 @@ class Sm70U4B8IteratorB {
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
   static constexpr Sm70TileMode kTileMode = TileMode_;
-  static constexpr bool kFullTile = kTileMode == Sm70TileMode::FullTile;
-  static constexpr bool kResidueN =
-      kTileMode == Sm70TileMode::ResidueNOnly ||
-      kTileMode == Sm70TileMode::ResidueKAndN;
-  static constexpr bool kResidueK =
-      kTileMode == Sm70TileMode::ResidueKOnly ||
-      kTileMode == Sm70TileMode::ResidueKAndN;
+  static constexpr bool kFullTile = kSm70TileModeFullTile<kTileMode>;
+  static constexpr bool kResidueN = kSm70TileModeResidueN<kTileMode>;
+  static constexpr bool kResidueK = kSm70TileModeResidueK<kTileMode>;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
@@ -245,8 +170,7 @@ class Sm70U4B8IteratorB {
 
   CUTLASS_DEVICE
   static int initial_k_advance(int size_k) {
-    int const residue_k = size_k % Shape::kK;
-    return residue_k == 0 ? Shape::kK : residue_k;
+    return marlin::sm70_dense::initial_k_advance<Shape::kK>(size_k);
   }
 
   CUTLASS_DEVICE
@@ -265,26 +189,8 @@ class Sm70U4B8IteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    int const k_tile = logical_k / kQuantTileK;
-    int const local_k = logical_k - k_tile * kQuantTileK;
-    int const n_tile = logical_n / kQuantTileN;
-    int const macro_n_tile = n_tile / kMacroNTiles;
-    int const macro_first_n_tile = macro_n_tile * kMacroNTiles;
-    int const subtile = n_tile - macro_first_n_tile;
-    int subtile_count = kMacroNTiles;
-    if constexpr (kResidueN) {
-      subtile_count = params.size_n / kQuantTileN - macro_first_n_tile;
-      subtile_count =
-          subtile_count < kMacroNTiles ? subtile_count : kMacroNTiles;
-    }
-    int const local_n_vec =
-        (logical_n - n_tile * kQuantTileN) / ThreadMap::kElementsPerAccess;
-    int const local_word = local_k * (kQuantTileN / kU4ValuesPerWord) +
-                           local_n_vec;
-
-    return k_tile * (params.size_n * 2) +
-           macro_n_tile * kMacroNTiles * kU4WordsPerTile +
-           local_word * subtile_count + subtile;
+    return u4_qweight_offset_from_logical<kResidueN>(params.size_n, logical_k,
+                                                     logical_n);
   }
 
   CUTLASS_DEVICE
@@ -300,18 +206,6 @@ class Sm70U4B8IteratorB {
           c * ThreadMap::Delta::kContiguous;
       return qweight_offset_from_logical(params_, logical_k, logical_n);
     }
-  }
-
-  CUTLASS_DEVICE
-  static uint32_t qword_from_vector(uint4 const& words, int c) {
-    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
-    return words_ptr[c];
-  }
-
-  CUTLASS_DEVICE
-  static uint32_t qword_from_vector(uint2 const& words, int c) {
-    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
-    return words_ptr[c];
   }
 
   CUTLASS_DEVICE
@@ -563,65 +457,17 @@ class Sm70U4B8IteratorB {
   }
 };
 
+struct Sm70U4B8GemmSpec {
+  template <typename Shape, typename ThreadMap, int GroupSize,
+            Sm70TileMode TileMode>
+  using IteratorB = Sm70U4B8IteratorB<Shape, ThreadMap, GroupSize, TileMode>;
+};
+
 template <int CtaM, int CtaN, int Warps, int GroupSize,
           Sm70TileMode TileMode>
-struct Sm70U4B8GemmTraits {
-  static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
-                "SM70 kU4B8 supports CTA_M in {32, 64, 128, 256}.");
-  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 kU4B8 supports CTA_N in {64, 128, 256}.");
-  static_assert(Warps == 4 || Warps == 8,
-                "SM70 kU4B8 supports 4 or 8 warps.");
-  using ElementA = cutlass::half_t;
-  using ElementB = cutlass::half_t;
-  using ElementOutput = cutlass::half_t;
-  using ElementAccumulator = float;
-  using LayoutA = cutlass::layout::RowMajor;
-  using LayoutB = cutlass::layout::RowMajor;
-  using LayoutC = cutlass::layout::RowMajor;
-  using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, kCtaK>;
-  using WarpShape = typename Sm70U4B8WarpShape<CtaM, CtaN, Warps>::Type;
-  static_assert(WarpShape::kM <= 64 && WarpShape::kN <= 64,
-                "SM70 kU4B8 keeps per-warp M/N no larger than 64.");
-  using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
-  using MmaCore = cutlass::gemm::threadblock::DefaultMmaCore<
-      ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
-      ElementB, LayoutB, ElementAccumulator, LayoutC,
-      cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
-  static_assert(MmaCore::kThreads == Warps * 32,
-                "SM70 kU4B8 launch threads must match CUTLASS warp count.");
-  using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
-      cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
-      ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
-      128 / cutlass::sizeof_bits<ElementA>::value>;
-  using IteratorB = Sm70U4B8IteratorB<
-      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
-      TileMode>;
-  using Mma = cutlass::gemm::threadblock::MmaPipelined<
-      ThreadblockShape, IteratorA, typename MmaCore::SmemIteratorA, IteratorB,
-      typename MmaCore::SmemIteratorB, ElementAccumulator, LayoutC,
-      typename MmaCore::MmaPolicy>;
-  using OutputOp = cutlass::epilogue::thread::LinearCombination<
-      ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value,
-      ElementAccumulator, ElementAccumulator>;
-  using ExpectedSmemLayoutB =
-      cutlass::layout::RowMajorVoltaTensorOpMultiplicandBCongruous<
-          cutlass::sizeof_bits<ElementB>::value>;
-  using ActualSmemLayoutB = typename Mma::SmemIteratorB::Layout;
-  static_assert(std::is_same<ActualSmemLayoutB, ExpectedSmemLayoutB>::value,
-                "kU4B8 B operand must be stored through CUTLASS' predefined "
-                "Volta B-congruous shared-memory layout.");
-  static int const kPartitionsK = ThreadblockShape::kK / WarpShape::kK;
-  using Epilogue =
-      typename cutlass::epilogue::threadblock::DefaultEpilogueVoltaTensorOp<
-          ThreadblockShape, typename Mma::Operator, kPartitionsK, OutputOp,
-          OutputOp::kCount>::Epilogue;
-
-  union SharedStorage {
-    typename Mma::SharedStorage main_loop;
-    typename Epilogue::SharedStorage epilogue;
-  };
-};
+using Sm70U4B8GemmTraits =
+    Sm70DenseGemmTraits<Sm70U4B8GemmSpec, CtaM, CtaN, Warps, GroupSize,
+                        TileMode>;
 
 template <int CtaM, int CtaN, int Warps, int GroupSize,
           Sm70TileMode TileMode>
@@ -680,71 +526,6 @@ void sm70_marlin_u4b8_gemm_kernel(
   epilogue(output_op, iterator_D, accumulators, iterator_C);
 }
 
-struct Sm70U4B8CtaGeometry {
-  int cta_m;
-  int cta_n;
-  int warps;
-};
-
-Sm70U4B8CtaGeometry parse_sm70_marlin_u4b8_cta_geometry() {
-  char const* env = std::getenv("SM70_MARLIN_U4B8_CTA");
-  if (env == nullptr || env[0] == '\0') {
-    return {kDefaultCtaM, kDefaultCtaN, kDefaultWarps};
-  }
-
-  std::string spec(env);
-  for (char& ch : spec) {
-    if (ch == 'x' || ch == 'X' || ch == '*' || ch == ',') {
-      ch = ' ';
-    }
-  }
-
-  int cta_m = 0;
-  int cta_n = 0;
-  int warps = 0;
-  std::string extra;
-  std::istringstream stream(spec);
-  TORCH_CHECK(
-      (stream >> cta_m >> cta_n >> warps) && !(stream >> extra),
-      "SM70_MARLIN_U4B8_CTA must use format CTA_MxCTA_NxWarps, for "
-      "example 128x256x8. Got: ",
-      env);
-  return {cta_m, cta_n, warps};
-}
-
-bool sm70_marlin_u4b8_cta_geometry_supported(
-    Sm70U4B8CtaGeometry geometry) {
-  int const cta_m = geometry.cta_m;
-  int const cta_n = geometry.cta_n;
-  int const warps = geometry.warps;
-  return (cta_m == 32 && cta_n == 128 && warps == 4) ||
-         (cta_m == 32 && cta_n == 256 && warps == 4) ||
-         (cta_m == 64 && cta_n == 64 && warps == 4) ||
-         (cta_m == 64 && cta_n == 128 && warps == 4) ||
-         (cta_m == 64 && cta_n == 128 && warps == 8) ||
-         (cta_m == 64 && cta_n == 256 && warps == 4) ||
-         (cta_m == 64 && cta_n == 256 && warps == 8) ||
-         (cta_m == 128 && cta_n == 64 && warps == 4) ||
-         (cta_m == 128 && cta_n == 64 && warps == 8) ||
-         (cta_m == 128 && cta_n == 128 && warps == 4) ||
-         (cta_m == 128 && cta_n == 128 && warps == 8) ||
-         (cta_m == 128 && cta_n == 256 && warps == 8) ||
-         (cta_m == 256 && cta_n == 64 && warps == 4) ||
-         (cta_m == 256 && cta_n == 64 && warps == 8) ||
-         (cta_m == 256 && cta_n == 128 && warps == 8);
-}
-
-void check_sm70_marlin_u4b8_cta_geometry(Sm70U4B8CtaGeometry geometry) {
-  TORCH_CHECK(
-      sm70_marlin_u4b8_cta_geometry_supported(geometry),
-      "Unsupported SM70_MARLIN_U4B8_CTA=", geometry.cta_m, "x",
-      geometry.cta_n, "x", geometry.warps,
-      ". Supported geometries are 32x128x4, 32x256x4, 64x64x4, "
-      "64x128x4, 64x128x8, 64x256x4, 64x256x8, 128x64x4, "
-      "128x64x8, 128x128x4, 128x128x8, 128x256x8, 256x64x4, "
-      "256x64x8, and 256x128x8.");
-}
-
 }  // namespace
 
 template <int CtaM, int CtaN, int Warps, int GroupSize,
@@ -754,17 +535,11 @@ torch::Tensor launch_sm70_marlin_u4b8_gemm(
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k) {
   auto kernel =
       sm70_marlin_u4b8_gemm_kernel<CtaM, CtaN, Warps, GroupSize, TileMode>;
-  size_t smem_bytes =
-      sizeof(typename Sm70U4B8GemmTraits<
-             CtaM, CtaN, Warps, GroupSize, TileMode>::SharedStorage);
-  if (smem_bytes >= (48u << 10)) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem_bytes)));
-  }
+  using SharedStorage = typename Sm70U4B8GemmTraits<
+      CtaM, CtaN, Warps, GroupSize, TileMode>::SharedStorage;
+  size_t smem_bytes = configure_dynamic_smem<SharedStorage>(kernel);
 
-  dim3 grid(static_cast<unsigned>((size_m + CtaM - 1) / CtaM),
-            static_cast<unsigned>((size_n + CtaN - 1) / CtaN));
+  dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
@@ -779,66 +554,23 @@ torch::Tensor launch_sm70_marlin_u4b8_gemm(
   return c;
 }
 
-template <int CtaM, int CtaN, int Warps, Sm70TileMode TileMode>
-torch::Tensor launch_sm70_marlin_u4b8_gemm_group_size(
-    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
-    int64_t group_size) {
-  switch (group_size) {
-    case -1:
-      return launch_sm70_marlin_u4b8_gemm<CtaM, CtaN, Warps, -1, TileMode>(
-          a, c, b_q_weight, b_scales, size_m, size_n, size_k);
-    case 32:
-      return launch_sm70_marlin_u4b8_gemm<CtaM, CtaN, Warps, 32, TileMode>(
-          a, c, b_q_weight, b_scales, size_m, size_n, size_k);
-    case 64:
-      return launch_sm70_marlin_u4b8_gemm<CtaM, CtaN, Warps, 64, TileMode>(
-          a, c, b_q_weight, b_scales, size_m, size_n, size_k);
-    case 128:
-      return launch_sm70_marlin_u4b8_gemm<CtaM, CtaN, Warps, 128, TileMode>(
-          a, c, b_q_weight, b_scales, size_m, size_n, size_k);
-    default:
-      TORCH_CHECK(false,
-                  "SM70 CUTLASS uint4b8 prototype supports only group_size "
-                  "-1, 32, 64, or 128. Got ",
-                  group_size);
-  }
-  return c;
-}
+struct Sm70U4B8Launcher {
+  torch::Tensor& a;
+  torch::Tensor& c;
+  torch::Tensor& b_q_weight;
+  torch::Tensor& b_scales;
+  int64_t size_m;
+  int64_t size_n;
+  int64_t size_k;
 
-template <int CtaM, int CtaN, int Warps>
-torch::Tensor launch_sm70_marlin_u4b8_gemm_geometry(
-    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
-    int64_t group_size) {
-  bool const residue_k = size_k % kCtaK != 0;
-  bool const residue_n = size_n % CtaN != 0 || size_n % kMacroN != 0;
-  if (!residue_k && !residue_n) {
-    return launch_sm70_marlin_u4b8_gemm_group_size<
-        CtaM, CtaN, Warps, Sm70TileMode::FullTile>(
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
+  template <int CtaM, int CtaN, int Warps, int GroupSize,
+            Sm70TileMode TileMode>
+  torch::Tensor operator()() const {
+    return launch_sm70_marlin_u4b8_gemm<CtaM, CtaN, Warps, GroupSize,
+                                        TileMode>(
+        a, c, b_q_weight, b_scales, size_m, size_n, size_k);
   }
-  if (!residue_k) {
-    return launch_sm70_marlin_u4b8_gemm_group_size<
-        CtaM, CtaN, Warps, Sm70TileMode::ResidueNOnly>(
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
-  }
-  if (!residue_n) {
-    return launch_sm70_marlin_u4b8_gemm_group_size<
-        CtaM, CtaN, Warps, Sm70TileMode::ResidueKOnly>(
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
-  }
-  return launch_sm70_marlin_u4b8_gemm_group_size<
-      CtaM, CtaN, Warps, Sm70TileMode::ResidueKAndN>(
-      a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);
-}
-
-#define DISPATCH_SM70_U4B8_CTA(CM, CN, W)                                \
-  if (geometry.cta_m == CM && geometry.cta_n == CN &&                     \
-      geometry.warps == W) {                                              \
-    return launch_sm70_marlin_u4b8_gemm_geometry<CM, CN, W>(              \
-        a, c, b_q_weight, b_scales, size_m, size_n, size_k, group_size);   \
-  }
+};
 
 torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
                                     torch::Tensor& b_q_weight,
@@ -847,27 +579,12 @@ torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
                                     int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  Sm70U4B8CtaGeometry const geometry =
-      parse_sm70_marlin_u4b8_cta_geometry();
-  check_sm70_marlin_u4b8_cta_geometry(geometry);
-
-  DISPATCH_SM70_U4B8_CTA(32, 128, 4)
-  DISPATCH_SM70_U4B8_CTA(32, 256, 4)
-  DISPATCH_SM70_U4B8_CTA(64, 64, 4)
-  DISPATCH_SM70_U4B8_CTA(64, 128, 4)
-  DISPATCH_SM70_U4B8_CTA(64, 128, 8)
-  DISPATCH_SM70_U4B8_CTA(64, 256, 4)
-  DISPATCH_SM70_U4B8_CTA(64, 256, 8)
-  DISPATCH_SM70_U4B8_CTA(128, 64, 4)
-  DISPATCH_SM70_U4B8_CTA(128, 64, 8)
-  DISPATCH_SM70_U4B8_CTA(128, 128, 4)
-  DISPATCH_SM70_U4B8_CTA(128, 128, 8)
-  DISPATCH_SM70_U4B8_CTA(128, 256, 8)
-  DISPATCH_SM70_U4B8_CTA(256, 64, 4)
-  DISPATCH_SM70_U4B8_CTA(256, 64, 8)
-  DISPATCH_SM70_U4B8_CTA(256, 128, 8)
-
-  TORCH_CHECK(false, "Unreachable SM70 uint4b8 CTA geometry dispatch.");
+  char const* env_name = "SM70_MARLIN_U4B8_CTA";
+  Sm70DenseCtaGeometry const geometry =
+      parse_sm70_dense_cta_geometry(env_name);
+  check_sm70_dense_cta_geometry(env_name, geometry);
+  Sm70U4B8Launcher const launcher{
+      a, c, b_q_weight, b_scales, size_m, size_n, size_k};
+  return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,
+                           "uint4b8");
 }
-
-#undef DISPATCH_SM70_U4B8_CTA
