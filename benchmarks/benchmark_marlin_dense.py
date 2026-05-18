@@ -38,6 +38,7 @@ from marlin_v100 import dense, ops
 from tests.helpers import (
     marlin_make_workspace_new,
     marlin_quantize,
+    marlin_quantize_mxfp4,
     marlin_quantize_nvfp4,
     marlin_quantize_uint4_zp_bias,
     marlin_quantize_uint8_zp_bias,
@@ -51,6 +52,7 @@ _DENSE_QUANT_TYPE_CANDIDATES = {
     "uint8b128": scalar_types.uint8b128,
     "fp8": scalar_types.float8_e4m3fn,
     "nvfp4": scalar_types.float4_e2m1f,
+    "mxfp4": scalar_types.float4_e2m1f,
 }
 QUANT_TYPES = {
     name: _DENSE_QUANT_TYPE_CANDIDATES[name]
@@ -142,6 +144,14 @@ def _is_supported_dense_benchmark_case(
             and size_k % 32 == 0
             and size_n % 64 == 0
         )
+    if quant_name == "mxfp4":
+        return (
+            group_size == 32
+            and not act_order
+            and is_k_full
+            and size_k % 32 == 0
+            and size_n % 64 == 0
+        )
     return True
 
 
@@ -182,7 +192,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Group sizes to benchmark for the current source target "
             f"({source_target_label()}; supported defaults={list(support.dense_group_sizes)}, "
-            "plus nvfp4-only 16)."
+            "plus nvfp4-only 16; mxfp4 uses 32)."
         ),
     )
     parser.add_argument(
@@ -269,6 +279,11 @@ def run_case(
     elif quant_name == "nvfp4":
         weight_ref, q_weight, scales, global_scale, g_idx, sort_indices, _ = (
             marlin_quantize_nvfp4(weight, group_size)
+        )
+    elif quant_name == "mxfp4":
+        weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize_mxfp4(
+            weight,
+            group_size,
         )
     else:
         weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(

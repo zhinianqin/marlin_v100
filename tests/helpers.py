@@ -54,6 +54,7 @@ class scalar_types:
     uint8b128 = ScalarType(0, 8, False, 128)
     float4_e2m1f = ScalarType(2, 1, True, 0, True, 0)
     float8_e4m3fn = ScalarType(4, 3, True, 0, True, 2)
+    float8_e8m0fnu = ScalarType(8, 0, False, 0, True, 2)
 
 
 _REPACK_IMPL_CASES = (
@@ -486,6 +487,10 @@ def _preconvert_nvfp4_global_scale(
     return (global_scale.to(torch.float32) * (128.0 / scale_factor)).reshape(1).contiguous()
 
 
+def _preconvert_mxfp4_scales_to_fp16(fp8_scales: torch.Tensor) -> torch.Tensor:
+    return fp8_scales.to(torch.float32).to(torch.float16)
+
+
 def _quantize_nvfp4_weight(
     weight: torch.Tensor,
     group_size: int,
@@ -510,6 +515,39 @@ def _quantize_nvfp4_weight(
     repeated_scales = effective_scales.repeat_interleave(group_size, dim=0)
     dequantized = (fp4_values[q_weight.to(torch.long)] * repeated_scales).to(torch.float16)
     return q_weight, fp8_scales, global_scale, dequantized, 1.0
+
+
+def _quantize_mxfp4_weight(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if group_size != 32:
+        raise ValueError("SM70 MXFP4 dense helper supports only group_size=32.")
+
+    size_k, size_n = weight.shape
+    if size_k % group_size != 0:
+        raise ValueError(f"group_size={group_size} must divide size_k={size_k}")
+
+    groups = size_k // group_size
+    reshaped = weight.to(torch.float32).reshape(groups, group_size, size_n)
+    max_abs = reshaped.abs().amax(dim=1)
+    scale_inputs = torch.where(
+        max_abs > 0,
+        (max_abs / 6.0).clamp_min(2.0**-127),
+        torch.ones_like(max_abs),
+    )
+    scale_exponents = torch.ceil(torch.log2(scale_inputs)).clamp(-127, 127)
+    power_of_two_scales = torch.pow(torch.full_like(scale_exponents, 2.0), scale_exponents)
+    fp8_scales = power_of_two_scales.to(torch.float8_e8m0fnu)
+    effective_scales = _preconvert_mxfp4_scales_to_fp16(fp8_scales).to(torch.float32)
+
+    q_weight = _quantize_to_fp4_e2m1(
+        reshaped / effective_scales.unsqueeze(1).clamp_min(1e-12)
+    ).reshape(size_k, size_n)
+    fp4_values = _fp4_e2m1_values(weight.device)
+    repeated_scales = effective_scales.repeat_interleave(group_size, dim=0)
+    dequantized = (fp4_values[q_weight.to(torch.long)] * repeated_scales).to(torch.float16)
+    return q_weight, fp8_scales, dequantized
 
 
 def _quantize_fp8_weight(
@@ -673,6 +711,32 @@ def marlin_quantize_nvfp4(
     )
 
 
+def marlin_quantize_mxfp4(
+    weight: torch.Tensor,
+    group_size: int,
+    act_order: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if act_order:
+        raise ValueError("SM70 MXFP4 dense helper does not support act_order.")
+    if group_size != 32:
+        raise ValueError("SM70 MXFP4 dense helper supports only group_size=32.")
+
+    size_k, size_n = weight.shape
+    q_weight, fp8_scales, dequantized = _quantize_mxfp4_weight(weight, group_size)
+    marlin_q_weight = fp4_e2m1_weight_to_marlin_weight(q_weight)
+    marlin_scales = dense.marlin_permute_scales(
+        _preconvert_mxfp4_scales_to_fp16(fp8_scales),
+        size_k,
+        size_n,
+        group_size,
+        is_a_8bit=False,
+    )
+    g_idx = marlin_make_empty_g_idx(weight.device)
+    sort_indices = torch.empty(0, dtype=torch.int, device=weight.device)
+    rand_perm = torch.arange(size_k, dtype=torch.int, device=weight.device)
+    return dequantized, marlin_q_weight, marlin_scales, g_idx, sort_indices, rand_perm
+
+
 def marlin_dequantize(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
@@ -683,7 +747,10 @@ def marlin_dequantize(
     perm: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if _is_nvfp4_quant_type(quant_type):
-        raise ValueError("Use marlin_dequantize_nvfp4 for preconverted NVFP4 weights.")
+        raise ValueError(
+            "Use marlin_dequantize_nvfp4 or marlin_dequantize_mxfp4 for "
+            "preconverted FP4 weights."
+        )
     if quant_type not in _supported_quant_types() and not _is_fp8_quant_type(quant_type):
         raise ValueError("Local marlin_v100 helper currently supports uint4b8, uint8b128, and fp8 only.")
     unpacked = marlin_unpack(q_weight, size_k, size_n, quant_type).to(torch.float32)
@@ -736,6 +803,29 @@ def marlin_dequantize_nvfp4(
         * (expanded_scales / 128.0)
         * (global_scale.reshape(-1)[0].to(torch.float32) / 128.0)
     )
+    return dequantized.to(torch.float16)
+
+
+def marlin_dequantize_mxfp4(
+    q_weight: torch.Tensor,
+    scales: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+) -> torch.Tensor:
+    if group_size != 32:
+        raise ValueError("SM70 MXFP4 dense helper supports only group_size=32.")
+    unpacked = marlin_unpack(q_weight, size_k, size_n, scalar_types.float4_e2m1f)
+    fp4_values = _fp4_e2m1_values(q_weight.device)
+    unpermuted_scales = marlin_unpermute_scales(
+        scales,
+        size_k,
+        size_n,
+        group_size,
+        scalar_types.float4_e2m1f,
+    ).to(torch.float32)
+    expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
+    dequantized = fp4_values[unpacked.to(torch.long)] * expanded_scales
     return dequantized.to(torch.float16)
 
 

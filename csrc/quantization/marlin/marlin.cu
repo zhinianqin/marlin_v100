@@ -59,6 +59,11 @@ torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      torch::Tensor& global_scale,
                                      int64_t size_m, int64_t size_n,
                                      int64_t size_k, int64_t group_size);
+torch::Tensor sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
+                                     torch::Tensor& b_q_weight,
+                                     torch::Tensor& b_scales, int64_t size_m,
+                                     int64_t size_n, int64_t size_k,
+                                     int64_t group_size);
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -606,10 +611,12 @@ torch::Tensor marlin_gemm(
   if (b_type_id == vllm::kFE2M1f.id()) {
     if (b_scales.scalar_type() == at::ScalarType::Half) {
       s_type_id = vllm::kFloat16.id();
+    } else if (b_scales.scalar_type() == at::ScalarType::BFloat16) {
+      s_type_id = vllm::kBFloat16.id();
     } else {
       TORCH_CHECK(false,
                   "When b_type = float4_e2m1f on the SM70 build, b_scales "
-                  "must be preconverted float16 NVFP4 scales. Raw "
+                  "must be preconverted float16 NVFP4/MXFP4 scales. Raw "
                   "float8_e4m3fn or float8_e8m0fnu scales are not supported "
                   "by the direct SM70 kernel.");
     }
@@ -631,7 +638,7 @@ torch::Tensor marlin_gemm(
                   b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
               "SM70 CUTLASS prototype currently implements only uint4, "
               "uint4b8, uint8, uint8b128, fp8_e4m3fn, and preconverted "
-              "nvfp4 dense weights.");
+              "nvfp4/mxfp4 dense weights.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -801,9 +808,6 @@ torch::Tensor marlin_gemm(
                 "value.");
   } else {
     global_scale = torch::empty({0}, options_fp32);
-    TORCH_CHECK(
-        !(b_type == vllm::kFE2M1f),
-        "SM70 CUTLASS nvfp4 prototype requires fp32 global_scale.");
   }
 
   bool has_bias = b_bias_or_none.has_value();
@@ -947,18 +951,25 @@ torch::Tensor marlin_gemm(
   if (b_type == vllm::kFE2M1f) {
     TORCH_CHECK(
         size_k % 32 == 0,
-        "SM70 CUTLASS nvfp4 dense prototype requires size_k % 32 == 0.");
-    TORCH_CHECK(group_size == 16,
-                "SM70 CUTLASS nvfp4 prototype supports only group_size 16. "
-                "Got ",
-                group_size);
-    TORCH_CHECK(global_scale.numel() == 1,
-                "SM70 CUTLASS nvfp4 prototype requires fp32 global_scale.");
+        "SM70 CUTLASS fp4 dense prototype requires size_k % 32 == 0.");
     TORCH_CHECK(!has_zp_bias && !use_zp_bias,
-                "SM70 CUTLASS nvfp4 prototype does not support zero-point "
+                "SM70 CUTLASS fp4 prototype does not support zero-point "
                 "bias metadata.");
-    return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales, global_scale,
-                                  size_m, size_n, size_k, group_size);
+    if (global_scale.numel() == 1) {
+      TORCH_CHECK(group_size == 16,
+                  "SM70 CUTLASS nvfp4 prototype supports only group_size 16. "
+                  "Got ",
+                  group_size);
+      return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales, global_scale,
+                                    size_m, size_n, size_k, group_size);
+    }
+
+    TORCH_CHECK(group_size == 32,
+                "SM70 CUTLASS mxfp4 prototype supports only group_size 32 "
+                "when global_scale is not provided. Got ",
+                group_size);
+    return sm70_marlin_mxfp4_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
+                                  size_k, group_size);
   }
 
   TORCH_CHECK(!has_zp_bias && !use_zp_bias,

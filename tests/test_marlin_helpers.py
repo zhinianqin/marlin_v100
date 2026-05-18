@@ -17,6 +17,7 @@ from tests.helpers import (
     fp4_e2m1_weight_to_marlin_weight,
     fp8_weight_to_marlin_weight,
     make_moe_model_like_inputs,
+    marlin_dequantize_mxfp4,
     marlin_dequantize_nvfp4,
     marlin_dequantize_uint4_zp,
     marlin_dequantize_uint4_zp_bias,
@@ -25,6 +26,7 @@ from tests.helpers import (
     marlin_unpack,
     marlin_quantize,
     marlin_quantize_fp8,
+    marlin_quantize_mxfp4,
     marlin_quantize_nvfp4,
     marlin_quantize_experts_uint4_zp_with_metadata,
     marlin_quantize_experts,
@@ -73,6 +75,12 @@ def test_nvfp4_scalar_type_id_matches_vllm_encoding():
 
     assert scalar_types.float4_e2m1f.id == expected_id
     assert quant_type_name_from_id(scalar_types.float4_e2m1f.id) == "nvfp4"
+
+
+def test_mxfp4_scale_scalar_type_id_matches_vllm_encoding():
+    expected_id = (8 << 0) | (1 << 49) | (2 << 50)
+
+    assert scalar_types.float8_e8m0fnu.id == expected_id
 
 
 @pytest.mark.parametrize("size_n", (64, 128, 256))
@@ -170,6 +178,49 @@ def test_marlin_quantize_nvfp4_uses_fp16_scales_and_global_scale():
     assert (scales > 1.0).all()
     torch.testing.assert_close(dequantized, weight_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(weight_ref, weight, atol=5.0e-1, rtol=5.0e-1)
+
+
+def test_marlin_quantize_mxfp4_uses_fp16_preconverted_e8m0_scales():
+    torch.manual_seed(0)
+    weight = torch.randn((256, 128), dtype=torch.float16)
+
+    weight_ref, q_weight, scales, g_idx, sort_indices, rand_perm = marlin_quantize_mxfp4(
+        weight,
+        32,
+    )
+    dequantized = marlin_dequantize_mxfp4(
+        q_weight,
+        scales,
+        size_k=weight.shape[0],
+        size_n=weight.shape[1],
+        group_size=32,
+    )
+
+    assert scales.shape == (weight.shape[0] // 32, weight.shape[1])
+    assert scales.dtype == torch.float16
+    assert g_idx.numel() == 0
+    assert sort_indices.numel() == 0
+    assert torch.equal(rand_perm, torch.arange(weight.shape[0], dtype=torch.int))
+    assert torch.isfinite(weight_ref).all()
+    assert torch.isfinite(dequantized).all()
+    assert (scales > 0.0).all()
+    torch.testing.assert_close(
+        scales.to(torch.float8_e8m0fnu).to(torch.float16),
+        scales,
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(dequantized, weight_ref, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(weight_ref, weight, atol=7.5e-1, rtol=7.5e-1)
+
+
+def test_marlin_quantize_mxfp4_rejects_unsupported_metadata():
+    weight = torch.randn((256, 128), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="group_size=32"):
+        marlin_quantize_mxfp4(weight, 16)
+    with pytest.raises(ValueError, match="does not support act_order"):
+        marlin_quantize_mxfp4(weight, 32, act_order=True)
 
 
 def _require_repack_cuda() -> None:
