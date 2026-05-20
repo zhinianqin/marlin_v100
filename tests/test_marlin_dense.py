@@ -61,7 +61,7 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 outputs\."
     rf"|{source_target_label()} build only supports float16 scales\."
 )
-_FULL_N_TILE_ERROR = "requires full-N tiles"
+_N_TILE_ALIGNMENT_ERROR = "requires N alignment for macro-N qweight layout"
 
 
 def _require_marlin_cuda() -> None:
@@ -655,11 +655,11 @@ def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_n_rejects_full_tile_contract(
+def test_marlin_dense_uint4b8_residue_n_rejects_n_tile_alignment_contract(
     group_size: int,
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+    with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
         _run_dense_accuracy_case(
             scalar_types.uint4b8,
             repack_impl=repack_impl,
@@ -675,7 +675,7 @@ def test_marlin_dense_uint4b8_residue_n_rejects_full_tile_contract(
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_k_single_group_rejects_full_tile_contract(
+def test_marlin_dense_uint4b8_residue_k_single_group_rejects_k_tile_alignment_contract(
     repack_impl: str,
 ):
     with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
@@ -694,7 +694,7 @@ def test_marlin_dense_uint4b8_residue_k_single_group_rejects_full_tile_contract(
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_k_and_n_single_group_rejects_full_tile_contract(
+def test_marlin_dense_uint4b8_residue_k_and_n_single_group_rejects_k_tile_alignment_contract(
     repack_impl: str,
 ):
     with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
@@ -874,10 +874,10 @@ def test_marlin_dense_uint4_zp_small_tile_matches_reference(repack_impl: str):
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4_zp_residue_n_rejects_full_tile_contract(
+def test_marlin_dense_uint4_zp_residue_n_rejects_n_tile_alignment_contract(
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+    with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl=repack_impl,
             group_size=128,
@@ -949,10 +949,10 @@ def test_marlin_dense_uint8_zp_bias_small_tile_matches_reference(repack_impl: st
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint8_zp_bias_residue_n_rejects_full_tile_contract(
+def test_marlin_dense_uint8_zp_bias_residue_n_rejects_n_tile_alignment_contract(
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+    with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
         _run_dense_uint8_zp_bias_accuracy_case(
             repack_impl=repack_impl,
             group_size=128,
@@ -1413,10 +1413,10 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
 
     @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-    def test_marlin_dense_uint8b128_residue_n_rejects_full_tile_contract(
+    def test_marlin_dense_uint8b128_residue_n_rejects_n_tile_alignment_contract(
         repack_impl: str,
     ):
-        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
             _run_dense_accuracy_case(
                 scalar_types.uint8b128,
                 repack_impl=repack_impl,
@@ -1476,8 +1476,8 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_fp8_weight_accuracy(group_size: int):
         _run_fp8_dense_accuracy_case(group_size=group_size)
 
-    def test_marlin_dense_fp8_weight_residue_n_rejects_full_tile_contract():
-        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+    def test_marlin_dense_fp8_weight_residue_n_rejects_n_tile_alignment_contract():
+        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
             _run_fp8_dense_accuracy_case(
                 group_size=128,
                 size_m=8,
@@ -1830,8 +1830,8 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_nvfp4_weight_accuracy():
         _run_nvfp4_dense_accuracy_case()
 
-    def test_marlin_dense_nvfp4_weight_residue_n_rejects_full_tile_contract():
-        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+    def test_marlin_dense_nvfp4_weight_residue_n_rejects_n_tile_alignment_contract():
+        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
             _run_nvfp4_dense_accuracy_case(
                 size_m=8,
                 size_k=256,
@@ -2078,8 +2078,8 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_mxfp4_weight_accuracy():
         _run_mxfp4_dense_accuracy_case()
 
-    def test_marlin_dense_mxfp4_weight_residue_n_rejects_full_tile_contract():
-        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+    def test_marlin_dense_mxfp4_weight_residue_n_rejects_n_tile_alignment_contract():
+        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
             _run_mxfp4_dense_accuracy_case(
                 size_m=8,
                 size_k=256,

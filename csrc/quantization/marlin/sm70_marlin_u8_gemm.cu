@@ -26,7 +26,7 @@
 using marlin::sm70_dense::Sm70DenseCtaGeometry;
 using marlin::sm70_dense::Sm70DenseGemmTraits;
 using marlin::sm70_dense::check_sm70_dense_cta_geometry;
-using marlin::sm70_dense::check_sm70_dense_full_n_tile;
+using marlin::sm70_dense::check_sm70_dense_n_tile_alignment;
 using marlin::sm70_dense::configure_dynamic_smem;
 using marlin::sm70_dense::cta_grid;
 using marlin::sm70_dense::dispatch_geometry;
@@ -37,8 +37,8 @@ using marlin::sm70_dense::kQuantTileK;
 using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::parse_sm70_dense_cta_geometry;
 using marlin::sm70_dense::qword_from_vector;
-using marlin::sm70_dense::u8_full_tile_qweight_offset_from_logical;
-using marlin::sm70_dense::u8_full_tile_qweight_word_stride_from_logical;
+using marlin::sm70_dense::u8_macro_n_qweight_offset_from_logical;
+using marlin::sm70_dense::u8_macro_n_qweight_word_stride_from_logical;
 
 namespace {
 
@@ -171,14 +171,14 @@ class Sm70U8ZpBiasIteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u8_full_tile_qweight_offset_from_logical(params.size_n, logical_k,
+    return u8_macro_n_qweight_offset_from_logical(params.size_n, logical_k,
                                                      logical_n);
   }
 
   CUTLASS_DEVICE
   static int qweight_word_stride_from_logical(Params const&,
                                               int logical_n) {
-    return u8_full_tile_qweight_word_stride_from_logical(logical_n);
+    return u8_macro_n_qweight_word_stride_from_logical(logical_n);
   }
 
   CUTLASS_DEVICE
@@ -554,7 +554,7 @@ torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
   Sm70DenseCtaGeometry const geometry =
       parse_sm70_dense_cta_geometry(env_name);
   check_sm70_dense_cta_geometry(env_name, geometry);
-  check_sm70_dense_full_n_tile(env_name, geometry, size_n);
+  check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   Sm70U8Launcher const launcher{
       a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k};
   return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,

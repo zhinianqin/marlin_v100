@@ -18,8 +18,8 @@ subtile_count = min(size_n / 64 - macro_first_n_tile, 4)
 ptxas 现象与此吻合：`uint8 128x256x8` positive group kernel 从 FullTile
 baseline 的 `254 regs, 0 spill` 变成 `988b62b` 后的 `255 regs, 0 spill`。
 
-本次修复恢复 full-tile 专用编译期常量 helper，不恢复 residue N/K 的运行
-支持，也不重新引入 `Sm70TileMode` / `TileMode_` / `kResidue*` /
+本次修复恢复 macro-N qweight layout 的编译期常量 helper，不恢复 residue N/K
+的运行支持，也不重新引入 `Sm70TileMode` / `TileMode_` / `kResidue*` /
 `load_full_tile` / `load_residue_tile`。
 
 ## 环境
@@ -39,23 +39,23 @@ baseline 的 `254 regs, 0 spill` 变成 `988b62b` 后的 `255 regs, 0 spill`。
 
 核心改动在 `csrc/quantization/marlin/sm70_dense_iterator_utils.cuh`：
 
-- 新增 `u4_full_tile_qweight_offset_from_logical(...)`
-- 新增 `u8_full_tile_qweight_offset_from_logical(...)`
-- 新增 `u8_full_tile_qweight_word_stride_from_logical(...)`
-- full-tile offset 中固定使用 `local_word * kMacroNTiles`
+- 新增 `u4_macro_n_qweight_offset_from_logical(...)`
+- 新增 `u8_macro_n_qweight_offset_from_logical(...)`
+- 新增 `u8_macro_n_qweight_word_stride_from_logical(...)`
+- macro-N qweight offset 中固定使用 `local_word * kMacroNTiles`
 - 8-bit word stride helper 直接返回 `kMacroNTiles`
 
-所有 SM70 dense iterator 已切到这些 full-tile helper：
+所有 SM70 dense iterator 已切到这些 macro-N qweight helper：
 
 | quant | qweight helper |
 |---|---|
-| `uint4` | `u4_full_tile_qweight_offset_from_logical` |
-| `uint4b8` | `u4_full_tile_qweight_offset_from_logical` |
-| `nvfp4` | `u4_full_tile_qweight_offset_from_logical` |
-| `mxfp4` | `u4_full_tile_qweight_offset_from_logical` |
-| `uint8` | `u8_full_tile_qweight_offset_from_logical` + constant stride |
-| `uint8b128` | `u8_full_tile_qweight_offset_from_logical` + constant stride |
-| `fp8` | `u8_full_tile_qweight_offset_from_logical` + constant stride |
+| `uint4` | `u4_macro_n_qweight_offset_from_logical` |
+| `uint4b8` | `u4_macro_n_qweight_offset_from_logical` |
+| `nvfp4` | `u4_macro_n_qweight_offset_from_logical` |
+| `mxfp4` | `u4_macro_n_qweight_offset_from_logical` |
+| `uint8` | `u8_macro_n_qweight_offset_from_logical` + constant stride |
+| `uint8b128` | `u8_macro_n_qweight_offset_from_logical` + constant stride |
+| `fp8` | `u8_macro_n_qweight_offset_from_logical` + constant stride |
 
 同时删除 residue K 删除后仍残留在 iterator 状态里的字段：
 
@@ -192,5 +192,5 @@ PYTHONPATH=$PWD/python \
 
 - 本次没有因为 benchmark 波动回滚 `988b62b`。
 - 本次没有恢复 residue N/K 的运行语义。
-- 本次只修复 full-tile hot path 的非等价实现细节：恢复 qweight macro-N
+- 本次只修复 macro-N qweight hot path 的非等价实现细节：恢复 qweight macro-N
   编译期常量路径，并移除已经无语义作用的 iterator 状态。

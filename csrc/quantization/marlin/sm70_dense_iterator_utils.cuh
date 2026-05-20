@@ -19,7 +19,7 @@ CUTLASS_DEVICE uint32_t qword_from_vector(uint2 const& words, int c) {
   return words_ptr[c];
 }
 
-CUTLASS_DEVICE int u4_full_tile_qweight_offset_from_logical(int size_n,
+CUTLASS_DEVICE int u4_macro_n_qweight_offset_from_logical(int size_n,
                                                             int logical_k,
                                                             int logical_n) {
   int const k_tile = logical_k / kQuantTileK;
@@ -36,7 +36,7 @@ CUTLASS_DEVICE int u4_full_tile_qweight_offset_from_logical(int size_n,
          local_word * kMacroNTiles + subtile;
 }
 
-CUTLASS_DEVICE int u8_full_tile_qweight_offset_from_logical(int size_n,
+CUTLASS_DEVICE int u8_macro_n_qweight_offset_from_logical(int size_n,
                                                             int logical_k,
                                                             int logical_n) {
   int const k_tile = logical_k / kQuantTileK;
@@ -53,7 +53,7 @@ CUTLASS_DEVICE int u8_full_tile_qweight_offset_from_logical(int size_n,
          local_word * kMacroNTiles + subtile;
 }
 
-CUTLASS_DEVICE int u8_full_tile_qweight_word_stride_from_logical(
+CUTLASS_DEVICE int u8_macro_n_qweight_word_stride_from_logical(
     int logical_n) {
   (void)logical_n;
   return kMacroNTiles;

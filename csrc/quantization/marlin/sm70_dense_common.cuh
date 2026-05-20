@@ -165,11 +165,12 @@ inline void check_sm70_dense_cta_geometry(char const* env_name,
               kSupportedSm70DenseCtaGeometries, ".");
 }
 
-inline void check_sm70_dense_full_n_tile(char const* env_name,
-                                         Sm70DenseCtaGeometry geometry,
-                                         int64_t size_n) {
+inline void check_sm70_dense_n_tile_alignment(char const* env_name,
+                                               Sm70DenseCtaGeometry geometry,
+                                               int64_t size_n) {
   TORCH_CHECK(size_n % geometry.cta_n == 0 && size_n % kMacroN == 0,
-              "SM70 CUTLASS dense prototype requires full-N tiles for ",
+              "SM70 CUTLASS dense prototype requires N alignment for macro-N "
+              "qweight layout for ",
               env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
               geometry.warps, ". size_n must be divisible by both CTA_N and ",
               kMacroN, ". Got size_n = ", size_n, ".");
