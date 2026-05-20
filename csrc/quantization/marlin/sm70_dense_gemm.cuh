@@ -19,8 +19,7 @@
 
 namespace marlin::sm70_dense {
 
-template <typename Spec, int CtaM, int CtaN, int Warps, int GroupSize,
-          Sm70TileMode TileMode>
+template <typename Spec, int CtaM, int CtaN, int Warps, int GroupSize>
 struct Sm70DenseGemmTraits {
   static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
                 "SM70 dense supports CTA_M in {32, 64, 128, 256}.");
@@ -51,8 +50,7 @@ struct Sm70DenseGemmTraits {
       ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
       128 / cutlass::sizeof_bits<ElementA>::value>;
   using IteratorB = typename Spec::template IteratorB<
-      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
-      TileMode>;
+      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize>;
   using Mma = cutlass::gemm::threadblock::MmaPipelined<
       ThreadblockShape, IteratorA, typename MmaCore::SmemIteratorA, IteratorB,
       typename MmaCore::SmemIteratorB, ElementAccumulator, LayoutC,
@@ -95,20 +93,19 @@ inline dim3 cta_grid(int64_t size_m, int64_t size_n, int cta_m, int cta_n) {
               static_cast<unsigned>((size_n + cta_n - 1) / cta_n));
 }
 
-template <int CtaM, int CtaN, int Warps, Sm70TileMode TileMode,
-          typename Launcher>
+template <int CtaM, int CtaN, int Warps, typename Launcher>
 torch::Tensor dispatch_group_size(Launcher const& launcher,
                                   int64_t group_size,
                                   char const* quant_name) {
   switch (group_size) {
     case -1:
-      return launcher.template operator()<CtaM, CtaN, Warps, -1, TileMode>();
+      return launcher.template operator()<CtaM, CtaN, Warps, -1>();
     case 32:
-      return launcher.template operator()<CtaM, CtaN, Warps, 32, TileMode>();
+      return launcher.template operator()<CtaM, CtaN, Warps, 32>();
     case 64:
-      return launcher.template operator()<CtaM, CtaN, Warps, 64, TileMode>();
+      return launcher.template operator()<CtaM, CtaN, Warps, 64>();
     case 128:
-      return launcher.template operator()<CtaM, CtaN, Warps, 128, TileMode>();
+      return launcher.template operator()<CtaM, CtaN, Warps, 128>();
     default:
       TORCH_CHECK(false, "SM70 CUTLASS ", quant_name,
                   " prototype supports only group_size -1, 32, 64, or 128. "
@@ -118,39 +115,17 @@ torch::Tensor dispatch_group_size(Launcher const& launcher,
   return torch::Tensor();
 }
 
-template <int CtaM, int CtaN, int Warps, typename Launcher>
-torch::Tensor dispatch_tile_mode(Launcher const& launcher, int64_t size_n,
-                                 int64_t size_k, int64_t group_size,
-                                 char const* quant_name) {
-  bool const residue_k = size_k % kCtaK != 0;
-  bool const residue_n = size_n % CtaN != 0 || size_n % kMacroN != 0;
-  if (!residue_k && !residue_n) {
-    return dispatch_group_size<CtaM, CtaN, Warps, Sm70TileMode::FullTile>(
-        launcher, group_size, quant_name);
-  }
-  if (!residue_k) {
-    return dispatch_group_size<CtaM, CtaN, Warps, Sm70TileMode::ResidueNOnly>(
-        launcher, group_size, quant_name);
-  }
-  if (!residue_n) {
-    return dispatch_group_size<CtaM, CtaN, Warps, Sm70TileMode::ResidueKOnly>(
-        launcher, group_size, quant_name);
-  }
-  return dispatch_group_size<CtaM, CtaN, Warps, Sm70TileMode::ResidueKAndN>(
-      launcher, group_size, quant_name);
-}
-
 template <typename Launcher>
 torch::Tensor dispatch_geometry(Launcher const& launcher,
                                 Sm70DenseCtaGeometry geometry,
-                                int64_t size_n, int64_t size_k,
+                                int64_t /*size_n*/, int64_t /*size_k*/,
                                 int64_t group_size,
                                 char const* quant_name) {
 #define DISPATCH_SM70_DENSE_CTA(CM, CN, W)                               \
   if (geometry.cta_m == CM && geometry.cta_n == CN &&                     \
       geometry.warps == W) {                                              \
-    return dispatch_tile_mode<CM, CN, W>(                                 \
-        launcher, size_n, size_k, group_size, quant_name);                 \
+    return dispatch_group_size<CM, CN, W>(launcher, group_size,            \
+                                          quant_name);                     \
   }
 
   DISPATCH_SM70_DENSE_CTA(32, 128, 4)
