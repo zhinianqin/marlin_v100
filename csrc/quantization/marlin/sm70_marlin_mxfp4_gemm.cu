@@ -67,12 +67,14 @@ class Sm70Mxfp4IteratorB {
 
   struct Params {
     int size_n;
+    int aligned_initial_k_step;
 
     CUTLASS_HOST_DEVICE
-    Params() : size_n(0) {}
+    Params() : size_n(0), aligned_initial_k_step(Shape::kK) {}
 
     CUTLASS_HOST_DEVICE
-    Params(int size_n_) : size_n(size_n_) {}
+    Params(int size_k, int size_n_)
+        : size_n(size_n_), aligned_initial_k_step(aligned_k_step(size_k)) {}
   };
 
  private:
@@ -83,6 +85,7 @@ class Sm70Mxfp4IteratorB {
   int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
+  int aligned_k_step_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
 
@@ -97,6 +100,7 @@ class Sm70Mxfp4IteratorB {
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
         n_offset_(threadblock_offset.column()),
+        aligned_k_step_(params.aligned_initial_k_step),
         mask_enabled_(true) {
     int const logical_k = threadblock_offset.row() + thread_offset_.strided();
     int const logical_n =
@@ -107,9 +111,11 @@ class Sm70Mxfp4IteratorB {
 
   CUTLASS_DEVICE
   Sm70Mxfp4IteratorB& operator++() {
+    int const k_advance = aligned_k_step_;
     int const k_advance_qwords =
-        (Shape::kK / kQuantTileK) * (params_.size_n * 2);
-    k_offset_ += Shape::kK;
+        (k_advance / kQuantTileK) * (params_.size_n * 2);
+    k_offset_ += k_advance;
+    aligned_k_step_ = Shape::kK;
     qweight_base_offset_ += k_advance_qwords;
     return *this;
   }
@@ -123,6 +129,12 @@ class Sm70Mxfp4IteratorB {
 
   CUTLASS_DEVICE
   void enable_mask() { mask_enabled_ = true; }
+
+  CUTLASS_DEVICE
+  static int aligned_k_step(int size_k) {
+    int const k_tail = size_k % Shape::kK;
+    return k_tail == 0 ? Shape::kK : k_tail;
+  }
 
   CUTLASS_DEVICE
   int scale_group(int logical_k) const {
@@ -192,16 +204,7 @@ class Sm70Mxfp4IteratorB {
   }
 
   CUTLASS_DEVICE
-  void load(Fragment& frag) const {
-    if (!mask_enabled_) {
-      return;
-    }
-
-    if constexpr (kGroupSize != -1) {
-      int const first_logical_k = k_offset_ + thread_offset_.strided();
-      cache_current_group_metadata(scale_group(first_logical_k));
-    }
-
+  void load_macro_n_aligned(Fragment& frag) const {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
         uint4 const qwords =
@@ -331,6 +334,20 @@ class Sm70Mxfp4IteratorB {
       }
     }
   }
+
+  CUTLASS_DEVICE
+  void load(Fragment& frag) const {
+    if (!mask_enabled_) {
+      return;
+    }
+
+    if constexpr (kGroupSize != -1) {
+      int const first_logical_k = k_offset_ + thread_offset_.strided();
+      cache_current_group_metadata(scale_group(first_logical_k));
+    }
+
+    load_macro_n_aligned(frag);
+  }
 };
 
 struct Sm70Mxfp4GemmSpec {
@@ -375,7 +392,7 @@ void sm70_marlin_mxfp4_gemm_kernel(
       const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
       tb_offset_A);
   typename Mma::IteratorB iterator_B(
-      typename Mma::IteratorB::Params(n),
+      typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales), thread_idx, tb_offset_B);
 
