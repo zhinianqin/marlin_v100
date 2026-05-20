@@ -68,12 +68,14 @@ class Sm70U4ZpBiasIteratorB {
 
   struct Params {
     int size_n;
+    int aligned_initial_k_step;
 
     CUTLASS_HOST_DEVICE
-    Params() : size_n(0) {}
+    Params() : size_n(0), aligned_initial_k_step(Shape::kK) {}
 
     CUTLASS_HOST_DEVICE
-    Params(int size_n_) : size_n(size_n_) {}
+    Params(int size_k, int size_n_)
+        : size_n(size_n_), aligned_initial_k_step(aligned_k_step(size_k)) {}
   };
 
  private:
@@ -85,6 +87,7 @@ class Sm70U4ZpBiasIteratorB {
   int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
+  int aligned_k_step_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
   mutable half2 cached_bias_[ThreadMap::Iterations::kContiguous * 4];
@@ -101,6 +104,7 @@ class Sm70U4ZpBiasIteratorB {
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
         n_offset_(threadblock_offset.column()),
+        aligned_k_step_(params.aligned_initial_k_step),
         mask_enabled_(true) {
     int const logical_k = threadblock_offset.row() + thread_offset_.strided();
     int const logical_n =
@@ -136,9 +140,11 @@ class Sm70U4ZpBiasIteratorB {
 
   CUTLASS_DEVICE
   Sm70U4ZpBiasIteratorB& operator++() {
+    int const k_advance = aligned_k_step_;
     int const k_advance_qwords =
-        (Shape::kK / kQuantTileK) * (params_.size_n * 2);
-    k_offset_ += Shape::kK;
+        (k_advance / kQuantTileK) * (params_.size_n * 2);
+    k_offset_ += k_advance;
+    aligned_k_step_ = Shape::kK;
     qweight_base_offset_ += k_advance_qwords;
     return *this;
   }
@@ -152,6 +158,12 @@ class Sm70U4ZpBiasIteratorB {
 
   CUTLASS_DEVICE
   void enable_mask() { mask_enabled_ = true; }
+
+  CUTLASS_DEVICE
+  static int aligned_k_step(int size_k) {
+    int const k_tail = size_k % Shape::kK;
+    return k_tail == 0 ? Shape::kK : k_tail;
+  }
 
   CUTLASS_DEVICE
   int scale_group(int logical_k) const {
@@ -170,7 +182,7 @@ class Sm70U4ZpBiasIteratorB {
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
     return u4_macro_n_qweight_offset_from_logical(params.size_n, logical_k,
-                                                     logical_n);
+                                                  logical_n);
   }
 
   CUTLASS_DEVICE
@@ -244,16 +256,7 @@ class Sm70U4ZpBiasIteratorB {
   }
 
   CUTLASS_DEVICE
-  void load(Fragment& frag) const {
-    if (!mask_enabled_) {
-      return;
-    }
-
-    if constexpr (kGroupSize != -1) {
-      int const first_logical_k = k_offset_ + thread_offset_.strided();
-      cache_current_group_metadata(scale_group(first_logical_k));
-    }
-
+  void load_macro_n_aligned(Fragment& frag) const {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
         uint4 const qwords =
@@ -389,6 +392,20 @@ class Sm70U4ZpBiasIteratorB {
       }
     }
   }
+
+  CUTLASS_DEVICE
+  void load(Fragment& frag) const {
+    if (!mask_enabled_) {
+      return;
+    }
+
+    if constexpr (kGroupSize != -1) {
+      int const first_logical_k = k_offset_ + thread_offset_.strided();
+      cache_current_group_metadata(scale_group(first_logical_k));
+    }
+
+    load_macro_n_aligned(frag);
+  }
 };
 
 struct Sm70U4ZpBiasGemmSpec {
@@ -434,7 +451,7 @@ void sm70_marlin_u4_gemm_kernel(
       const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
       tb_offset_A);
   typename Mma::IteratorB iterator_B(
-      typename Mma::IteratorB::Params(n),
+      typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales),
       reinterpret_cast<half const*>(b_zp_bias), thread_idx, tb_offset_B);
