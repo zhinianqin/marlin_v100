@@ -32,26 +32,26 @@ _DENSE_SUPPORTED_QUANT_NAMES = frozenset(
 )
 _GROUP_SIZES = (-1, 32, 64, 128)
 _CTA_GEOMETRY_CASES = (
-    ("32x128x4", 32, 128),
+    ("32x128x4", 32, 256),
     ("32x256x4", 32, 256),
-    ("64x64x4", 32, 64),
-    ("64x128x4", 32, 128),
-    ("64x128x8", 32, 128),
-    ("64x256x4", 32, 256),
-    ("64x256x8", 32, 256),
-    ("128x64x4", 32, 64),
-    ("128x64x8", 32, 64),
-    ("128x128x4", 32, 128),
-    ("128x128x8", 32, 128),
-    ("128x256x8", 32, 256),
-    ("256x64x4", 32, 64),
-    ("256x64x8", 32, 64),
-    ("256x128x8", 32, 128),
+    ("64x64x4", 64, 256),
+    ("64x128x4", 64, 256),
+    ("64x128x8", 64, 256),
+    ("64x256x4", 64, 256),
+    ("64x256x8", 64, 256),
+    ("128x64x4", 128, 256),
+    ("128x64x8", 128, 256),
+    ("128x128x4", 128, 256),
+    ("128x128x8", 128, 256),
+    ("128x256x8", 128, 256),
+    ("256x64x4", 256, 256),
+    ("256x64x8", 256, 256),
+    ("256x128x8", 256, 256),
 )
 _FP8_CTA_GEOMETRY_CASES = (
-    ("64x128x4", 32, 128),
-    ("128x256x8", 32, 256),
-    ("256x64x8", 32, 64),
+    ("64x128x4", 64, 256),
+    ("128x256x8", 128, 256),
+    ("256x64x8", 256, 256),
 )
 _FLOAT16_ACTIVATION_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
@@ -61,6 +61,7 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 outputs\."
     rf"|{source_target_label()} build only supports float16 scales\."
 )
+_FULL_N_TILE_ERROR = "requires full-N tiles"
 
 
 def _require_marlin_cuda() -> None:
@@ -648,64 +649,67 @@ def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
         atol=2.5e-1,
         size_m=8,
         size_k=128,
-        size_n=128,
+        size_n=256,
     )
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_n_matches_reference(
+def test_marlin_dense_uint4b8_residue_n_rejects_full_tile_contract(
     group_size: int,
     repack_impl: str,
 ):
-    _run_dense_accuracy_case(
-        scalar_types.uint4b8,
-        repack_impl=repack_impl,
-        group_size=group_size,
-        act_order=False,
-        is_k_full=True,
-        rtol=5e-2,
-        atol=2.5e-1,
-        size_m=8,
-        size_k=256,
-        size_n=128,
-    )
+    with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+        _run_dense_accuracy_case(
+            scalar_types.uint4b8,
+            repack_impl=repack_impl,
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_k_single_group_matches_reference(
+def test_marlin_dense_uint4b8_residue_k_single_group_rejects_full_tile_contract(
     repack_impl: str,
 ):
-    _run_dense_accuracy_case(
-        scalar_types.uint4b8,
-        repack_impl=repack_impl,
-        group_size=-1,
-        act_order=False,
-        is_k_full=True,
-        rtol=5e-2,
-        atol=2.5e-1,
-        size_m=8,
-        size_k=144,
-        size_n=256,
-    )
+    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+        _run_dense_accuracy_case(
+            scalar_types.uint4b8,
+            repack_impl=repack_impl,
+            group_size=-1,
+            act_order=False,
+            is_k_full=True,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=144,
+            size_n=256,
+        )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_k_and_n_single_group_matches_reference(
+def test_marlin_dense_uint4b8_residue_k_and_n_single_group_rejects_full_tile_contract(
     repack_impl: str,
 ):
-    _run_dense_accuracy_case(
-        scalar_types.uint4b8,
-        repack_impl=repack_impl,
-        group_size=-1,
-        act_order=False,
-        is_k_full=True,
-        rtol=5e-2,
-        atol=2.5e-1,
-        size_m=8,
-        size_k=144,
-        size_n=128,
-    )
+    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+        _run_dense_accuracy_case(
+            scalar_types.uint4b8,
+            repack_impl=repack_impl,
+            group_size=-1,
+            act_order=False,
+            is_k_full=True,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=144,
+            size_n=128,
+        )
 
 
 def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
@@ -723,7 +727,7 @@ def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
     )
     scales = torch.ones((3, size_n), device="cuda", dtype=torch.float16)
 
-    with pytest.raises(RuntimeError, match="single-scale residue path"):
+    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
         ops.marlin_gemm(
             a,
             None,
@@ -865,21 +869,24 @@ def test_marlin_dense_uint4_zp_small_tile_matches_reference(repack_impl: str):
         atol=2.5e-1,
         size_m=8,
         size_k=128,
-        size_n=128,
+        size_n=256,
     )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4_zp_residue_n_matches_reference(repack_impl: str):
-    _run_dense_uint4_zp_accuracy_case(
-        repack_impl=repack_impl,
-        group_size=128,
-        rtol=5e-2,
-        atol=2.5e-1,
-        size_m=8,
-        size_k=256,
-        size_n=128,
-    )
+def test_marlin_dense_uint4_zp_residue_n_rejects_full_tile_contract(
+    repack_impl: str,
+):
+    with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl=repack_impl,
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
 
 @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
@@ -937,21 +944,24 @@ def test_marlin_dense_uint8_zp_bias_small_tile_matches_reference(repack_impl: st
         atol=2.5e-1,
         size_m=8,
         size_k=128,
-        size_n=128,
+        size_n=256,
     )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint8_zp_bias_residue_n_matches_reference(repack_impl: str):
-    _run_dense_uint8_zp_bias_accuracy_case(
-        repack_impl=repack_impl,
-        group_size=128,
-        rtol=5e-2,
-        atol=2.5e-1,
-        size_m=8,
-        size_k=256,
-        size_n=128,
-    )
+def test_marlin_dense_uint8_zp_bias_residue_n_rejects_full_tile_contract(
+    repack_impl: str,
+):
+    with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+        _run_dense_uint8_zp_bias_accuracy_case(
+            repack_impl=repack_impl,
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
 
 @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
@@ -1399,23 +1409,26 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
             atol=2e-1,
             size_m=8,
             size_k=128,
-            size_n=128,
+            size_n=256,
         )
 
     @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-    def test_marlin_dense_uint8b128_residue_n_matches_reference(repack_impl: str):
-        _run_dense_accuracy_case(
-            scalar_types.uint8b128,
-            repack_impl=repack_impl,
-            group_size=128,
-            act_order=False,
-            is_k_full=True,
-            rtol=4e-2,
-            atol=2e-1,
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    def test_marlin_dense_uint8b128_residue_n_rejects_full_tile_contract(
+        repack_impl: str,
+    ):
+        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+            _run_dense_accuracy_case(
+                scalar_types.uint8b128,
+                repack_impl=repack_impl,
+                group_size=128,
+                act_order=False,
+                is_k_full=True,
+                rtol=4e-2,
+                atol=2e-1,
+                size_m=8,
+                size_k=256,
+                size_n=128,
+            )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
     def test_marlin_dense_uint8b128_env_cta_geometry_matches_reference(
@@ -1463,13 +1476,14 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_fp8_weight_accuracy(group_size: int):
         _run_fp8_dense_accuracy_case(group_size=group_size)
 
-    def test_marlin_dense_fp8_weight_residue_n_matches_reference():
-        _run_fp8_dense_accuracy_case(
-            group_size=128,
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    def test_marlin_dense_fp8_weight_residue_n_rejects_full_tile_contract():
+        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+            _run_fp8_dense_accuracy_case(
+                group_size=128,
+                size_m=8,
+                size_k=256,
+                size_n=128,
+            )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
     def test_marlin_dense_fp8_env_cta_geometry_matches_reference(
@@ -1816,12 +1830,13 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_nvfp4_weight_accuracy():
         _run_nvfp4_dense_accuracy_case()
 
-    def test_marlin_dense_nvfp4_weight_residue_n_matches_reference():
-        _run_nvfp4_dense_accuracy_case(
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    def test_marlin_dense_nvfp4_weight_residue_n_rejects_full_tile_contract():
+        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+            _run_nvfp4_dense_accuracy_case(
+                size_m=8,
+                size_k=256,
+                size_n=128,
+            )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
     def test_marlin_dense_nvfp4_env_cta_geometry_matches_reference(
@@ -2063,12 +2078,13 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_mxfp4_weight_accuracy():
         _run_mxfp4_dense_accuracy_case()
 
-    def test_marlin_dense_mxfp4_weight_residue_n_matches_reference():
-        _run_mxfp4_dense_accuracy_case(
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    def test_marlin_dense_mxfp4_weight_residue_n_rejects_full_tile_contract():
+        with pytest.raises(RuntimeError, match=_FULL_N_TILE_ERROR):
+            _run_mxfp4_dense_accuracy_case(
+                size_m=8,
+                size_k=256,
+                size_n=128,
+            )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
     def test_marlin_dense_mxfp4_env_cta_geometry_matches_reference(

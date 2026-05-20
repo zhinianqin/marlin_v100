@@ -891,9 +891,8 @@ torch::Tensor marlin_gemm(
               "SM70 CUTLASS dense prototype does not support atomic-add output.");
   TORCH_CHECK(is_k_full,
               "SM70 CUTLASS dense prototype requires full-K non act-order inputs.");
-  TORCH_CHECK(size_k % 32 == 0 || (b_type == vllm::kU4B8 && group_size == -1),
-              "SM70 CUTLASS dense prototype requires size_k % 32 == 0 "
-              "except for the uint4b8 single-scale residue path.");
+  TORCH_CHECK(size_k % 32 == 0,
+              "SM70 CUTLASS dense prototype requires size_k % 32 == 0.");
   TORCH_CHECK(size_n % 64 == 0,
               "SM70 CUTLASS dense prototype requires size_n % 64 == 0.");
   TORCH_CHECK(group_size == -1 || group_size > 0,
