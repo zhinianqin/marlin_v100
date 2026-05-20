@@ -37,8 +37,8 @@ using marlin::sm70_dense::kQuantTileK;
 using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::parse_sm70_dense_cta_geometry;
 using marlin::sm70_dense::qword_from_vector;
-using marlin::sm70_dense::u8_qweight_offset_from_logical;
-using marlin::sm70_dense::u8_qweight_word_stride_from_logical;
+using marlin::sm70_dense::u8_full_tile_qweight_offset_from_logical;
+using marlin::sm70_dense::u8_full_tile_qweight_word_stride_from_logical;
 
 namespace {
 
@@ -69,14 +69,13 @@ class Sm70U8ZpBiasIteratorB {
                 "access.");
 
   struct Params {
-    int size_k;
     int size_n;
 
     CUTLASS_HOST_DEVICE
-    Params() : size_k(0), size_n(0) {}
+    Params() : size_n(0) {}
 
     CUTLASS_HOST_DEVICE
-    Params(int size_k_, int size_n_) : size_k(size_k_), size_n(size_n_) {}
+    Params(int size_n_) : size_n(size_n_) {}
   };
 
  private:
@@ -88,8 +87,6 @@ class Sm70U8ZpBiasIteratorB {
   int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
-  int tile_k_end_;
-  int next_k_advance_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
   mutable half2 cached_bias_[ThreadMap::Iterations::kContiguous * 4];
@@ -174,15 +171,14 @@ class Sm70U8ZpBiasIteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u8_qweight_offset_from_logical(params.size_n, logical_k,
+    return u8_full_tile_qweight_offset_from_logical(params.size_n, logical_k,
                                                      logical_n);
   }
 
   CUTLASS_DEVICE
-  static int qweight_word_stride_from_logical(Params const& params,
+  static int qweight_word_stride_from_logical(Params const&,
                                               int logical_n) {
-    return u8_qweight_word_stride_from_logical(params.size_n,
-                                                          logical_n);
+    return u8_full_tile_qweight_word_stride_from_logical(logical_n);
   }
 
   CUTLASS_DEVICE
@@ -476,7 +472,7 @@ void sm70_marlin_u8_gemm_kernel(
       const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
       tb_offset_A);
   typename Mma::IteratorB iterator_B(
-      typename Mma::IteratorB::Params(k, n),
+      typename Mma::IteratorB::Params(n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales),
       reinterpret_cast<half const*>(b_zp_bias), thread_idx, tb_offset_B);

@@ -37,7 +37,7 @@ using marlin::sm70_dense::kQuantTileK;
 using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::parse_sm70_dense_cta_geometry;
 using marlin::sm70_dense::qword_from_vector;
-using marlin::sm70_dense::u4_qweight_offset_from_logical;
+using marlin::sm70_dense::u4_full_tile_qweight_offset_from_logical;
 
 namespace {
 
@@ -67,14 +67,13 @@ class Sm70U4B8IteratorB {
                 "access.");
 
   struct Params {
-    int size_k;
     int size_n;
 
     CUTLASS_HOST_DEVICE
-    Params() : size_k(0), size_n(0) {}
+    Params() : size_n(0) {}
 
     CUTLASS_HOST_DEVICE
-    Params(int size_k_, int size_n_) : size_k(size_k_), size_n(size_n_) {}
+    Params(int size_n_) : size_n(size_n_) {}
   };
 
  private:
@@ -85,8 +84,6 @@ class Sm70U4B8IteratorB {
   int qweight_base_offset_;
   int k_offset_;
   int n_offset_;
-  int tile_k_end_;
-  int next_k_advance_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
 
@@ -161,7 +158,7 @@ class Sm70U4B8IteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u4_qweight_offset_from_logical(params.size_n, logical_k,
+    return u4_full_tile_qweight_offset_from_logical(params.size_n, logical_k,
                                                      logical_n);
   }
 
@@ -402,7 +399,7 @@ void sm70_marlin_u4b8_gemm_kernel(
       const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
       tb_offset_A);
   typename Mma::IteratorB iterator_B(
-      typename Mma::IteratorB::Params(k, n),
+      typename Mma::IteratorB::Params(n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales), thread_idx, tb_offset_B);
 
