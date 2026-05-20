@@ -42,7 +42,6 @@ using marlin::sm70_dense::u8_macro_n_qweight_word_stride_from_logical;
 
 namespace {
 
-constexpr int kU8ValuesPerWord = 4;
 constexpr int kU8ValuesPerAccess = 8;
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
