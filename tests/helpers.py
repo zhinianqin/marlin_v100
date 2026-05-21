@@ -477,6 +477,64 @@ def _preconvert_mxfp4_scales_to_fp16(fp8_scales: torch.Tensor) -> torch.Tensor:
     return fp8_scales.to(torch.float32).to(torch.float16)
 
 
+def _nvfp4_compute_scale_factor(
+    marlin_scales: torch.Tensor,
+    a_dtype: torch.dtype | None = None,
+) -> float:
+    if a_dtype is not None and a_dtype == torch.float16:
+        return 1.0
+
+    ws_float = marlin_scales.float() * (2**7)
+    nonzero_mask = ws_float > 0
+    if nonzero_mask.any():
+        min_val = ws_float[nonzero_mask].min()
+        if min_val < 2:
+            return (2 / min_val).log2().ceil().exp2().item()
+    return 1.0
+
+
+def _nvfp4_marlin_process_scales(
+    marlin_scales: torch.Tensor,
+    scale_factor: float | None = None,
+    a_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, float]:
+    marlin_scales = marlin_scales.to(torch.float16)
+    marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].reshape(
+        marlin_scales.shape
+    )
+
+    if scale_factor is None:
+        scale_factor = _nvfp4_compute_scale_factor(marlin_scales, a_dtype)
+    if scale_factor > 1.0:
+        marlin_scales = (marlin_scales.float() * scale_factor).to(torch.float16)
+
+    marlin_scales = (marlin_scales * (2**7)).view(torch.int16) << 1
+    marlin_scales = marlin_scales.view(torch.float8_e4m3fn)
+    marlin_scales = marlin_scales[:, 1::2].contiguous()
+    return marlin_scales, scale_factor
+
+
+def _nvfp4_marlin_process_global_scale(
+    global_scale: torch.Tensor,
+    a_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if a_dtype is None:
+        a_dtype = torch.float16
+    if a_dtype != torch.float16:
+        raise ValueError("SM70 NVFP4 dense helper currently expects fp16 activations.")
+
+    fp4_exponent = 2
+    target_exponent = 5
+    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
+    return global_scale * (2.0 ** (exponent_bias - 7))
+
+
+def _decode_nvfp4_marlin_fast_scales(scales: torch.Tensor) -> torch.Tensor:
+    scale_bits = scales.view(torch.uint8).to(torch.int16) << 7
+    decoded = scale_bits.contiguous().view(torch.float16).to(torch.float32)
+    return decoded.view(-1, 4)[:, [0, 2, 1, 3]].reshape(scales.shape)
+
+
 def _quantize_nvfp4_weight(
     weight: torch.Tensor,
     group_size: int,
@@ -676,14 +734,30 @@ def marlin_quantize_nvfp4(
         group_size,
     )
     marlin_q_weight = fp4_e2m1_weight_to_marlin_weight(q_weight)
-    marlin_scales = dense.marlin_permute_scales(
+    raw_marlin_scales = dense.marlin_permute_scales(
         fp8_scales,
         size_k,
         size_n,
         group_size,
         is_a_8bit=False,
     )
-    marlin_global_scale = global_scale.reshape(1).contiguous()
+    marlin_scales, scale_factor = _nvfp4_marlin_process_scales(
+        raw_marlin_scales,
+        a_dtype=weight.dtype,
+    )
+    marlin_global_scale = _nvfp4_marlin_process_global_scale(
+        global_scale.reshape(1).contiguous(),
+        weight.dtype,
+    ).to(torch.float32)
+    marlin_global_scale = (marlin_global_scale / scale_factor).contiguous()
+    dequantized = marlin_dequantize_nvfp4(
+        marlin_q_weight,
+        marlin_scales,
+        marlin_global_scale,
+        size_k,
+        size_n,
+        group_size,
+    )
     g_idx = marlin_make_empty_g_idx(weight.device)
     sort_indices = torch.empty(0, dtype=torch.int, device=weight.device)
     rand_perm = torch.arange(size_k, dtype=torch.int, device=weight.device)
@@ -776,9 +850,10 @@ def marlin_dequantize_nvfp4(
     if group_size != 16:
         raise ValueError("SM70 NVFP4 dense helper supports only group_size=16.")
     unpacked = marlin_unpack(q_weight, size_k, size_n, scalar_types.float4_e2m1f)
-    fp4_values = _fp4_e2m1_values(q_weight.device)
+    fp4_values = _fp4_e2m1_values(q_weight.device) / float(2**14)
+    decoded_scales = _decode_nvfp4_marlin_fast_scales(scales)
     unpermuted_scales = marlin_unpermute_scales(
-        scales,
+        decoded_scales,
         size_k,
         size_n,
         group_size,

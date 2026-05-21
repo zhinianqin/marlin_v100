@@ -175,7 +175,7 @@ def test_marlin_quantize_nvfp4_uses_fp8_scales_and_global_scale():
     assert torch.equal(rand_perm, torch.arange(weight.shape[0], dtype=torch.int))
     assert torch.isfinite(weight_ref).all()
     assert torch.isfinite(dequantized).all()
-    assert (scales.to(torch.float32) > 0.0).all()
+    assert (scales.view(torch.uint8) > 0).all()
     torch.testing.assert_close(dequantized, weight_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(weight_ref, weight, atol=5.0e-1, rtol=5.0e-1)
 

@@ -171,31 +171,11 @@ class Sm70Nvfp4IteratorB {
                                  int cache_n) const {
     uint2 const scale_words = *reinterpret_cast<uint2 const*>(
         scales_ + group * params_.size_n + cache_n);
-    half2 dequantized_scales[4];
-    marlin::dequant_fp8_scales<half2, vllm::kFE4M3fn.id()>(
-        static_cast<int>(qword_from_vector(scale_words, 0)),
-        dequantized_scales);
-    marlin::dequant_fp8_scales<half2, vllm::kFE4M3fn.id()>(
-        static_cast<int>(qword_from_vector(scale_words, 1)),
-        dequantized_scales + 2);
     half2* scale_cache = cached_scales_ + cache_index * 4;
-    half2 const fp8_bias = __float2half2_rn(256.0f);
-    scale_cache[0] = __hmul2(
-        __halves2half2(__low2half(dequantized_scales[0]),
-                       __low2half(dequantized_scales[1])),
-        fp8_bias);
-    scale_cache[1] = __hmul2(
-        __halves2half2(__high2half(dequantized_scales[0]),
-                       __high2half(dequantized_scales[1])),
-        fp8_bias);
-    scale_cache[2] = __hmul2(
-        __halves2half2(__low2half(dequantized_scales[2]),
-                       __low2half(dequantized_scales[3])),
-        fp8_bias);
-    scale_cache[3] = __hmul2(
-        __halves2half2(__high2half(dequantized_scales[2]),
-                       __high2half(dequantized_scales[3])),
-        fp8_bias);
+    marlin::dequant_fp8_scales<half2, vllm::kFE4M3fn.id()>(
+        static_cast<int>(qword_from_vector(scale_words, 0)), scale_cache);
+    marlin::dequant_fp8_scales<half2, vllm::kFE4M3fn.id()>(
+        static_cast<int>(qword_from_vector(scale_words, 1)), scale_cache + 2);
   }
 
   CUTLASS_DEVICE
@@ -232,11 +212,11 @@ class Sm70Nvfp4IteratorB {
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-          marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+          marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
               static_cast<int>(qword << 8), deq);
           frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
           frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
-          marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+          marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
               static_cast<int>(qword), deq);
           frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
           frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
@@ -253,11 +233,11 @@ class Sm70Nvfp4IteratorB {
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-          marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+          marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
               static_cast<int>(qword << 8), deq);
           frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
           frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
-          marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+          marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
               static_cast<int>(qword), deq);
           frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
           frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
@@ -270,11 +250,11 @@ class Sm70Nvfp4IteratorB {
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data());
-        marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+        marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
             static_cast<int>(qword << 8), deq);
         frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
         frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
-        marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+        marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
             static_cast<int>(qword), deq);
         frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
         frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
@@ -297,11 +277,11 @@ class Sm70Nvfp4IteratorB {
 
             half2 deq[2];
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-            marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+            marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
                 static_cast<int>(qword << 8), deq);
             frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
             frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
-            marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+            marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
                 static_cast<int>(qword), deq);
             frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
             frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
@@ -321,11 +301,11 @@ class Sm70Nvfp4IteratorB {
 
             half2 deq[2];
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-            marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+            marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
                 static_cast<int>(qword << 8), deq);
             frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
             frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
-            marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+            marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
                 static_cast<int>(qword), deq);
             frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
             frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
@@ -341,11 +321,11 @@ class Sm70Nvfp4IteratorB {
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-          marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+          marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
               static_cast<int>(qword << 8), deq);
           frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
           frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
-          marlin::dequant<half2, vllm::kFE2M1f.id(), false>(
+          marlin::dequant<half2, vllm::kFE2M1f.id(), true>(
               static_cast<int>(qword), deq);
           frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
           frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
