@@ -150,7 +150,7 @@ def test_marlin_quantize_fp8_uses_fused_scales_and_dequantizes(
     torch.testing.assert_close(dequantized, weight, atol=5.0e-1, rtol=5.0e-1)
 
 
-def test_marlin_quantize_nvfp4_uses_fp16_scales_and_global_scale():
+def test_marlin_quantize_nvfp4_uses_fp8_scales_and_global_scale():
     torch.manual_seed(0)
     weight = torch.randn((256, 128), dtype=torch.float16)
 
@@ -167,7 +167,7 @@ def test_marlin_quantize_nvfp4_uses_fp16_scales_and_global_scale():
     )
 
     assert scales.shape == (weight.shape[0] // 16, weight.shape[1])
-    assert scales.dtype == torch.float16
+    assert scales.dtype == torch.float8_e4m3fn
     assert global_scale.shape == (1,)
     assert global_scale.dtype == torch.float32
     assert g_idx.numel() == 0
@@ -175,7 +175,7 @@ def test_marlin_quantize_nvfp4_uses_fp16_scales_and_global_scale():
     assert torch.equal(rand_perm, torch.arange(weight.shape[0], dtype=torch.int))
     assert torch.isfinite(weight_ref).all()
     assert torch.isfinite(dequantized).all()
-    assert (scales > 1.0).all()
+    assert (scales.to(torch.float32) > 0.0).all()
     torch.testing.assert_close(dequantized, weight_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(weight_ref, weight, atol=5.0e-1, rtol=5.0e-1)
 

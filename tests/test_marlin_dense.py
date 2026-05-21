@@ -1733,7 +1733,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="supports global_scale only for preconverted nvfp4"):
+        with pytest.raises(RuntimeError, match="supports global_scale only for nvfp4 format"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -1865,7 +1865,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 size_n=64,
             )
 
-    def test_marlin_dense_nvfp4_rejects_raw_fp8_scales_and_missing_global_scale():
+    def test_marlin_dense_nvfp4_requires_fp8_scales_and_global_scale():
         _require_marlin_cuda()
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
@@ -1875,18 +1875,18 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         _weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
             marlin_quantize_nvfp4(w, 16)
         )
-        raw_fp8_scales = (scales.to(torch.float32) / 128.0).to(torch.float8_e4m3fn)
+        fp16_scales = scales.to(torch.float32).to(torch.float16)
         workspace = marlin_make_workspace_new(a.device)
 
-        with pytest.raises(RuntimeError, match="preconverted float16 NVFP4/MXFP4 scales"):
+        with pytest.raises(RuntimeError, match="global_scale parameter must be passed"):
             ops.marlin_gemm(
                 a,
                 None,
                 q_w,
                 None,
-                raw_fp8_scales,
+                scales,
                 None,
-                global_scale,
+                None,
                 None,
                 g_idx,
                 sort_indices,
@@ -1901,15 +1901,15 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="mxfp4 prototype supports only group_size 32"):
+        with pytest.raises(RuntimeError, match="supports global_scale only for nvfp4"):
             ops.marlin_gemm(
                 a,
                 None,
                 q_w,
                 None,
-                scales,
+                fp16_scales,
                 None,
-                None,
+                global_scale,
                 None,
                 g_idx,
                 sort_indices,
@@ -2126,7 +2126,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
         workspace = marlin_make_workspace_new(a.device)
 
-        with pytest.raises(RuntimeError, match="preconverted float16 NVFP4/MXFP4 scales"):
+        with pytest.raises(RuntimeError, match="preconverted float16 MXFP4 scales"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2149,7 +2149,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="nvfp4 prototype supports only group_size 16"):
+        with pytest.raises(RuntimeError, match="supports global_scale only for nvfp4"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2175,7 +2175,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         _nv_weight_ref, nv_q_w, nv_scales, _global_scale, nv_g_idx, nv_sort_indices, _ = (
             marlin_quantize_nvfp4(w, 16)
         )
-        with pytest.raises(RuntimeError, match="mxfp4 prototype supports only group_size 32"):
+        with pytest.raises(RuntimeError, match="global_scale parameter must be passed"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2237,7 +2237,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         with pytest.raises(RuntimeError, match="SM70 build only supports float16 outputs"):
             ops.marlin_gemm(a, c_bf16, *common_args)
 
-        with pytest.raises(RuntimeError, match="SM70 build only supports float16 scales"):
+        with pytest.raises(RuntimeError, match="preconverted float16 MXFP4 scales"):
             ops.marlin_gemm(
                 a,
                 None,

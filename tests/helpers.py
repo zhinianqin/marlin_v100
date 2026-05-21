@@ -473,20 +473,6 @@ def _quantize_to_fp4_e2m1(values: torch.Tensor) -> torch.Tensor:
     return distances.argmin(dim=-1).to(torch.int32)
 
 
-def _preconvert_nvfp4_scales_to_fp16(
-    fp8_scales: torch.Tensor,
-    scale_factor: float = 1.0,
-) -> torch.Tensor:
-    return (fp8_scales.to(torch.float32) * scale_factor * 128.0).to(torch.float16)
-
-
-def _preconvert_nvfp4_global_scale(
-    global_scale: torch.Tensor,
-    scale_factor: float = 1.0,
-) -> torch.Tensor:
-    return (global_scale.to(torch.float32) * (128.0 / scale_factor)).reshape(1).contiguous()
-
-
 def _preconvert_mxfp4_scales_to_fp16(fp8_scales: torch.Tensor) -> torch.Tensor:
     return fp8_scales.to(torch.float32).to(torch.float16)
 
@@ -494,7 +480,7 @@ def _preconvert_mxfp4_scales_to_fp16(fp8_scales: torch.Tensor) -> torch.Tensor:
 def _quantize_nvfp4_weight(
     weight: torch.Tensor,
     group_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if group_size != 16:
         raise ValueError("SM70 NVFP4 dense helper supports only group_size=16.")
 
@@ -514,7 +500,7 @@ def _quantize_nvfp4_weight(
     fp4_values = _fp4_e2m1_values(weight.device)
     repeated_scales = effective_scales.repeat_interleave(group_size, dim=0)
     dequantized = (fp4_values[q_weight.to(torch.long)] * repeated_scales).to(torch.float16)
-    return q_weight, fp8_scales, global_scale, dequantized, 1.0
+    return q_weight, fp8_scales, global_scale, dequantized
 
 
 def _quantize_mxfp4_weight(
@@ -685,18 +671,19 @@ def marlin_quantize_nvfp4(
         raise ValueError("SM70 NVFP4 dense helper supports only group_size=16.")
 
     size_k, size_n = weight.shape
-    q_weight, fp8_scales, global_scale, dequantized, scale_factor = (
-        _quantize_nvfp4_weight(weight, group_size)
+    q_weight, fp8_scales, global_scale, dequantized = _quantize_nvfp4_weight(
+        weight,
+        group_size,
     )
     marlin_q_weight = fp4_e2m1_weight_to_marlin_weight(q_weight)
     marlin_scales = dense.marlin_permute_scales(
-        _preconvert_nvfp4_scales_to_fp16(fp8_scales, scale_factor),
+        fp8_scales,
         size_k,
         size_n,
         group_size,
         is_a_8bit=False,
     )
-    marlin_global_scale = _preconvert_nvfp4_global_scale(global_scale, scale_factor)
+    marlin_global_scale = global_scale.reshape(1).contiguous()
     g_idx = marlin_make_empty_g_idx(weight.device)
     sort_indices = torch.empty(0, dtype=torch.int, device=weight.device)
     rand_perm = torch.arange(size_k, dtype=torch.int, device=weight.device)
@@ -800,8 +787,8 @@ def marlin_dequantize_nvfp4(
     expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
     dequantized = (
         fp4_values[unpacked.to(torch.long)]
-        * (expanded_scales / 128.0)
-        * (global_scale.reshape(-1)[0].to(torch.float32) / 128.0)
+        * expanded_scales
+        * global_scale.reshape(-1)[0].to(torch.float32)
     )
     return dequantized.to(torch.float16)
 
