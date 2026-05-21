@@ -473,10 +473,6 @@ def _quantize_to_fp4_e2m1(values: torch.Tensor) -> torch.Tensor:
     return distances.argmin(dim=-1).to(torch.int32)
 
 
-def _preconvert_mxfp4_scales_to_fp16(fp8_scales: torch.Tensor) -> torch.Tensor:
-    return fp8_scales.to(torch.float32).to(torch.float16)
-
-
 def _nvfp4_compute_scale_factor(
     marlin_scales: torch.Tensor,
     a_dtype: torch.dtype | None = None,
@@ -583,7 +579,7 @@ def _quantize_mxfp4_weight(
     scale_exponents = torch.ceil(torch.log2(scale_inputs)).clamp(-127, 127)
     power_of_two_scales = torch.pow(torch.full_like(scale_exponents, 2.0), scale_exponents)
     fp8_scales = power_of_two_scales.to(torch.float8_e8m0fnu)
-    effective_scales = _preconvert_mxfp4_scales_to_fp16(fp8_scales).to(torch.float32)
+    effective_scales = fp8_scales.to(torch.float32)
 
     q_weight = _quantize_to_fp4_e2m1(
         reshaped / effective_scales.unsqueeze(1).clamp_min(1e-12)
@@ -786,7 +782,7 @@ def marlin_quantize_mxfp4(
     q_weight, fp8_scales, dequantized = _quantize_mxfp4_weight(weight, group_size)
     marlin_q_weight = fp4_e2m1_weight_to_marlin_weight(q_weight)
     marlin_scales = dense.marlin_permute_scales(
-        _preconvert_mxfp4_scales_to_fp16(fp8_scales),
+        fp8_scales,
         size_k,
         size_n,
         group_size,

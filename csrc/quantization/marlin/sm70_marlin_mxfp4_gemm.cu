@@ -11,6 +11,7 @@
 
 #include <cuda_fp16.h>
 #include <torch/library.h>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -41,6 +42,38 @@ using marlin::sm70_dense::u4_macro_n_qweight_offset_from_logical;
 namespace {
 
 constexpr int kMxfp4ValuesPerWord = 8;
+
+CUTLASS_DEVICE
+uint16_t e8m0_byte_to_half_bits(uint32_t exponent_byte) {
+  int const exponent = static_cast<int>(exponent_byte & 0xffu) - 127;
+  if (exponent < -24) {
+    return 0;
+  }
+  if (exponent < -14) {
+    return static_cast<uint16_t>(1u << (exponent + 24));
+  }
+  if (exponent <= 15) {
+    return static_cast<uint16_t>((exponent + 15) << 10);
+  }
+  return 0x7c00u;
+}
+
+CUTLASS_DEVICE
+half2 e8m0_half2_from_bytes(uint32_t low_byte, uint32_t high_byte) {
+  uint32_t const bits =
+      static_cast<uint32_t>(e8m0_byte_to_half_bits(low_byte)) |
+      (static_cast<uint32_t>(e8m0_byte_to_half_bits(high_byte)) << 16);
+  half2 result;
+  *reinterpret_cast<uint32_t*>(&result) = bits;
+  return result;
+}
+
+CUTLASS_DEVICE
+void dequant_e8m0_scales_to_half2(int q, half2* scale_cache) {
+  uint32_t const word = static_cast<uint32_t>(q);
+  scale_cache[0] = e8m0_half2_from_bytes(word, word >> 8);
+  scale_cache[1] = e8m0_half2_from_bytes(word >> 16, word >> 24);
+}
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
 class Sm70Mxfp4IteratorB {
@@ -79,7 +112,7 @@ class Sm70Mxfp4IteratorB {
 
  private:
   uint32_t const* qweight_;
-  half const* scales_;
+  uint8_t const* scales_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
   int qweight_base_offset_;
@@ -92,7 +125,7 @@ class Sm70Mxfp4IteratorB {
  public:
   CUTLASS_DEVICE
   Sm70Mxfp4IteratorB(Params const& params, uint32_t const* qweight,
-                     half const* scales, int thread_id,
+                     uint8_t const* scales, int thread_id,
                      cutlass::MatrixCoord const& threadblock_offset)
       : qweight_(qweight),
         scales_(scales),
@@ -166,26 +199,14 @@ class Sm70Mxfp4IteratorB {
   }
 
   CUTLASS_DEVICE
-  void cache_metadata_lane_vectors(int c, int group, int cache_n) const {
-    half2 const* scale_vec = reinterpret_cast<half2 const*>(
+  void cache_metadata_e8m0_scales(int c, int group, int cache_n) const {
+    uint2 const scale_words = *reinterpret_cast<uint2 const*>(
         scales_ + group * params_.size_n + cache_n);
     half2* scale_cache = cached_scales_ + c * 4;
-    scale_cache[0] = scale_vec[0];
-    scale_cache[1] = scale_vec[1];
-    scale_cache[2] = scale_vec[2];
-    scale_cache[3] = scale_vec[3];
-  }
-
-  CUTLASS_DEVICE
-  void cache_metadata_vector_words(int c, int group, int cache_n) const {
-    uint4 const scale_words = *reinterpret_cast<uint4 const*>(
-        scales_ + group * params_.size_n + cache_n);
-    half2 const* scale_vec = reinterpret_cast<half2 const*>(&scale_words);
-    half2* scale_cache = cached_scales_ + c * 4;
-    scale_cache[0] = scale_vec[0];
-    scale_cache[1] = scale_vec[1];
-    scale_cache[2] = scale_vec[2];
-    scale_cache[3] = scale_vec[3];
+    dequant_e8m0_scales_to_half2(
+        static_cast<int>(qword_from_vector(scale_words, 0)), scale_cache);
+    dequant_e8m0_scales_to_half2(
+        static_cast<int>(qword_from_vector(scale_words, 1)), scale_cache + 2);
   }
 
   CUTLASS_DEVICE
@@ -195,11 +216,7 @@ class Sm70Mxfp4IteratorB {
       int const cache_n =
           n_offset_ + thread_offset_.contiguous() +
           c * ThreadMap::Delta::kContiguous;
-      if constexpr (Shape::kN == 256) {
-        cache_metadata_vector_words(c, group, cache_n);
-      } else {
-        cache_metadata_lane_vectors(c, group, cache_n);
-      }
+      cache_metadata_e8m0_scales(c, group, cache_n);
     }
   }
 
@@ -364,7 +381,7 @@ __global__ __launch_bounds__(Warps * 32, 1)
 void sm70_marlin_mxfp4_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
-    cutlass::half_t const* __restrict__ b_scales,
+    uint8_t const* __restrict__ b_scales,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
   using Traits =
       Sm70Mxfp4GemmTraits<CtaM, CtaN, Warps, GroupSize>;
@@ -394,7 +411,7 @@ void sm70_marlin_mxfp4_gemm_kernel(
   typename Mma::IteratorB iterator_B(
       typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
-      reinterpret_cast<half const*>(b_scales), thread_idx, tb_offset_B);
+      reinterpret_cast<uint8_t const*>(b_scales), thread_idx, tb_offset_B);
 
   Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
   typename Mma::FragmentC accumulators;
@@ -434,7 +451,7 @@ torch::Tensor launch_sm70_marlin_mxfp4_gemm(
   kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
-      reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
+      reinterpret_cast<uint8_t const*>(b_scales.data_ptr()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
       static_cast<int>(size_m), static_cast<int>(size_n),
       static_cast<int>(size_k), static_cast<int>(a.stride(0)));

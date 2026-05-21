@@ -2113,7 +2113,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 size_n=64,
             )
 
-    def test_marlin_dense_mxfp4_rejects_raw_e8m0_scales_and_wrong_routing():
+    def test_marlin_dense_mxfp4_rejects_fp16_scales_and_wrong_routing():
         _require_marlin_cuda()
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
@@ -2126,13 +2126,13 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
         workspace = marlin_make_workspace_new(a.device)
 
-        with pytest.raises(RuntimeError, match="preconverted float16 MXFP4 scales"):
+        with pytest.raises(RuntimeError, match="float8_e8m0fnu"):
             ops.marlin_gemm(
                 a,
                 None,
                 q_w,
                 None,
-                scales.to(torch.float8_e8m0fnu),
+                scales.to(torch.float32).to(torch.float16),
                 None,
                 None,
                 None,
@@ -2237,7 +2237,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         with pytest.raises(RuntimeError, match="SM70 build only supports float16 outputs"):
             ops.marlin_gemm(a, c_bf16, *common_args)
 
-        with pytest.raises(RuntimeError, match="preconverted float16 MXFP4 scales"):
+        with pytest.raises(RuntimeError, match="float8_e8m0fnu"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2365,7 +2365,9 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
             device="cuda",
             dtype=torch.int32,
         )
-        scales_bad_k = torch.ones((1, size_n), device="cuda", dtype=torch.float16)
+        scales_bad_k = torch.ones((1, size_n), device="cuda", dtype=torch.float32).to(
+            torch.float8_e8m0fnu
+        )
         with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
             ops.marlin_gemm(
                 a_bad_k,
@@ -2393,7 +2395,9 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         bad_n = 96
         a_bad_n = torch.randn((8, size_k), device="cuda", dtype=torch.float16)
         q_w_bad_n = torch.empty((size_k // 16, bad_n * 16 // 8), device="cuda", dtype=torch.int32)
-        scales_bad_n = torch.ones((size_k // 32, bad_n), device="cuda", dtype=torch.float16)
+        scales_bad_n = torch.ones(
+            (size_k // 32, bad_n), device="cuda", dtype=torch.float32
+        ).to(torch.float8_e8m0fnu)
         with pytest.raises(RuntimeError, match="requires size_n % 64 == 0"):
             ops.marlin_gemm(
                 a_bad_n,
