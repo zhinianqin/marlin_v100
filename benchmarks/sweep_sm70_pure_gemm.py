@@ -24,13 +24,18 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_ROOT = ROOT / "benchmarks" / "results"
 EXTENSION_PATH = ROOT / "python" / "marlin_v100" / "_C.abi3.so"
 
-CTA_M_CANDIDATES = (32, 64, 128, 256, 512)
-CTA_N_CANDIDATES = (64, 128, 256, 512)
+THREADBLOCK_CTA_M_CANDIDATES = (32, 64, 128, 256, 512)
+THREADBLOCK_CTA_N_CANDIDATES = (64, 128, 256, 512)
+CUTE_CTA_M_CANDIDATES = (8, 16, 32, 48, 64)
+CUTE_CTA_N_CANDIDATES = (64, 128, 256)
 CTA_K = 32
 CTA_K_CANDIDATES = (CTA_K,)
 WARP_CANDIDATES = (4, 8)
 STAGES = 2
-A_PATH_CUTLASS_THREADBLOCK = 2
+A_PATH_IDS = {
+    "cute_shared": 0,
+    "cutlass_threadblock": 2,
+}
 B_PATH_CUTLASS_SHARED = 0
 V100_PEAK_TFLOPS = 125.0
 
@@ -53,6 +58,12 @@ def default_mkn_shapes() -> tuple[tuple[int, int, int], ...]:
 
 
 DEFAULT_MKN = default_mkn_shapes()
+DEFAULT_CUTE_MKN = (
+    (384, 512, 512),
+    (768, 1024, 1024),
+    (1536, 4096, 4096),
+    (3072, 4096, 4096),
+)
 
 SUPPORTED_THREADBLOCK_CONFIGS = {
     (cta_m, cta_n, CTA_K, warps)
@@ -76,6 +87,14 @@ SUPPORTED_THREADBLOCK_CONFIGS = {
         (512, 64, 8),
     )
 }
+SUPPORTED_CUTE_CONFIGS = {
+    (cta_m, cta_n, CTA_K, warps)
+    for cta_m, cta_n, warps in product(
+        CUTE_CTA_M_CANDIDATES,
+        CUTE_CTA_N_CANDIDATES,
+        WARP_CANDIDATES,
+    )
+}
 
 RESULT_COLUMNS = (
     "M",
@@ -85,6 +104,7 @@ RESULT_COLUMNS = (
     "CTA_N",
     "CTA_K",
     "Warps",
+    "a_path",
     "status",
     "avg_us",
     "avg_tflops",
@@ -100,8 +120,11 @@ RESULT_COLUMNS = (
 )
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-KERNEL_RE = re.compile(
+THREADBLOCK_KERNEL_RE = re.compile(
     r"sm70_cutlass_threadblock_gemm_kernel<\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*>"
+)
+CUTE_KERNEL_RE = re.compile(
+    r"sm70_cute_gemm_kernel<\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*>"
 )
 RESOURCE_RE = re.compile(r"([A-Z]+(?:\[\d+\])?):([0-9]+)")
 SPILL_RE = re.compile(
@@ -113,15 +136,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Unattended SM70 pure GEMM tile/resource/benchmark sweep."
     )
+    parser.add_argument(
+        "--a-path",
+        choices=sorted(A_PATH_IDS),
+        default="cutlass_threadblock",
+        help="Probe path to sweep. Defaults to the extracted CUTLASS threadblock path.",
+    )
     parser.add_argument("--mkn", action="append", help="Shape as M,N,K. May be repeated.")
     parser.add_argument("--mkn-file", type=Path, help="Text file with one M,N,K per line.")
-    parser.add_argument("--cta-m", nargs="+", type=int, default=list(CTA_M_CANDIDATES))
-    parser.add_argument("--cta-n", nargs="+", type=int, default=list(CTA_N_CANDIDATES))
+    parser.add_argument("--cta-m", nargs="+", type=int)
+    parser.add_argument("--cta-n", nargs="+", type=int)
     parser.add_argument(
         "--cta-k",
         nargs="+",
         type=int,
-        default=list(CTA_K_CANDIDATES),
+        default=None,
         help="Compatibility option. The pure GEMM sweep only supports CTA_K=32.",
     )
     parser.add_argument("--warps", nargs="+", type=int, default=list(WARP_CANDIDATES))
@@ -147,6 +176,20 @@ def parse_args() -> argparse.Namespace:
         help="Record unsupported geometry and invalid shape rows.",
     )
     args = parser.parse_args()
+    if args.cta_m is None:
+        args.cta_m = list(
+            CUTE_CTA_M_CANDIDATES
+            if args.a_path == "cute_shared"
+            else THREADBLOCK_CTA_M_CANDIDATES
+        )
+    if args.cta_n is None:
+        args.cta_n = list(
+            CUTE_CTA_N_CANDIDATES
+            if args.a_path == "cute_shared"
+            else THREADBLOCK_CTA_N_CANDIDATES
+        )
+    if args.cta_k is None:
+        args.cta_k = list(CTA_K_CANDIDATES)
     if any(cta_k != CTA_K for cta_k in args.cta_k):
         parser.error("pure GEMM sweep only supports CTA_K=32")
     return args
@@ -179,7 +222,7 @@ def load_shapes(args: argparse.Namespace) -> list[tuple[int, int, int]]:
             except argparse.ArgumentTypeError as exc:
                 raise ValueError(f"{args.mkn_file}:{line_number}: {exc}") from exc
     if not shapes:
-        shapes.extend(DEFAULT_MKN)
+        shapes.extend(DEFAULT_CUTE_MKN if args.a_path == "cute_shared" else DEFAULT_MKN)
     return sorted(set(shapes))
 
 
@@ -272,16 +315,22 @@ def run_cuobjdump(out_dir: Path, env: dict[str, str]) -> str:
     return output
 
 
-def shape_from_text(text: str) -> tuple[int, int, int, int] | None:
-    match = KERNEL_RE.search(text)
-    if not match:
-        return None
-    return tuple(int(group) for group in match.groups())  # type: ignore[return-value]
+KernelKey = tuple[str, int, int, int, int]
 
 
-def parse_resource_usage(text: str) -> dict[tuple[int, int, int, int], dict[str, int]]:
-    resources: dict[tuple[int, int, int, int], dict[str, int]] = {}
-    current_key: tuple[int, int, int, int] | None = None
+def shape_from_text(text: str) -> KernelKey | None:
+    match = THREADBLOCK_KERNEL_RE.search(text)
+    if match:
+        return ("cutlass_threadblock", *(int(group) for group in match.groups()))
+    match = CUTE_KERNEL_RE.search(text)
+    if match:
+        return ("cute_shared", *(int(group) for group in match.groups()))
+    return None
+
+
+def parse_resource_usage(text: str) -> dict[KernelKey, dict[str, int]]:
+    resources: dict[KernelKey, dict[str, int]] = {}
+    current_key: KernelKey | None = None
     for line in text.splitlines():
         key = shape_from_text(line)
         if key is not None:
@@ -314,7 +363,7 @@ def demangle_names(names: list[str]) -> list[str]:
     return result.stdout.splitlines()
 
 
-def parse_ptxas_spills(text: str) -> dict[tuple[int, int, int, int], dict[str, int]]:
+def parse_ptxas_spills(text: str) -> dict[KernelKey, dict[str, int]]:
     clean_lines = strip_ansi(text).splitlines()
     entries: list[tuple[str, tuple[int, int, int]]] = []
     for index, line in enumerate(clean_lines):
@@ -329,7 +378,7 @@ def parse_ptxas_spills(text: str) -> dict[tuple[int, int, int, int], dict[str, i
         entries.append((name, (stack, stores, loads)))
 
     demangled = demangle_names([name for name, _ in entries])
-    spills: dict[tuple[int, int, int, int], dict[str, int]] = {}
+    spills: dict[KernelKey, dict[str, int]] = {}
     for (_, values), demangled_name in zip(entries, demangled):
         key = shape_from_text(demangled_name)
         if key is None:
@@ -386,8 +435,9 @@ def candidate_configs(args: argparse.Namespace) -> list[tuple[int, int, int, int
     ]
 
 
-def raw_key(record: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int]:
+def raw_key(record: dict[str, Any]) -> tuple[str, int, int, int, int, int, int, int, int]:
     return (
+        str(record.get("a_path", "cutlass_threadblock")),
         int(record["M"]),
         int(record["N"]),
         int(record["K"]),
@@ -399,8 +449,8 @@ def raw_key(record: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, 
     )
 
 
-def terminal_key(record: dict[str, Any]) -> tuple[int, int, int, int, int, int, int]:
-    return raw_key(record)[:7]
+def terminal_key(record: dict[str, Any]) -> tuple[str, int, int, int, int, int, int, int]:
+    return raw_key(record)[:8]
 
 
 def read_raw_records(raw_path: Path) -> list[dict[str, Any]]:
@@ -424,18 +474,21 @@ def append_raw_record(raw_path: Path, record: dict[str, Any]) -> None:
 
 
 def resource_for(
+    a_path: str,
     cfg: tuple[int, int, int, int],
-    resources: dict[tuple[int, int, int, int], dict[str, int]],
-    spills: dict[tuple[int, int, int, int], dict[str, int]],
+    resources: dict[KernelKey, dict[str, int]],
+    spills: dict[KernelKey, dict[str, int]],
 ) -> dict[str, int]:
-    resource = dict(resources.get(cfg, {}))
-    spill = spills.get(cfg, {})
+    key = (a_path, *cfg)
+    resource = dict(resources.get(key, {}))
+    spill = spills.get(key, {})
     resource["spill_stores"] = spill.get("spill_stores", 0)
     resource["spill_loads"] = spill.get("spill_loads", 0)
     return resource
 
 
 def base_record(
+    a_path: str,
     m: int,
     n: int,
     k: int,
@@ -454,6 +507,7 @@ def base_record(
         "CTA_N": cta_n,
         "CTA_K": cta_k,
         "Warps": warps,
+        "a_path": a_path,
         "repeat": repeat,
         "status": status,
         "latency_us": None,
@@ -471,8 +525,8 @@ def base_record(
 
 def run_config_repeats(
     raw_path: Path,
-    completed_repeats: set[tuple[int, int, int, int, int, int, int, int]],
-    terminal_configs: set[tuple[int, int, int, int, int, int, int]],
+    completed_repeats: set[tuple[str, int, int, int, int, int, int, int, int]],
+    terminal_configs: set[tuple[str, int, int, int, int, int, int, int]],
     m: int,
     n: int,
     k: int,
@@ -484,13 +538,20 @@ def run_config_repeats(
     reference: torch.Tensor,
 ) -> None:
     cta_m, cta_n, cta_k, warps = cfg
-    term_key = (m, n, k, cta_m, cta_n, cta_k, warps)
+    a_path = str(args.a_path)
+    term_key = (a_path, m, n, k, cta_m, cta_n, cta_k, warps)
     if term_key in terminal_configs:
         return
 
-    if cfg not in SUPPORTED_THREADBLOCK_CONFIGS:
+    supported_configs = (
+        SUPPORTED_CUTE_CONFIGS
+        if a_path == "cute_shared"
+        else SUPPORTED_THREADBLOCK_CONFIGS
+    )
+    if cfg not in supported_configs:
         if args.include_unsupported:
             record = base_record(
+                a_path,
                 m,
                 n,
                 k,
@@ -498,7 +559,7 @@ def run_config_repeats(
                 -1,
                 "unsupported_geometry",
                 resources,
-                "No canonical SM70 threadblock warp shape is instantiated for this config.",
+                f"No SM70 {a_path} kernel is instantiated for this config.",
             )
             append_raw_record(raw_path, record)
             terminal_configs.add(term_key)
@@ -507,6 +568,7 @@ def run_config_repeats(
     if m % cta_m != 0 or n % cta_n != 0 or k % cta_k != 0:
         if args.include_unsupported:
             record = base_record(
+                a_path,
                 m,
                 n,
                 k,
@@ -529,7 +591,7 @@ def run_config_repeats(
             cta_k,
             warps,
             STAGES,
-            A_PATH_CUTLASS_THREADBLOCK,
+            A_PATH_IDS[a_path],
             B_PATH_CUTLASS_SHARED,
         )
 
@@ -539,19 +601,19 @@ def run_config_repeats(
         torch.testing.assert_close(output, reference, rtol=args.rtol, atol=args.atol)
         diff = max_abs_diff(output, reference)
     except Exception as exc:
-        record = base_record(m, n, k, cfg, -1, "failure", resources, str(exc).splitlines()[0][:240])
+        record = base_record(a_path, m, n, k, cfg, -1, "failure", resources, str(exc).splitlines()[0][:240])
         append_raw_record(raw_path, record)
         terminal_configs.add(term_key)
         return
 
     for repeat in range(args.repeats):
-        key = (m, n, k, cta_m, cta_n, cta_k, warps, repeat)
+        key = (a_path, m, n, k, cta_m, cta_n, cta_k, warps, repeat)
         if key in completed_repeats:
             continue
         try:
             stats = time_probe(run, warmup_iters=args.warmup_iters, iters=args.iters)
             latency_us = float(stats["median_us"])
-            record = base_record(m, n, k, cfg, repeat, "ok", resources)
+            record = base_record(a_path, m, n, k, cfg, repeat, "ok", resources)
             record.update(
                 {
                     "latency_us": latency_us,
@@ -563,19 +625,19 @@ def run_config_repeats(
                 }
             )
         except Exception as exc:
-            record = base_record(m, n, k, cfg, repeat, "failure", resources, str(exc).splitlines()[0][:240])
+            record = base_record(a_path, m, n, k, cfg, repeat, "failure", resources, str(exc).splitlines()[0][:240])
         append_raw_record(raw_path, record)
         completed_repeats.add(key)
 
 
 def aggregate_records(records: list[dict[str, Any]], target_repeats: int) -> list[dict[str, Any]]:
-    grouped: dict[tuple[int, int, int, int, int, int, int], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, int, int, int, int, int, int, int], list[dict[str, Any]]] = {}
     for record in records:
         grouped.setdefault(terminal_key(record), []).append(record)
 
     rows: list[dict[str, Any]] = []
     for key, group in sorted(grouped.items()):
-        m, n, k, cta_m, cta_n, cta_k, warps = key
+        a_path, m, n, k, cta_m, cta_n, cta_k, warps = key
         ok_records = [record for record in group if record["status"] == "ok"]
         first = group[0]
         row = {
@@ -586,6 +648,7 @@ def aggregate_records(records: list[dict[str, Any]], target_repeats: int) -> lis
             "CTA_N": cta_n,
             "CTA_K": cta_k,
             "Warps": warps,
+            "a_path": a_path,
             "REG": first.get("REG", -1),
             "STACK": first.get("STACK", -1),
             "LOCAL": first.get("LOCAL", -1),
@@ -653,6 +716,7 @@ def markdown_table(rows: list[dict[str, Any]], columns: tuple[str, ...]) -> str:
 
 def write_sorted_tables(out_dir: Path, rows: list[dict[str, Any]]) -> None:
     columns = (
+        "a_path",
         "CTA_M",
         "CTA_N",
         "CTA_K",
@@ -666,12 +730,21 @@ def write_sorted_tables(out_dir: Path, rows: list[dict[str, Any]]) -> None:
         "spill_loads",
         "repeats",
     )
-    shapes = sorted({(int(row["M"]), int(row["N"]), int(row["K"])) for row in rows})
-    for m, n, k in shapes:
+    shapes = sorted(
+        {
+            (str(row.get("a_path", "cutlass_threadblock")), int(row["M"]), int(row["N"]), int(row["K"]))
+            for row in rows
+        }
+    )
+    for a_path, m, n, k in shapes:
         ok_rows = [
             row
             for row in rows
-            if row["M"] == m and row["N"] == n and row["K"] == k and row["status"] in {"ok", "partial_ok"}
+            if row.get("a_path", "cutlass_threadblock") == a_path
+            and row["M"] == m
+            and row["N"] == n
+            and row["K"] == k
+            and row["status"] in {"ok", "partial_ok"}
         ]
         by_tflops = sorted(
             ok_rows,
@@ -688,7 +761,7 @@ def write_sorted_tables(out_dir: Path, rows: list[dict[str, Any]]) -> None:
                 int(row["LOCAL"]),
             ),
         )
-        stem = f"M{m}_N{n}_K{k}"
+        stem = f"{a_path}_M{m}_N{n}_K{k}"
         (out_dir / f"{stem}_tflops.md").write_text(
             f"# {stem} TFLOPs sort\n\n" + markdown_table(by_tflops, columns),
             encoding="utf-8",
@@ -714,8 +787,12 @@ def git_commit() -> str:
 def write_summary(out_dir: Path, rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
     ok_rows = [row for row in rows if row["status"] in {"ok", "partial_ok"}]
     best_by_shape: list[dict[str, Any]] = []
-    for shape in sorted({(row["M"], row["N"], row["K"]) for row in ok_rows}):
-        shape_rows = [row for row in ok_rows if (row["M"], row["N"], row["K"]) == shape]
+    for shape in sorted({(row["a_path"], row["M"], row["N"], row["K"]) for row in ok_rows}):
+        shape_rows = [
+            row
+            for row in ok_rows
+            if (row["a_path"], row["M"], row["N"], row["K"]) == shape
+        ]
         best_by_shape.append(max(shape_rows, key=lambda row: float(row["avg_tflops"])))
 
     status_counts: dict[str, int] = {}
@@ -727,6 +804,7 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]], args: argparse.Name
         "",
         f"- Timestamp: {timestamp()}",
         f"- Git commit: {git_commit()}",
+        f"- A path: {args.a_path}",
         f"- Repeats: {args.repeats}",
         f"- Warmup iters: {args.warmup_iters}",
         f"- Timed iters: {args.iters}",
@@ -742,6 +820,7 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]], args: argparse.Name
                 "M",
                 "N",
                 "K",
+                "a_path",
                 "CTA_M",
                 "CTA_N",
                 "CTA_K",
@@ -811,6 +890,7 @@ def main() -> None:
 
     shapes = load_shapes(args)
     configs = candidate_configs(args)
+    print(f"A path: {args.a_path}")
     print(f"Shapes: {len(shapes)}")
     print(f"Candidate configs: {len(configs)}")
 
@@ -832,7 +912,7 @@ def main() -> None:
                 k,
                 cfg,
                 args,
-                resource_for(cfg, resources, spills),
+                resource_for(str(args.a_path), cfg, resources, spills),
                 a,
                 b,
                 reference,

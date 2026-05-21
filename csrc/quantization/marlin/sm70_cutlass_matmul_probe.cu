@@ -13,6 +13,7 @@
 #include "cutlass/epilogue/threadblock/default_epilogue_volta_tensor_op.h"
 #include "cutlass/gemm/threadblock/default_mma.h"
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
+#include "cute/algorithm/cooperative_gemm.hpp"
 #include "cute/tensor.hpp"
 #include "cute/swizzle.hpp"
 #include "cute/swizzle_layout.hpp"
@@ -63,10 +64,11 @@ void check_probe_inputs(const at::Tensor& a, const at::Tensor& b,
               "sm70_cutlass_matmul_probe: A direct-global path is TODO; only "
               "CUTLASS 3 CuTe shared-memory path id 0 and extracted CUTLASS "
               "threadblock path id 2 are available");
-  TORCH_CHECK(cta_m == 8 || cta_m == 16 || cta_m == 32 || cta_m == 64 ||
-                  cta_m == 128 || cta_m == 256 || cta_m == 512,
-              "sm70_cutlass_matmul_probe: cta_m must be 8, 16, 32, 64, "
-              "128, 256, or 512");
+  TORCH_CHECK(cta_m == 8 || cta_m == 16 || cta_m == 32 || cta_m == 48 ||
+                  cta_m == 64 || cta_m == 128 || cta_m == 256 ||
+                  cta_m == 512,
+              "sm70_cutlass_matmul_probe: cta_m must be 8, 16, 32, 48, "
+              "64, 128, 256, or 512");
   TORCH_CHECK(cta_n == 32 || cta_n == 64 || cta_n == 128 || cta_n == 256 ||
                   cta_n == 512,
               "sm70_cutlass_matmul_probe: cta_n must be 32, 64, 128, "
@@ -92,17 +94,24 @@ void check_probe_inputs(const at::Tensor& a, const at::Tensor& b,
               major, minor);
 }
 
-template <int Warps>
-struct Sm70AtomLayout;
+template <int CTA_M, int CTA_N, int Warps>
+struct Sm70AtomLayout {
+  static_assert(CTA_M == 8 || CTA_M == 16 || CTA_M == 32 || CTA_M == 48 ||
+                    CTA_M == 64,
+                "SM70 CuTe native probe supports CTA_M in {8,16,32,48,64}.");
+  static_assert(CTA_N == 64 || CTA_N == 128 || CTA_N == 256,
+                "SM70 CuTe native probe supports CTA_N in {64,128,256}.");
+  static_assert(Warps == 4 || Warps == 8,
+                "SM70 CuTe native probe supports 4 or 8 warps.");
 
-template <>
-struct Sm70AtomLayout<4> {
-  using Type = cute::Layout<cute::Shape<cute::Int<4>, cute::Int<4>, cute::Int<1>>>;
-};
-
-template <>
-struct Sm70AtomLayout<8> {
-  using Type = cute::Layout<cute::Shape<cute::Int<4>, cute::Int<8>, cute::Int<1>>>;
+  static constexpr int kAtomM =
+      CTA_M == 8 ? 1 : (CTA_M == 16 ? 2 : 4);
+  static_assert(kAtomM * 8 <= CTA_M,
+                "SM70 CuTe native atom layout must not pad logical M.");
+  static constexpr int kAtomN = (Warps * 4) / kAtomM;
+  using Type =
+      cute::Layout<cute::Shape<cute::Int<kAtomM>, cute::Int<kAtomN>,
+                               cute::Int<1>>>;
 };
 
 template <int CTA_M, int CTA_K>
@@ -127,6 +136,32 @@ CUTE_HOST_DEVICE auto make_smem_b_layout() {
   return tile_to_shape(atom_layout, make_shape(Int<CTA_N>{}, Int<CTA_K>{}));
 }
 
+template <int CTA_M, int CTA_K, int Threads, class SmemTensor>
+__device__ __forceinline__ void copy_a_gmem_to_smem_bounded(
+    const cutlass::half_t* __restrict__ a, SmemTensor& sA, int m0, int k0,
+    int k) {
+  static_assert(CTA_K == 32, "SM70 CuTe native A copy expects CTA_K=32.");
+  for (int linear = int(threadIdx.x); linear < CTA_M * CTA_K;
+       linear += Threads) {
+    int row = linear / CTA_K;
+    int col = linear - row * CTA_K;
+    sA(row, col) = a[(m0 + row) * k + (k0 + col)];
+  }
+}
+
+template <int CTA_N, int CTA_K, int Threads, class SmemTensor>
+__device__ __forceinline__ void copy_b_gmem_to_smem_bounded(
+    const cutlass::half_t* __restrict__ b, SmemTensor& sB, int n0, int k0,
+    int n) {
+  static_assert(CTA_K == 32, "SM70 CuTe native B copy expects CTA_K=32.");
+  for (int linear = int(threadIdx.x); linear < CTA_N * CTA_K;
+       linear += Threads) {
+    int col = linear / CTA_K;
+    int kk = linear - col * CTA_K;
+    sB(col, kk) = b[(k0 + kk) * n + (n0 + col)];
+  }
+}
+
 template <int CTA_M, int CTA_N, int CTA_K, int Warps>
 __global__ __launch_bounds__(Warps * 32, 1)
 void sm70_cute_gemm_kernel(const cutlass::half_t* __restrict__ a,
@@ -135,37 +170,20 @@ void sm70_cute_gemm_kernel(const cutlass::half_t* __restrict__ a,
                            int k) {
   using namespace cute;
 
+  static_assert(CTA_K == 32, "SM70 CuTe native probe supports CTA_K=32.");
+  static_assert(Sm70AtomLayout<CTA_M, CTA_N, Warps>::kAtomM * 8 <= CTA_M,
+                "SM70 CuTe native kernel must not use padded-M atom layout.");
   constexpr int kThreads = Warps * 32;
-  constexpr int kCopyAThrK = CTA_K / 8;
-  constexpr int kCopyAThrM = kThreads / kCopyAThrK;
-  constexpr int kCopyBThrN = CTA_N / 8;
-  constexpr int kCopyBThrK = kThreads / kCopyBThrN;
   auto tiled_mma = make_tiled_mma(
       SM70_8x8x4_F32F16F16F32_TN{},
-      typename Sm70AtomLayout<Warps>::Type{},
+      typename Sm70AtomLayout<CTA_M, CTA_N, Warps>::Type{},
       Tile<Int<CTA_M>, Int<CTA_N>, Int<4>>{});
-  TiledCopy copy_a = make_tiled_copy(
-      Copy_Atom<UniversalCopy<uint128_t>, cutlass::half_t>{},
-      Layout<Shape<Int<kCopyAThrM>, Int<kCopyAThrK>>,
-             Stride<Int<kCopyAThrK>, Int<1>>>{},
-      Layout<Shape<Int<1>, Int<8>>>{});
-  TiledCopy copy_b = make_tiled_copy(
-      Copy_Atom<UniversalCopy<uint128_t>, cutlass::half_t>{},
-      Layout<Shape<Int<kCopyBThrN>, Int<kCopyBThrK>>,
-             Stride<Int<1>, Int<kCopyBThrN>>>{},
-      Layout<Shape<Int<8>, Int<1>>>{});
 
-  Tensor mA = make_tensor(make_gmem_ptr(a), make_shape(m, k),
-                          make_stride(k, Int<1>{}));
-  Tensor mB = make_tensor(make_gmem_ptr(b), make_shape(n, k),
-                          make_stride(Int<1>{}, n));
   Tensor mC = make_tensor(make_gmem_ptr(c), make_shape(m, n),
                           make_stride(n, Int<1>{}));
 
   auto cta_tiler = make_shape(Int<CTA_M>{}, Int<CTA_N>{}, Int<CTA_K>{});
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
-  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});
-  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>{});
   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
 
   auto sA_layout = make_smem_a_layout<CTA_M, CTA_K>();
@@ -178,77 +196,33 @@ void sm70_cute_gemm_kernel(const cutlass::half_t* __restrict__ a,
   Tensor sA = make_tensor(make_smem_ptr(smem_a), sA_layout);
   Tensor sB = make_tensor(make_smem_ptr(smem_b), sB_layout);
 
-  auto thr_copy_a = copy_a.get_slice(threadIdx.x);
-  Tensor tAgA = thr_copy_a.partition_S(gA);
-  Tensor tAsA = thr_copy_a.partition_D(sA);
-  Tensor tArA = make_fragment_like(tAsA);
-
-  auto thr_copy_b = copy_b.get_slice(threadIdx.x);
-  Tensor tBgB = thr_copy_b.partition_S(gB);
-  Tensor tBsB = thr_copy_b.partition_D(sB);
-  Tensor tBrB = make_fragment_like(tBsB);
-
-  copy(copy_a, tAgA(_, _, _, 0), tArA);
-  copy(copy_b, tBgB(_, _, _, 0), tBrB);
-
   auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
   Tensor tCgC = thr_mma.partition_C(gC);
-  Tensor tCrA = thr_mma.partition_fragment_A(sA);
-  Tensor tCrB = thr_mma.partition_fragment_B(sB);
   Tensor tCrC = thr_mma.make_fragment_C(tCgC);
   clear(tCrC);
 
-  auto s2r_thr_copy_a =
-      make_tiled_copy_A(Copy_Atom<DefaultCopy, cutlass::half_t>{},
-                        tiled_mma)
-          .get_thread_slice(threadIdx.x);
-  Tensor tCsA = s2r_thr_copy_a.partition_S(sA);
-  Tensor tCrA_copy_view = s2r_thr_copy_a.retile_D(tCrA);
-
-  auto s2r_thr_copy_b =
-      make_tiled_copy_B(Copy_Atom<DefaultCopy, cutlass::half_t>{},
-                        tiled_mma)
-          .get_thread_slice(threadIdx.x);
-  Tensor tCsB = s2r_thr_copy_b.partition_S(sB);
-  Tensor tCrB_copy_view = s2r_thr_copy_b.retile_D(tCrB);
-
-  copy(tArA, tAsA);
-  copy(tBrB, tBsB);
-  __syncthreads();
-
-  copy(tCsA(_, _, 0), tCrA_copy_view(_, _, 0));
-  copy(tCsB(_, _, 0), tCrB_copy_view(_, _, 0));
-
+  int m0 = int(blockIdx.x) * CTA_M;
+  int n0 = int(blockIdx.y) * CTA_N;
   int k_tiles = k / CTA_K;
-  auto k_blocks = size<2>(tCrA);
   CUTE_NO_UNROLL
   for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
-    CUTE_UNROLL
-    for (int k_block = 0; k_block < k_blocks; ++k_block) {
-      if (k_block == k_blocks - 1) {
-        __syncthreads();
-        copy(tArA, tAsA);
-        copy(tBrB, tBsB);
-        __syncthreads();
-      }
+    int k0 = k_tile * CTA_K;
+    copy_a_gmem_to_smem_bounded<CTA_M, CTA_K, kThreads>(a, sA, m0, k0, k);
+    copy_b_gmem_to_smem_bounded<CTA_N, CTA_K, kThreads>(b, sB, n0, k0, n);
+    __syncthreads();
 
-      int k_block_next = (k_block + 1) % k_blocks;
-      copy(tCsA(_, _, k_block_next), tCrA_copy_view(_, _, k_block_next));
-      copy(tCsB(_, _, k_block_next), tCrB_copy_view(_, _, k_block_next));
-
-      if (k_block == 0) {
-        int k_tile_next = k_tile + 1 < k_tiles ? k_tile + 1 : k_tile;
-        copy(copy_a, tAgA(_, _, _, k_tile_next), tArA);
-        copy(copy_b, tBgB(_, _, _, k_tile_next), tBrB);
-      }
-
-      gemm(tiled_mma, tCrA(_, _, k_block), tCrB(_, _, k_block), tCrC);
-    }
+    cute::detail::cooperative_gemm_predication(thr_mma, sA, sB, tCrC,
+                                               identity{}, identity{});
+    __syncthreads();
   }
 
+  Tensor cC = make_identity_tensor(make_shape(Int<CTA_M>{}, Int<CTA_N>{}));
+  Tensor tCcC = thr_mma.partition_C(cC);
   CUTE_UNROLL
   for (int i = 0; i < size(tCrC); ++i) {
-    tCgC(i) = static_cast<cutlass::half_t>(tCrC(i));
+    if (elem_less(tCcC(i), make_coord(Int<CTA_M>{}, Int<CTA_N>{}))) {
+      tCgC(i) = static_cast<cutlass::half_t>(tCrC(i));
+    }
   }
 }
 
@@ -525,23 +499,17 @@ at::Tensor run_sm70_cutlass_threadblock_gemm(const at::Tensor& a,
     return run_sm70_cute_gemm<CM, CN, CK, W>(a, b);                       \
   }
 
-#define DISPATCH_CUTE_K(CM, CN, W)                                        \
-  DISPATCH_CUTE(CM, CN, 32, W)                                            \
-  DISPATCH_CUTE(CM, CN, 64, W)                                            \
-  DISPATCH_CUTE(CM, CN, 128, W)
-
 #define DISPATCH_CUTE_N(CM, W)                                            \
-  DISPATCH_CUTE_K(CM, 32, W)                                              \
-  DISPATCH_CUTE_K(CM, 64, W)                                              \
-  DISPATCH_CUTE_K(CM, 128, W)                                             \
-  DISPATCH_CUTE_K(CM, 256, W)
+  DISPATCH_CUTE(CM, 64, 32, W)                                            \
+  DISPATCH_CUTE(CM, 128, 32, W)                                           \
+  DISPATCH_CUTE(CM, 256, 32, W)
 
 #define DISPATCH_CUTE_M(W)                                                \
   DISPATCH_CUTE_N(8, W)                                                   \
   DISPATCH_CUTE_N(16, W)                                                  \
   DISPATCH_CUTE_N(32, W)                                                  \
-  DISPATCH_CUTE_N(64, W)                                                  \
-  DISPATCH_CUTE_N(128, W)
+  DISPATCH_CUTE_N(48, W)                                                  \
+  DISPATCH_CUTE_N(64, W)
 
 at::Tensor dispatch_sm70_cute_gemm(const at::Tensor& a, const at::Tensor& b,
                                    int64_t cta_m, int64_t cta_n,
@@ -550,14 +518,16 @@ at::Tensor dispatch_sm70_cute_gemm(const at::Tensor& a, const at::Tensor& b,
   DISPATCH_CUTE_M(8)
 
   TORCH_CHECK(false,
-              "sm70_cutlass_matmul_probe: unsupported CUTLASS 3 CuTe config "
+              "sm70_cutlass_matmul_probe: unsupported CUTLASS 3 CuTe native config "
               "cta_m=", cta_m, ", cta_n=", cta_n, ", cta_k=", cta_k,
-              ", warps=", warps);
+              ", warps=", warps,
+              ". Supported native CuTe shapes are CTA_M in {8, 16, 32, "
+              "48, 64}, CTA_N in {64, 128, 256}, CTA_K=32, and warps in "
+              "{4, 8}.");
 }
 
 #undef DISPATCH_CUTE_M
 #undef DISPATCH_CUTE_N
-#undef DISPATCH_CUTE_K
 #undef DISPATCH_CUTE
 
 #define DISPATCH_THREADBLOCK(CM, CN, CK, W)                               \

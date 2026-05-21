@@ -48,6 +48,12 @@ _CTA_GEOMETRY_CASES = (
     ("256x64x8", 256, 256),
     ("256x128x8", 256, 256),
 )
+_SM70_CUTE_NATIVE_CASES = tuple(
+    (cta_m, cta_n, warps)
+    for cta_m in (8, 16, 32, 48, 64)
+    for cta_n in (64, 128, 256)
+    for warps in (4, 8)
+)
 _FP8_CTA_GEOMETRY_CASES = (
     ("64x128x4", 64, 256),
     ("128x256x8", 128, 256),
@@ -103,6 +109,26 @@ def test_sm70_cutlass_matmul_probe_matches_torch_mm():
     torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize(("cta_m", "cta_n", "warps"), _SM70_CUTE_NATIVE_CASES)
+def test_sm70_cutlass_matmul_probe_cute_native_shapes_match_torch_mm(
+    cta_m: int, cta_n: int, warps: int
+):
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    m = cta_m * 2
+    n = cta_n
+    k = 64
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_probe(a, b, cta_m, cta_n, 32, warps, 2, 0, 0)
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
 def test_sm70_cutlass_matmul_probe_threadblock_path_matches_torch_mm():
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -148,6 +174,24 @@ def test_sm70_cutlass_matmul_probe_rejects_unsupported_threadblock_shape():
 
     with pytest.raises(RuntimeError, match="unsupported extracted CUTLASS"):
         ops.sm70_cutlass_matmul_probe(a, b, 512, 512, 32, 8, 2, 2, 0)
+
+
+@pytest.mark.parametrize(
+    ("cta_m", "cta_n", "cta_k", "warps"),
+    [
+        (32, 32, 32, 4),
+        (32, 64, 64, 4),
+    ],
+)
+def test_sm70_cutlass_matmul_probe_rejects_unsupported_cute_native_shape(
+    cta_m: int, cta_n: int, cta_k: int, warps: int
+):
+    _require_marlin_cuda()
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="unsupported CUTLASS 3 CuTe native"):
+        ops.sm70_cutlass_matmul_probe(a, b, cta_m, cta_n, cta_k, warps, 2, 0, 0)
 
 
 def test_sm70_cutlass_matmul_probe_rejects_direct_a_path():
@@ -1901,7 +1945,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="supports global_scale only for nvfp4"):
+        with pytest.raises(RuntimeError, match="b_scales must be float8_e4m3fn"):
             ops.marlin_gemm(
                 a,
                 None,

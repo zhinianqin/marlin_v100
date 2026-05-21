@@ -16,8 +16,8 @@ from common import (
 from marlin_v100 import ops
 
 
-CTA_M_CANDIDATES = (8, 16, 32, 64, 128)
-CTA_N_CANDIDATES = (32, 64, 128, 256)
+CTA_M_CANDIDATES = (8, 16, 32, 48, 64)
+CTA_N_CANDIDATES = (64, 128, 256)
 CTA_K = 32
 CTA_K_CANDIDATES = (CTA_K,)
 WARP_CANDIDATES = (4, 8)
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         description="Benchmark the private SM70 CUTLASS matmul probe."
     )
     parser.add_argument("--preset", choices=("quick", "full"), default="quick")
-    parser.add_argument("--m", type=int, default=256)
+    parser.add_argument("--m", type=int, default=384)
     parser.add_argument("--n", type=int, default=512)
     parser.add_argument("--k", type=int, default=512)
     parser.add_argument("--warmup-iters", type=int, default=10)
@@ -90,17 +90,17 @@ def max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
 
 def candidate_configs(args: argparse.Namespace):
     if args.preset == "quick":
-        cta_m_values = (64, 128)
-        cta_n_values = (64, 128, 256)
+        cta_m_values = (8, 32, 64)
+        cta_n_values = (64, 128)
         cta_k_values = (32,)
         warp_values = (4, 8)
-        a_paths = args.a_paths or ("cutlass_threadblock", "cutlass_shared")
+        a_paths = args.a_paths or ("cutlass_shared",)
     else:
         cta_m_values = CTA_M_CANDIDATES
         cta_n_values = CTA_N_CANDIDATES
         cta_k_values = CTA_K_CANDIDATES
         warp_values = WARP_CANDIDATES
-        a_paths = args.a_paths or ("cutlass_shared", "direct_global")
+        a_paths = args.a_paths or ("cutlass_shared",)
 
     cta_m_values = tuple(args.cta_m or cta_m_values)
     cta_n_values = tuple(args.cta_n or cta_n_values)
