@@ -34,13 +34,13 @@ torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
 torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zp_bias, int64_t size_m,
+                                  torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size);
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zp_bias, int64_t size_m,
+                                  torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size);
 torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
@@ -89,12 +89,12 @@ torch::Tensor marlin_gemm(
     torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
     torch::Tensor& b_q_weight,
     std::optional<torch::Tensor> const& b_bias_or_none, torch::Tensor& b_scales,
-    std::optional<torch::Tensor> const& b_zp_bias_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
     std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool use_zp_bias) {
+    bool is_zp_float) {
   TORCH_CHECK_NOT_IMPLEMENTED(false,
                               "marlin_gemm(..) requires an SM70 build.");
   return torch::empty({1, 1});
@@ -561,12 +561,12 @@ torch::Tensor marlin_gemm(
     std::optional<torch::Tensor> const& b_bias_or_none, torch::Tensor& b_scales,
     std::optional<torch::Tensor> const& a_scales_or_none,
     std::optional<torch::Tensor> const& global_scale_or_none,
-    std::optional<torch::Tensor> const& b_zp_bias_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
     std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
-    bool use_zp_bias) {
+    bool is_zp_float) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -822,37 +822,37 @@ torch::Tensor marlin_gemm(
     b_bias = torch::empty({0}, options);
   }
 
-  torch::Tensor b_zp_bias;
-  if (b_zp_bias_or_none.has_value()) {
-    b_zp_bias = b_zp_bias_or_none.value();
-    TORCH_CHECK(b_zp_bias.device().is_cuda(), "b_zp_bias is not on GPU");
-    TORCH_CHECK(b_zp_bias.is_contiguous(),
-                "b_zp_bias is not contiguous");
+  torch::Tensor b_zeros;
+  if (b_zeros_or_none.has_value()) {
+    b_zeros = b_zeros_or_none.value();
+    TORCH_CHECK(b_zeros.device().is_cuda(), "b_zeros is not on GPU");
+    TORCH_CHECK(b_zeros.is_contiguous(),
+                "b_zeros is not contiguous");
   } else {
-    b_zp_bias = torch::empty({0}, options);
+    b_zeros = torch::empty({0}, options);
   }
-  bool has_zp_bias = b_zp_bias.size(-1) > 0;
+  bool has_zp = b_zeros.size(-1) > 0;
 
-  // Verify precomputed zero-point bias metadata for dense uint4/uint8.
-  if (has_zp_bias) {
-    TORCH_CHECK(use_zp_bias,
-                "SM70 CUTLASS dense prototype received b_zp_bias but "
-                "use_zp_bias is false. Packed integer zero-points are not "
+  // Verify fp16 zero-point metadata for dense uint4/uint8.
+  if (has_zp) {
+    TORCH_CHECK(is_zp_float,
+                "SM70 CUTLASS dense prototype received b_zeros but "
+                "is_zp_float is false. Packed integer zero-points are not "
                 "supported on the dense SM70 uint4/uint8 path.");
-    int rank = b_zp_bias.sizes().size();
-    TORCH_CHECK(rank == 2, "b_zp_bias rank = ", rank, " is not 2");
-    TORCH_CHECK(b_zp_bias.scalar_type() == at::ScalarType::Half,
+    int rank = b_zeros.sizes().size();
+    TORCH_CHECK(rank == 2, "b_zeros rank = ", rank, " is not 2");
+    TORCH_CHECK(b_zeros.scalar_type() == at::ScalarType::Half,
                 "SM70 CUTLASS uint4/uint8 dense prototype expects fp16 "
-                "precomputed zero-point bias.");
-    TORCH_CHECK(b_zp_bias.size(1) == size_n,
-                "b_zp_bias dim 1 = ", b_zp_bias.size(1),
+                "zero points.");
+    TORCH_CHECK(b_zeros.size(1) == size_n,
+                "b_zeros dim 1 = ", b_zeros.size(1),
                 " is not size_n = ", size_n);
-    TORCH_CHECK(num_groups == b_zp_bias.size(0),
-                "b_zp_bias dim 0 = ", b_zp_bias.size(0),
+    TORCH_CHECK(num_groups == b_zeros.size(0),
+                "b_zeros dim 0 = ", b_zeros.size(0),
                 " is not num_groups = ", num_groups);
   } else {
-    TORCH_CHECK(!use_zp_bias,
-                "use_zp_bias is true but b_zp_bias was not provided.");
+    TORCH_CHECK(!is_zp_float,
+                "is_zp_float is true but b_zeros was not provided.");
   }
 
   // Verify workspace size
@@ -903,10 +903,9 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(size_k % 32 == 0,
                 "SM70 CUTLASS uint4 dense prototype requires size_k % 32 == 0.");
     TORCH_CHECK(
-        has_zp_bias && use_zp_bias,
-        "SM70 CUTLASS uint4 dense prototype requires fp16 precomputed "
-        "zero-point bias.");
-    return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zp_bias, size_m,
+        has_zp && is_zp_float,
+        "SM70 CUTLASS uint4 dense prototype requires fp16 zero points.");
+    return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
                                size_n, size_k, group_size);
   }
 
@@ -914,10 +913,9 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(size_k % 32 == 0,
                 "SM70 CUTLASS uint8 dense prototype requires size_k % 32 == 0.");
     TORCH_CHECK(
-        has_zp_bias && use_zp_bias,
-        "SM70 CUTLASS uint8 dense prototype requires fp16 precomputed "
-        "zero-point bias.");
-    return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales, b_zp_bias, size_m,
+        has_zp && is_zp_float,
+        "SM70 CUTLASS uint8 dense prototype requires fp16 zero points.");
+    return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
                                size_n, size_k, group_size);
   }
 
@@ -925,9 +923,9 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(
         size_k % 32 == 0,
         "SM70 CUTLASS uint8b128 dense prototype requires size_k % 32 == 0.");
-    TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+    TORCH_CHECK(!has_zp && !is_zp_float,
                 "SM70 CUTLASS uint8b128 prototype does not support "
-                "zero-point bias metadata.");
+                "zero-point metadata.");
     return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                    size_k, group_size);
   }
@@ -940,9 +938,9 @@ torch::Tensor marlin_gemm(
                 "SM70 CUTLASS fp8 prototype supports only group_size -1 or "
                 "128. Got ",
                 group_size);
-    TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+    TORCH_CHECK(!has_zp && !is_zp_float,
                 "SM70 CUTLASS fp8 prototype does not support zero-point "
-                "bias metadata.");
+                "metadata.");
     return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                 size_k, group_size);
   }
@@ -951,9 +949,9 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(
         size_k % 32 == 0,
         "SM70 CUTLASS fp4 dense prototype requires size_k % 32 == 0.");
-    TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+    TORCH_CHECK(!has_zp && !is_zp_float,
                 "SM70 CUTLASS fp4 prototype does not support zero-point "
-                "bias metadata.");
+                "metadata.");
     if (global_scale.numel() == 1) {
       TORCH_CHECK(group_size == 16,
                   "SM70 CUTLASS nvfp4 prototype supports only group_size 16. "
@@ -971,21 +969,21 @@ torch::Tensor marlin_gemm(
                                   size_k, group_size);
   }
 
-  TORCH_CHECK(!has_zp_bias && !use_zp_bias,
+  TORCH_CHECK(!has_zp && !is_zp_float,
               "SM70 CUTLASS uint4b8 prototype does not support zero-point "
-              "bias metadata.");
+              "metadata.");
   return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                size_k, group_size);
 
   marlin::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
-      global_scale.data_ptr(), b_zp_bias.data_ptr(), g_idx.data_ptr(),
+      global_scale.data_ptr(), b_zeros.data_ptr(), g_idx.data_ptr(),
       perm.data_ptr(), a_tmp.data_ptr(), size_m, size_n, size_k, a.stride(0),
       workspace.data_ptr(), a_type, b_type, c_type, s_type, has_bias,
-      has_act_order, is_k_full, has_zp_bias, num_groups, group_size, dev,
+      has_act_order, is_k_full, has_zp, num_groups, group_size, dev,
       at::cuda::getCurrentCUDAStream(dev), thread_k, thread_n, sms,
-      use_atomic_add, use_fp32_reduce, use_zp_bias);
+      use_atomic_add, use_fp32_reduce, is_zp_float);
 
   return c;
 }

@@ -20,8 +20,8 @@ from tests.helpers import (
     marlin_dequantize_mxfp4,
     marlin_dequantize_nvfp4,
     marlin_dequantize_uint4_zp,
-    marlin_dequantize_uint4_zp_bias,
-    marlin_dequantize_uint8_zp_bias,
+    marlin_dequantize_uint4_packed_zp,
+    marlin_dequantize_uint8_zp,
     marlin_dequantize,
     marlin_unpack,
     marlin_quantize,
@@ -32,8 +32,8 @@ from tests.helpers import (
     marlin_quantize_experts,
     marlin_quantize_experts_with_metadata,
     marlin_quantize_uint4_zp,
-    marlin_quantize_uint4_zp_bias,
-    marlin_quantize_uint8_zp_bias,
+    marlin_quantize_uint4_packed_zp,
+    marlin_quantize_uint8_zp,
     scalar_types,
 )
 
@@ -358,10 +358,12 @@ def test_marlin_quantize_rejects_group_size_zero_outside_runtime_act_order_path(
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-def test_marlin_quantize_uint4_zp_round_trip_matches_original_weight(group_size: int):
+def test_marlin_quantize_uint4_packed_zp_round_trip_matches_original_weight(group_size: int):
     torch.manual_seed(0)
     weight = torch.randn((128, 256), dtype=torch.float16)
-    _weight, q_weight, scales, zero_points, dequantized = marlin_quantize_uint4_zp(weight, group_size)
+    _weight, q_weight, scales, zero_points, dequantized = marlin_quantize_uint4_packed_zp(
+        weight, group_size
+    )
 
     assert q_weight.shape == (weight.shape[0] // 16, weight.shape[1] * 16 // 8)
     assert scales.shape == (
@@ -378,35 +380,35 @@ def test_marlin_quantize_uint4_zp_round_trip_matches_original_weight(group_size:
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-def test_marlin_quantize_uint4_zp_bias_round_trip_matches_original_weight(group_size: int):
+def test_marlin_quantize_uint4_zp_round_trip_matches_original_weight(group_size: int):
     torch.manual_seed(0)
     weight = torch.randn((128, 256), dtype=torch.float16)
-    _weight, q_weight, scales, zp_bias, dequantized = marlin_quantize_uint4_zp_bias(weight, group_size)
+    _weight, q_weight, scales, zp, dequantized = marlin_quantize_uint4_zp(weight, group_size)
 
     assert q_weight.shape == (weight.shape[0] // 16, weight.shape[1] * 16 // 8)
     assert scales.shape == (
         1 if group_size == -1 else weight.shape[0] // group_size,
         weight.shape[1],
     )
-    assert zp_bias.shape == scales.shape
-    assert zp_bias.dtype == torch.float16
+    assert zp.shape == scales.shape
+    assert zp.dtype == torch.float16
     assert torch.isfinite(dequantized).all()
     torch.testing.assert_close(dequantized, weight, atol=4.0e-1, rtol=3.0e-1)
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-def test_marlin_quantize_uint8_zp_bias_round_trip_matches_original_weight(group_size: int):
+def test_marlin_quantize_uint8_zp_round_trip_matches_original_weight(group_size: int):
     torch.manual_seed(0)
     weight = torch.randn((128, 256), dtype=torch.float16)
-    _weight, q_weight, scales, zp_bias, dequantized = marlin_quantize_uint8_zp_bias(weight, group_size)
+    _weight, q_weight, scales, zp, dequantized = marlin_quantize_uint8_zp(weight, group_size)
 
     assert q_weight.shape == (weight.shape[0] // 16, weight.shape[1] * 16 // 4)
     assert scales.shape == (
         1 if group_size == -1 else weight.shape[0] // group_size,
         weight.shape[1],
     )
-    assert zp_bias.shape == scales.shape
-    assert zp_bias.dtype == torch.float16
+    assert zp.shape == scales.shape
+    assert zp.dtype == torch.float16
     assert torch.isfinite(dequantized).all()
     torch.testing.assert_close(dequantized, weight, atol=5.0e-2, rtol=5.0e-2)
 
@@ -431,11 +433,13 @@ def test_marlin_quantize_experts_uint4_zp_round_trip_matches_original_weights(gr
     torch.testing.assert_close(dequantized, weights, atol=4.0e-1, rtol=3.0e-1)
 
 
-def test_marlin_dequantize_uint4_zp_matches_quantize_helper_output():
+def test_marlin_dequantize_uint4_packed_zp_matches_quantize_helper_output():
     torch.manual_seed(0)
     weight = torch.randn((128, 256), dtype=torch.float16)
-    _weight, q_weight, scales, zero_points, dequantized = marlin_quantize_uint4_zp(weight, 64)
-    roundtrip = marlin_dequantize_uint4_zp(
+    _weight, q_weight, scales, zero_points, dequantized = marlin_quantize_uint4_packed_zp(
+        weight, 64
+    )
+    roundtrip = marlin_dequantize_uint4_packed_zp(
         q_weight,
         scales,
         zero_points,
@@ -448,37 +452,37 @@ def test_marlin_dequantize_uint4_zp_matches_quantize_helper_output():
     torch.testing.assert_close(roundtrip, dequantized, atol=0.0, rtol=0.0)
 
 
-def test_marlin_dequantize_uint4_zp_bias_matches_quantize_helper_output():
+def test_marlin_dequantize_uint4_zp_matches_quantize_helper_output():
     torch.manual_seed(0)
     weight = torch.randn((128, 256), dtype=torch.float16)
-    _weight, q_weight, scales, zp_bias, dequantized = marlin_quantize_uint4_zp_bias(weight, 64)
-    roundtrip = marlin_dequantize_uint4_zp_bias(
+    _weight, q_weight, scales, zp, dequantized = marlin_quantize_uint4_zp(weight, 64)
+    roundtrip = marlin_dequantize_uint4_zp(
         q_weight,
         scales,
-        zp_bias,
+        zp,
         size_k=weight.shape[0],
         size_n=weight.shape[1],
         group_size=64,
     )
 
-    assert zp_bias.dtype == torch.float16
+    assert zp.dtype == torch.float16
     torch.testing.assert_close(roundtrip, dequantized, atol=0.0, rtol=0.0)
 
 
-def test_marlin_dequantize_uint8_zp_bias_matches_quantize_helper_output():
+def test_marlin_dequantize_uint8_zp_matches_quantize_helper_output():
     torch.manual_seed(0)
     weight = torch.randn((128, 256), dtype=torch.float16)
-    _weight, q_weight, scales, zp_bias, dequantized = marlin_quantize_uint8_zp_bias(weight, 64)
-    roundtrip = marlin_dequantize_uint8_zp_bias(
+    _weight, q_weight, scales, zp, dequantized = marlin_quantize_uint8_zp(weight, 64)
+    roundtrip = marlin_dequantize_uint8_zp(
         q_weight,
         scales,
-        zp_bias,
+        zp,
         size_k=weight.shape[0],
         size_n=weight.shape[1],
         group_size=64,
     )
 
-    assert zp_bias.dtype == torch.float16
+    assert zp.dtype == torch.float16
     torch.testing.assert_close(roundtrip, dequantized, atol=0.0, rtol=0.0)
 
 

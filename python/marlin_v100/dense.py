@@ -57,18 +57,18 @@ def run_marlin_gemm(
     b_bias: torch.Tensor | None = None,
     a_scales: torch.Tensor | None = None,
     global_scale: torch.Tensor | None = None,
-    b_zp_bias: torch.Tensor | None = None,
+    b_zeros: torch.Tensor | None = None,
     g_idx: torch.Tensor | None = None,
     perm: torch.Tensor | None = None,
     is_k_full: bool = True,
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = True,
-    use_zp_bias: bool | None = None,
+    is_zp_float: bool | None = None,
 ) -> torch.Tensor:
     if workspace is None:
         workspace = marlin_make_workspace(a.device)
-    if use_zp_bias is None:
-        use_zp_bias = b_zp_bias is not None
+    if is_zp_float is None:
+        is_zp_float = b_zeros is not None
     validate_dense_marlin_call(
         b_type_id=b_type_id,
         size_k=size_k,
@@ -86,7 +86,7 @@ def run_marlin_gemm(
         b_scales,
         a_scales,
         global_scale,
-        b_zp_bias,
+        b_zeros,
         g_idx,
         perm,
         workspace,
@@ -97,5 +97,5 @@ def run_marlin_gemm(
         is_k_full,
         use_atomic_add,
         use_fp32_reduce,
-        use_zp_bias,
+        is_zp_float,
     )

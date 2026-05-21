@@ -40,8 +40,8 @@ from tests.helpers import (
     marlin_quantize,
     marlin_quantize_mxfp4,
     marlin_quantize_nvfp4,
-    marlin_quantize_uint4_zp_bias,
-    marlin_quantize_uint8_zp_bias,
+    marlin_quantize_uint4_zp,
+    marlin_quantize_uint8_zp,
     scalar_types,
 )
 
@@ -258,12 +258,12 @@ def run_case(
     device = torch.device("cuda")
     a = torch.randn((size_m, size_k), device=device, dtype=torch.float16)
     weight = torch.randn((size_k, size_n), device=device, dtype=torch.float16)
-    b_zp_bias = None
+    b_zeros = None
     global_scale = None
     if quant_name == "uint4":
         if act_order:
             return None
-        _weight, q_weight, scales, b_zp_bias, weight_ref = marlin_quantize_uint4_zp_bias(
+        _weight, q_weight, scales, b_zeros, weight_ref = marlin_quantize_uint4_zp(
             weight, group_size
         )
         g_idx = torch.empty(0, dtype=torch.int, device=device)
@@ -271,7 +271,7 @@ def run_case(
     elif quant_name == "uint8":
         if act_order:
             return None
-        _weight, q_weight, scales, b_zp_bias, weight_ref = marlin_quantize_uint8_zp_bias(
+        _weight, q_weight, scales, b_zeros, weight_ref = marlin_quantize_uint8_zp(
             weight, group_size
         )
         g_idx = torch.empty(0, dtype=torch.int, device=device)
@@ -307,7 +307,7 @@ def run_case(
             size_n,
             size_k,
             workspace=workspace,
-            b_zp_bias=b_zp_bias,
+            b_zeros=b_zeros,
             global_scale=global_scale,
             g_idx=g_idx,
             perm=sort_indices,
@@ -343,7 +343,7 @@ def run_case(
                 size_k,
                 workspace=workspace,
                 c=marlin_output,
-                b_zp_bias=b_zp_bias,
+                b_zeros=b_zeros,
                 global_scale=global_scale,
                 g_idx=g_idx,
                 perm=sort_indices,

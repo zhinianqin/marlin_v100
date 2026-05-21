@@ -20,8 +20,8 @@ from tests.helpers import (
     marlin_quantize_mxfp4,
     marlin_quantize_nvfp4,
     marlin_quantize_uint4_zp,
-    marlin_quantize_uint4_zp_bias,
-    marlin_quantize_uint8_zp_bias,
+    marlin_quantize_uint4_packed_zp,
+    marlin_quantize_uint8_zp,
     scalar_types,
 )
 
@@ -502,7 +502,7 @@ def _run_dense_uint4_zp_accuracy_case(
 
     a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zp_bias, dequantized = marlin_quantize_uint4_zp_bias(
+    _w, q_w, scales, zp, dequantized = marlin_quantize_uint4_zp(
         w, group_size
     )
     output = ops.marlin_gemm(
@@ -513,7 +513,7 @@ def _run_dense_uint4_zp_accuracy_case(
         scales,
         None,
         None,
-        zp_bias,
+        zp,
         None,
         None,
         marlin_make_workspace_new(a.device),
@@ -536,7 +536,7 @@ def _run_dense_uint4_zp_accuracy_case(
     torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
 
 
-def _run_dense_uint8_zp_bias_accuracy_case(
+def _run_dense_uint8_zp_accuracy_case(
     *,
     repack_impl: str,
     group_size: int,
@@ -558,7 +558,7 @@ def _run_dense_uint8_zp_bias_accuracy_case(
 
     a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zp_bias, dequantized = marlin_quantize_uint8_zp_bias(
+    _w, q_w, scales, zp, dequantized = marlin_quantize_uint8_zp(
         w, group_size
     )
     output = ops.marlin_gemm(
@@ -569,7 +569,7 @@ def _run_dense_uint8_zp_bias_accuracy_case(
         scales,
         None,
         None,
-        zp_bias,
+        zp,
         None,
         None,
         marlin_make_workspace_new(a.device),
@@ -926,8 +926,8 @@ def test_marlin_dense_uint4_zp_env_cta_geometry_rejects_unsupported(
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint8_zp_bias_accuracy(group_size: int, repack_impl: str):
-    _run_dense_uint8_zp_bias_accuracy_case(
+def test_marlin_dense_uint8_zp_accuracy(group_size: int, repack_impl: str):
+    _run_dense_uint8_zp_accuracy_case(
         repack_impl=repack_impl,
         group_size=group_size,
         rtol=5e-2,
@@ -936,8 +936,8 @@ def test_marlin_dense_uint8_zp_bias_accuracy(group_size: int, repack_impl: str):
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint8_zp_bias_small_tile_matches_reference(repack_impl: str):
-    _run_dense_uint8_zp_bias_accuracy_case(
+def test_marlin_dense_uint8_zp_small_tile_matches_reference(repack_impl: str):
+    _run_dense_uint8_zp_accuracy_case(
         repack_impl=repack_impl,
         group_size=128,
         rtol=5e-2,
@@ -949,11 +949,11 @@ def test_marlin_dense_uint8_zp_bias_small_tile_matches_reference(repack_impl: st
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint8_zp_bias_residue_n_rejects_n_tile_alignment_contract(
+def test_marlin_dense_uint8_zp_residue_n_rejects_n_tile_alignment_contract(
     repack_impl: str,
 ):
     with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-        _run_dense_uint8_zp_bias_accuracy_case(
+        _run_dense_uint8_zp_accuracy_case(
             repack_impl=repack_impl,
             group_size=128,
             rtol=5e-2,
@@ -965,14 +965,14 @@ def test_marlin_dense_uint8_zp_bias_residue_n_rejects_n_tile_alignment_contract(
 
 
 @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
-def test_marlin_dense_uint8_zp_bias_env_cta_geometry_matches_reference(
+def test_marlin_dense_uint8_zp_env_cta_geometry_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
     cta_geometry: str,
     size_m: int,
     size_n: int,
 ):
     monkeypatch.setenv("SM70_MARLIN_U8_CTA", cta_geometry)
-    _run_dense_uint8_zp_bias_accuracy_case(
+    _run_dense_uint8_zp_accuracy_case(
         repack_impl="gptq",
         group_size=128,
         rtol=5e-2,
@@ -983,12 +983,12 @@ def test_marlin_dense_uint8_zp_bias_env_cta_geometry_matches_reference(
     )
 
 
-def test_marlin_dense_uint8_zp_bias_env_cta_geometry_rejects_unsupported(
+def test_marlin_dense_uint8_zp_env_cta_geometry_rejects_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("SM70_MARLIN_U8_CTA", "32x64x4")
     with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U8_CTA"):
-        _run_dense_uint8_zp_bias_accuracy_case(
+        _run_dense_uint8_zp_accuracy_case(
             repack_impl="gptq",
             group_size=128,
             rtol=5e-2,
@@ -999,16 +999,16 @@ def test_marlin_dense_uint8_zp_bias_env_cta_geometry_rejects_unsupported(
         )
 
 
-def test_marlin_dense_uint4_zp_requires_bias():
+def test_marlin_dense_uint4_zp_requires_zeros():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, _zp_bias, _dequantized = marlin_quantize_uint4_zp_bias(w, 128)
+    _w, q_w, scales, _zp, _dequantized = marlin_quantize_uint4_zp(w, 128)
 
-    with pytest.raises(RuntimeError, match="requires fp16 precomputed zero-point bias"):
+    with pytest.raises(RuntimeError, match="requires fp16 zero points"):
         ops.marlin_gemm(
             a,
             None,
@@ -1032,16 +1032,16 @@ def test_marlin_dense_uint4_zp_requires_bias():
         )
 
 
-def test_marlin_dense_uint8_zp_bias_requires_bias():
+def test_marlin_dense_uint8_zp_requires_zeros():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, _zp_bias, _dequantized = marlin_quantize_uint8_zp_bias(w, 128)
+    _w, q_w, scales, _zp, _dequantized = marlin_quantize_uint8_zp(w, 128)
 
-    with pytest.raises(RuntimeError, match="requires fp16 precomputed zero-point bias"):
+    with pytest.raises(RuntimeError, match="requires fp16 zero points"):
         ops.marlin_gemm(
             a,
             None,
@@ -1072,9 +1072,11 @@ def test_marlin_dense_uint4_zp_rejects_packed_zero_points():
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, packed_zero_points, _dequantized = marlin_quantize_uint4_zp(w, 128)
+    _w, q_w, scales, packed_zero_points, _dequantized = marlin_quantize_uint4_packed_zp(
+        w, 128
+    )
 
-    with pytest.raises(RuntimeError, match="fp16 precomputed zero-point bias"):
+    with pytest.raises(RuntimeError, match="fp16 zero points"):
         ops.marlin_gemm(
             a,
             None,
@@ -1098,21 +1100,21 @@ def test_marlin_dense_uint4_zp_rejects_packed_zero_points():
         )
 
 
-def test_marlin_dense_uint8_zp_bias_rejects_packed_zero_points():
+def test_marlin_dense_uint8_zp_rejects_packed_zero_points():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, _zp_bias, _dequantized = marlin_quantize_uint8_zp_bias(w, 128)
+    _w, q_w, scales, _zp, _dequantized = marlin_quantize_uint8_zp(w, 128)
     packed_zero_points = torch.zeros(
         (scales.shape[0], w.shape[1] // 4),
         device="cuda",
         dtype=torch.int32,
     )
 
-    with pytest.raises(RuntimeError, match="fp16 precomputed zero-point bias"):
+    with pytest.raises(RuntimeError, match="fp16 zero points"):
         ops.marlin_gemm(
             a,
             None,
@@ -1136,7 +1138,7 @@ def test_marlin_dense_uint8_zp_bias_rejects_packed_zero_points():
         )
 
 
-def test_marlin_dense_uint4b8_rejects_zp_bias_metadata():
+def test_marlin_dense_uint4b8_rejects_zp_metadata():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -1146,9 +1148,9 @@ def test_marlin_dense_uint4b8_rejects_zp_bias_metadata():
     _w, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
         w, scalar_types.uint4b8, 128, False
     )
-    zp_bias = torch.zeros_like(scales)
+    zp = torch.zeros_like(scales)
 
-    with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+    with pytest.raises(RuntimeError, match="zero-point metadata"):
         ops.marlin_gemm(
             a,
             None,
@@ -1157,7 +1159,7 @@ def test_marlin_dense_uint4b8_rejects_zp_bias_metadata():
             scales,
             None,
             None,
-            zp_bias,
+            zp,
             g_idx,
             sort_indices,
             marlin_make_workspace_new(a.device),
@@ -1172,16 +1174,16 @@ def test_marlin_dense_uint4b8_rejects_zp_bias_metadata():
         )
 
 
-def test_marlin_dense_uint8_zp_bias_rejects_bias_without_flag():
+def test_marlin_dense_uint8_zp_rejects_zeros_without_flag():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zp_bias, _dequantized = marlin_quantize_uint8_zp_bias(w, 128)
+    _w, q_w, scales, zp, _dequantized = marlin_quantize_uint8_zp(w, 128)
 
-    with pytest.raises(RuntimeError, match="use_zp_bias is false"):
+    with pytest.raises(RuntimeError, match="is_zp_float is false"):
         ops.marlin_gemm(
             a,
             None,
@@ -1190,7 +1192,7 @@ def test_marlin_dense_uint8_zp_bias_rejects_bias_without_flag():
             scales,
             None,
             None,
-            zp_bias,
+            zp,
             None,
             None,
             marlin_make_workspace_new(a.device),
@@ -1205,7 +1207,7 @@ def test_marlin_dense_uint8_zp_bias_rejects_bias_without_flag():
         )
 
 
-def test_marlin_dense_uint8b128_rejects_zp_bias_metadata():
+def test_marlin_dense_uint8b128_rejects_zp_metadata():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -1215,9 +1217,9 @@ def test_marlin_dense_uint8b128_rejects_zp_bias_metadata():
     _w, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
         w, scalar_types.uint8b128, 128, False
     )
-    zp_bias = torch.zeros_like(scales)
+    zp = torch.zeros_like(scales)
 
-    with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+    with pytest.raises(RuntimeError, match="zero-point metadata"):
         ops.marlin_gemm(
             a,
             None,
@@ -1226,7 +1228,7 @@ def test_marlin_dense_uint8b128_rejects_zp_bias_metadata():
             scales,
             None,
             None,
-            zp_bias,
+            zp,
             g_idx,
             sort_indices,
             marlin_make_workspace_new(a.device),
@@ -1241,7 +1243,7 @@ def test_marlin_dense_uint8b128_rejects_zp_bias_metadata():
         )
 
 
-def test_marlin_dense_uint8b128_rejects_use_zp_bias_without_metadata():
+def test_marlin_dense_uint8b128_rejects_is_zp_float_without_metadata():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -1252,7 +1254,7 @@ def test_marlin_dense_uint8b128_rejects_use_zp_bias_without_metadata():
         w, scalar_types.uint8b128, 128, False
     )
 
-    with pytest.raises(RuntimeError, match="use_zp_bias is true"):
+    with pytest.raises(RuntimeError, match="is_zp_float is true"):
         ops.marlin_gemm(
             a,
             None,
@@ -1276,16 +1278,16 @@ def test_marlin_dense_uint8b128_rejects_use_zp_bias_without_metadata():
         )
 
 
-def test_marlin_dense_uint4_zp_rejects_bias_without_flag():
+def test_marlin_dense_uint4_zp_rejects_zeros_without_flag():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
     a = torch.randn((16, 256), device="cuda", dtype=torch.float16)
     w = torch.randn((256, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zp_bias, _dequantized = marlin_quantize_uint4_zp_bias(w, 128)
+    _w, q_w, scales, zp, _dequantized = marlin_quantize_uint4_zp(w, 128)
 
-    with pytest.raises(RuntimeError, match="use_zp_bias is false"):
+    with pytest.raises(RuntimeError, match="is_zp_float is false"):
         ops.marlin_gemm(
             a,
             None,
@@ -1294,7 +1296,7 @@ def test_marlin_dense_uint4_zp_rejects_bias_without_flag():
             scales,
             None,
             None,
-            zp_bias,
+            zp,
             None,
             None,
             marlin_make_workspace_new(a.device),
@@ -1317,7 +1319,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
     size_k = 256
     a = torch.randn((16, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, 256), device="cuda", dtype=torch.float16)
-    _w, q_w, scales, zp_bias, _dequantized = marlin_quantize_uint4_zp_bias(w, 64)
+    _w, q_w, scales, zp, _dequantized = marlin_quantize_uint4_zp(w, 64)
     g_idx = (torch.arange(size_k, device=a.device, dtype=torch.int32) // 64).contiguous()
     perm = torch.arange(size_k, device=a.device, dtype=torch.int32)
 
@@ -1330,7 +1332,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
             scales,
             None,
             None,
-            zp_bias,
+            zp,
             g_idx,
             perm,
             marlin_make_workspace_new(a.device),
@@ -1754,8 +1756,8 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        zp_bias = torch.zeros_like(scales)
-        with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+        zp = torch.zeros_like(scales)
+        with pytest.raises(RuntimeError, match="zero-point metadata"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -1764,7 +1766,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 scales,
                 None,
                 None,
-                zp_bias,
+                zp,
                 g_idx,
                 sort_indices,
                 workspace,
@@ -1778,7 +1780,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 True,
             )
 
-        with pytest.raises(RuntimeError, match="use_zp_bias is true"):
+        with pytest.raises(RuntimeError, match="is_zp_float is true"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2026,7 +2028,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+        with pytest.raises(RuntimeError, match="zero-point metadata"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2304,7 +2306,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="zero-point bias metadata"):
+        with pytest.raises(RuntimeError, match="zero-point metadata"):
             ops.marlin_gemm(
                 a,
                 None,

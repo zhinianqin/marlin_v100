@@ -45,7 +45,7 @@ namespace {
 constexpr int kU8ValuesPerAccess = 8;
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
-class Sm70U8ZpBiasIteratorB {
+class Sm70U8ZpIteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
@@ -82,7 +82,7 @@ class Sm70U8ZpBiasIteratorB {
  private:
   uint32_t const* qweight_;
   half const* scales_;
-  half const* zp_bias_;
+  half const* zp_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
   int qweight_base_offset_;
@@ -91,16 +91,16 @@ class Sm70U8ZpBiasIteratorB {
   int aligned_k_step_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
-  mutable half2 cached_bias_[ThreadMap::Iterations::kContiguous * 4];
+  mutable half2 cached_zp_[ThreadMap::Iterations::kContiguous * 4];
 
  public:
   CUTLASS_DEVICE
-  Sm70U8ZpBiasIteratorB(Params const& params, uint32_t const* qweight,
-                        half const* scales, half const* zp_bias, int thread_id,
-                        cutlass::MatrixCoord const& threadblock_offset)
+  Sm70U8ZpIteratorB(Params const& params, uint32_t const* qweight,
+                    half const* scales, half const* zp, int thread_id,
+                    cutlass::MatrixCoord const& threadblock_offset)
       : qweight_(qweight),
         scales_(scales),
-        zp_bias_(zp_bias),
+        zp_(zp),
         params_(params),
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         k_offset_(threadblock_offset.row()),
@@ -113,7 +113,7 @@ class Sm70U8ZpBiasIteratorB {
     qweight_base_offset_ =
         qweight_offset_from_logical(params_, logical_k, logical_n);
     if constexpr (kGroupSize == -1) {
-      // GroupSize=-1 keeps scale and precomputed zero-point bias stable for
+      // GroupSize=-1 keeps scale and fp16 zero points stable for
       // every K tile. Cache both planes once before the MMA mainloop.
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
@@ -128,19 +128,18 @@ class Sm70U8ZpBiasIteratorB {
         scale_cache[2] = scale_vec[2];
         scale_cache[3] = scale_vec[3];
 
-        half2 const* bias_vec =
-            reinterpret_cast<half2 const*>(zp_bias_ + cache_n);
-        half2* bias_cache = cached_bias_ + c * 4;
-        bias_cache[0] = bias_vec[0];
-        bias_cache[1] = bias_vec[1];
-        bias_cache[2] = bias_vec[2];
-        bias_cache[3] = bias_vec[3];
+        half2 const* zp_vec = reinterpret_cast<half2 const*>(zp_ + cache_n);
+        half2* zp_cache = cached_zp_ + c * 4;
+        zp_cache[0] = zp_vec[0];
+        zp_cache[1] = zp_vec[1];
+        zp_cache[2] = zp_vec[2];
+        zp_cache[3] = zp_vec[3];
       }
     }
   }
 
   CUTLASS_DEVICE
-  Sm70U8ZpBiasIteratorB& operator++() {
+  Sm70U8ZpIteratorB& operator++() {
     int const k_advance = aligned_k_step_;
     int const k_advance_qwords =
         (k_advance / kQuantTileK) * (params_.size_n * 4);
@@ -183,12 +182,11 @@ class Sm70U8ZpBiasIteratorB {
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
     return u8_macro_n_qweight_offset_from_logical(params.size_n, logical_k,
-                                                     logical_n);
+                                                  logical_n);
   }
 
   CUTLASS_DEVICE
-  static int qweight_word_stride_from_logical(Params const&,
-                                              int logical_n) {
+  static int qweight_word_stride_from_logical(Params const&, int logical_n) {
     return u8_macro_n_qweight_word_stride_from_logical(logical_n);
   }
 
@@ -226,13 +224,13 @@ class Sm70U8ZpBiasIteratorB {
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
 
-    half2 const* bias_vec = reinterpret_cast<half2 const*>(
-        zp_bias_ + group * params_.size_n + cache_n);
-    half2* bias_cache = cached_bias_ + c * 4;
-    bias_cache[0] = bias_vec[0];
-    bias_cache[1] = bias_vec[1];
-    bias_cache[2] = bias_vec[2];
-    bias_cache[3] = bias_vec[3];
+    half2 const* zp_vec = reinterpret_cast<half2 const*>(
+        zp_ + group * params_.size_n + cache_n);
+    half2* zp_cache = cached_zp_ + c * 4;
+    zp_cache[0] = zp_vec[0];
+    zp_cache[1] = zp_vec[1];
+    zp_cache[2] = zp_vec[2];
+    zp_cache[3] = zp_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -246,14 +244,14 @@ class Sm70U8ZpBiasIteratorB {
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
 
-    uint4 const bias_words = *reinterpret_cast<uint4 const*>(
-        zp_bias_ + group * params_.size_n + cache_n);
-    half2 const* bias_vec = reinterpret_cast<half2 const*>(&bias_words);
-    half2* bias_cache = cached_bias_ + c * 4;
-    bias_cache[0] = bias_vec[0];
-    bias_cache[1] = bias_vec[1];
-    bias_cache[2] = bias_vec[2];
-    bias_cache[3] = bias_vec[3];
+    uint4 const zp_words = *reinterpret_cast<uint4 const*>(
+        zp_ + group * params_.size_n + cache_n);
+    half2 const* zp_vec = reinterpret_cast<half2 const*>(&zp_words);
+    half2* zp_cache = cached_zp_ + c * 4;
+    zp_cache[0] = zp_vec[0];
+    zp_cache[1] = zp_vec[1];
+    zp_cache[2] = zp_vec[2];
+    zp_cache[3] = zp_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -287,18 +285,18 @@ class Sm70U8ZpBiasIteratorB {
           uint32_t const qword0 = qword_from_vector(qwords0, c);
           uint32_t const qword1 = qword_from_vector(qwords1, c);
           half2 const* scale_vec = cached_scales_ + c * 4;
-          half2 const* bias_vec = cached_bias_ + c * 4;
+          half2 const* zp_vec = cached_zp_ + c * 4;
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
           marlin::dequant<half2, vllm::kU8.id(), false>(
               static_cast<int>(qword0), deq);
-          frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
-          frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
+          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
           marlin::dequant<half2, vllm::kU8.id(), false>(
               static_cast<int>(qword1), deq);
-          frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
-          frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
+          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
         uint2 const qwords0 =
@@ -313,18 +311,18 @@ class Sm70U8ZpBiasIteratorB {
           uint32_t const qword0 = qword_from_vector(qwords0, c);
           uint32_t const qword1 = qword_from_vector(qwords1, c);
           half2 const* scale_vec = cached_scales_ + c * 4;
-          half2 const* bias_vec = cached_bias_ + c * 4;
+          half2 const* zp_vec = cached_zp_ + c * 4;
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
           marlin::dequant<half2, vllm::kU8.id(), false>(
               static_cast<int>(qword0), deq);
-          frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
-          frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
+          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
           marlin::dequant<half2, vllm::kU8.id(), false>(
               static_cast<int>(qword1), deq);
-          frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
-          frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
+          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
@@ -333,18 +331,18 @@ class Sm70U8ZpBiasIteratorB {
         uint32_t const qword1 =
             qweight_[qweight_base_offset_ + qweight_word_stride(0)];
         half2 const* scale_vec = cached_scales_;
-        half2 const* bias_vec = cached_bias_;
+        half2 const* zp_vec = cached_zp_;
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data());
         marlin::dequant<half2, vllm::kU8.id(), false>(
             static_cast<int>(qword0), deq);
-        frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
-        frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
+        frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+        frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
         marlin::dequant<half2, vllm::kU8.id(), false>(
             static_cast<int>(qword1), deq);
-        frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
-        frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
+        frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+        frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
       }
     } else {
       CUTLASS_PRAGMA_UNROLL
@@ -364,18 +362,22 @@ class Sm70U8ZpBiasIteratorB {
             uint32_t const qword0 = qword_from_vector(qwords0, c);
             uint32_t const qword1 = qword_from_vector(qwords1, c);
             half2 const* scale_vec = cached_scales_ + c * 4;
-            half2 const* bias_vec = cached_bias_ + c * 4;
+            half2 const* zp_vec = cached_zp_ + c * 4;
 
             half2 deq[2];
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword0), deq);
-            frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
-            frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
+            frag_vec[0] =
+                __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+            frag_vec[1] =
+                __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword1), deq);
-            frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
-            frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
+            frag_vec[2] =
+                __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+            frag_vec[3] =
+                __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
           uint2 const qwords0 =
@@ -392,18 +394,22 @@ class Sm70U8ZpBiasIteratorB {
             uint32_t const qword0 = qword_from_vector(qwords0, c);
             uint32_t const qword1 = qword_from_vector(qwords1, c);
             half2 const* scale_vec = cached_scales_ + c * 4;
-            half2 const* bias_vec = cached_bias_ + c * 4;
+            half2 const* zp_vec = cached_zp_ + c * 4;
 
             half2 deq[2];
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword0), deq);
-            frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
-            frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
+            frag_vec[0] =
+                __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+            frag_vec[1] =
+                __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword1), deq);
-            frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
-            frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
+            frag_vec[2] =
+                __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+            frag_vec[3] =
+                __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
           }
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
@@ -413,18 +419,18 @@ class Sm70U8ZpBiasIteratorB {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
           half2 const* scale_vec = cached_scales_;
-          half2 const* bias_vec = cached_bias_;
+          half2 const* zp_vec = cached_zp_;
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
           marlin::dequant<half2, vllm::kU8.id(), false>(
               static_cast<int>(qword0), deq);
-          frag_vec[0] = __hfma2(deq[0], scale_vec[0], bias_vec[0]);
-          frag_vec[1] = __hfma2(deq[1], scale_vec[1], bias_vec[1]);
+          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
           marlin::dequant<half2, vllm::kU8.id(), false>(
               static_cast<int>(qword1), deq);
-          frag_vec[2] = __hfma2(deq[0], scale_vec[2], bias_vec[2]);
-          frag_vec[3] = __hfma2(deq[1], scale_vec[3], bias_vec[3]);
+          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       }
     }
@@ -445,14 +451,14 @@ class Sm70U8ZpBiasIteratorB {
   }
 };
 
-struct Sm70U8ZpBiasGemmSpec {
+struct Sm70U8ZpGemmSpec {
   template <typename Shape, typename ThreadMap, int GroupSize>
-  using IteratorB = Sm70U8ZpBiasIteratorB<Shape, ThreadMap, GroupSize>;
+  using IteratorB = Sm70U8ZpIteratorB<Shape, ThreadMap, GroupSize>;
 };
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
-using Sm70U8ZpBiasGemmTraits =
-    Sm70DenseGemmTraits<Sm70U8ZpBiasGemmSpec, CtaM, CtaN, Warps, GroupSize>;
+using Sm70U8ZpGemmTraits =
+    Sm70DenseGemmTraits<Sm70U8ZpGemmSpec, CtaM, CtaN, Warps, GroupSize>;
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 __global__ __launch_bounds__(Warps * 32, 1)
@@ -460,10 +466,9 @@ void sm70_marlin_u8_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
-    cutlass::half_t const* __restrict__ b_zp_bias,
+    cutlass::half_t const* __restrict__ b_zeros,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
-  using Traits =
-      Sm70U8ZpBiasGemmTraits<CtaM, CtaN, Warps, GroupSize>;
+  using Traits = Sm70U8ZpGemmTraits<CtaM, CtaN, Warps, GroupSize>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -491,7 +496,7 @@ void sm70_marlin_u8_gemm_kernel(
       typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales),
-      reinterpret_cast<half const*>(b_zp_bias), thread_idx, tb_offset_B);
+      reinterpret_cast<half const*>(b_zeros), thread_idx, tb_offset_B);
 
   Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
   typename Mma::FragmentC accumulators;
@@ -517,11 +522,11 @@ void sm70_marlin_u8_gemm_kernel(
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 torch::Tensor launch_sm70_marlin_u8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zp_bias, int64_t size_m,
+    torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
     int64_t size_n, int64_t size_k) {
   auto kernel =
       sm70_marlin_u8_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
-  using SharedStorage = typename Sm70U8ZpBiasGemmTraits<
+  using SharedStorage = typename Sm70U8ZpGemmTraits<
       CtaM, CtaN, Warps, GroupSize>::SharedStorage;
   size_t smem_bytes = configure_dynamic_smem<SharedStorage>(kernel);
 
@@ -533,7 +538,7 @@ torch::Tensor launch_sm70_marlin_u8_gemm(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
-      reinterpret_cast<cutlass::half_t const*>(b_zp_bias.data_ptr<at::Half>()),
+      reinterpret_cast<cutlass::half_t const*>(b_zeros.data_ptr<at::Half>()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
       static_cast<int>(size_m), static_cast<int>(size_n),
       static_cast<int>(size_k), static_cast<int>(a.stride(0)));
@@ -546,7 +551,7 @@ struct Sm70U8Launcher {
   torch::Tensor& c;
   torch::Tensor& b_q_weight;
   torch::Tensor& b_scales;
-  torch::Tensor& b_zp_bias;
+  torch::Tensor& b_zeros;
   int64_t size_m;
   int64_t size_n;
   int64_t size_k;
@@ -554,14 +559,14 @@ struct Sm70U8Launcher {
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
     return launch_sm70_marlin_u8_gemm<CtaM, CtaN, Warps, GroupSize>(
-        a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k);
+        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k);
   }
 };
 
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zp_bias, int64_t size_m,
+                                  torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
@@ -572,7 +577,7 @@ torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
   check_sm70_dense_cta_geometry(env_name, geometry);
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   Sm70U8Launcher const launcher{
-      a, c, b_q_weight, b_scales, b_zp_bias, size_m, size_n, size_k};
+      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k};
   return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,
                            "uint8");
 }

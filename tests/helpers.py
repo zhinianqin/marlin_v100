@@ -829,7 +829,7 @@ def marlin_dequantize_mxfp4(
     return dequantized.to(torch.float16)
 
 
-def marlin_quantize_uint4_zp(
+def marlin_quantize_uint4_packed_zp(
     weight: torch.Tensor,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -857,7 +857,7 @@ def marlin_quantize_uint4_zp(
         zero_points.shape[0],
         size_n,
     )
-    dequantized = marlin_dequantize_uint4_zp(
+    dequantized = marlin_dequantize_uint4_packed_zp(
         marlin_q_weight,
         marlin_scales,
         packed_zero_points,
@@ -868,7 +868,7 @@ def marlin_quantize_uint4_zp(
     return weight, marlin_q_weight, marlin_scales, packed_zero_points, dequantized
 
 
-def marlin_quantize_uint4_zp_bias(
+def marlin_quantize_uint4_zp(
     weight: torch.Tensor,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -891,26 +891,26 @@ def marlin_quantize_uint4_zp_bias(
         group_size,
         is_a_8bit=False,
     )
-    zp_bias = (-zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
-    marlin_zp_bias = dense.marlin_permute_scales(
-        zp_bias,
+    zp = (zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
+    marlin_zp = dense.marlin_permute_scales(
+        zp,
         size_k,
         size_n,
         group_size,
         is_a_8bit=False,
     )
-    dequantized = marlin_dequantize_uint4_zp_bias(
+    dequantized = marlin_dequantize_uint4_zp(
         marlin_q_weight,
         marlin_scales,
-        marlin_zp_bias,
+        marlin_zp,
         size_k,
         size_n,
         group_size,
     )
-    return weight, marlin_q_weight, marlin_scales, marlin_zp_bias, dequantized
+    return weight, marlin_q_weight, marlin_scales, marlin_zp, dequantized
 
 
-def marlin_quantize_uint8_zp_bias(
+def marlin_quantize_uint8_zp(
     weight: torch.Tensor,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -933,26 +933,26 @@ def marlin_quantize_uint8_zp_bias(
         group_size,
         is_a_8bit=False,
     )
-    zp_bias = (-zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
-    marlin_zp_bias = dense.marlin_permute_scales(
-        zp_bias,
+    zp = (zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
+    marlin_zp = dense.marlin_permute_scales(
+        zp,
         size_k,
         size_n,
         group_size,
         is_a_8bit=False,
     )
-    dequantized = marlin_dequantize_uint8_zp_bias(
+    dequantized = marlin_dequantize_uint8_zp(
         marlin_q_weight,
         marlin_scales,
-        marlin_zp_bias,
+        marlin_zp,
         size_k,
         size_n,
         group_size,
     )
-    return weight, marlin_q_weight, marlin_scales, marlin_zp_bias, dequantized
+    return weight, marlin_q_weight, marlin_scales, marlin_zp, dequantized
 
 
-def marlin_dequantize_uint4_zp(
+def marlin_dequantize_uint4_packed_zp(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
     packed_zero_points: torch.Tensor,
@@ -985,10 +985,10 @@ def marlin_dequantize_uint4_zp(
     return dequantized
 
 
-def marlin_dequantize_uint4_zp_bias(
+def marlin_dequantize_uint4_zp(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
-    zp_bias: torch.Tensor,
+    zp: torch.Tensor,
     size_k: int,
     size_n: int,
     group_size: int,
@@ -1001,8 +1001,8 @@ def marlin_dequantize_uint4_zp_bias(
         size_n,
         group_size,
     ).to(torch.float32)
-    unpermuted_zp_bias = _marlin_unpermute_scales_impl(
-        zp_bias,
+    unpermuted_zp = _marlin_unpermute_scales_impl(
+        zp,
         size_k,
         size_n,
         group_size,
@@ -1010,8 +1010,8 @@ def marlin_dequantize_uint4_zp_bias(
     if group_size == -1:
         group_size = size_k
     expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
-    expanded_zp_bias = unpermuted_zp_bias.repeat_interleave(group_size, dim=0)[:size_k]
-    dequantized = (unpacked * expanded_scales + expanded_zp_bias).to(torch.float16)
+    expanded_zp = unpermuted_zp.repeat_interleave(group_size, dim=0)[:size_k]
+    dequantized = (unpacked * expanded_scales - expanded_zp).to(torch.float16)
     if perm is not None and perm.numel() > 0:
         logical = torch.empty_like(dequantized)
         logical[perm.to(torch.long)] = dequantized
@@ -1019,10 +1019,10 @@ def marlin_dequantize_uint4_zp_bias(
     return dequantized
 
 
-def marlin_dequantize_uint8_zp_bias(
+def marlin_dequantize_uint8_zp(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
-    zp_bias: torch.Tensor,
+    zp: torch.Tensor,
     size_k: int,
     size_n: int,
     group_size: int,
@@ -1035,8 +1035,8 @@ def marlin_dequantize_uint8_zp_bias(
         size_n,
         group_size,
     ).to(torch.float32)
-    unpermuted_zp_bias = _marlin_unpermute_scales_impl(
-        zp_bias,
+    unpermuted_zp = _marlin_unpermute_scales_impl(
+        zp,
         size_k,
         size_n,
         group_size,
@@ -1044,8 +1044,8 @@ def marlin_dequantize_uint8_zp_bias(
     if group_size == -1:
         group_size = size_k
     expanded_scales = unpermuted_scales.repeat_interleave(group_size, dim=0)[:size_k]
-    expanded_zp_bias = unpermuted_zp_bias.repeat_interleave(group_size, dim=0)[:size_k]
-    dequantized = (unpacked * expanded_scales + expanded_zp_bias).to(torch.float16)
+    expanded_zp = unpermuted_zp.repeat_interleave(group_size, dim=0)[:size_k]
+    dequantized = (unpacked * expanded_scales - expanded_zp).to(torch.float16)
     if perm is not None and perm.numel() > 0:
         logical = torch.empty_like(dequantized)
         logical[perm.to(torch.long)] = dequantized
@@ -1241,7 +1241,7 @@ def marlin_quantize_experts_uint4_zp_with_metadata(
     g_indices = []
     perms = []
     for expert in range(weights.shape[0]):
-        _, q_weight, scale, packed_zero_points, expert_dequantized = marlin_quantize_uint4_zp(
+        _, q_weight, scale, packed_zero_points, expert_dequantized = marlin_quantize_uint4_packed_zp(
             weights[expert],
             group_size,
         )
