@@ -7,6 +7,7 @@
 
 #include <cuda_fp16.h>
 #include <torch/library.h>
+#include <cstdint>
 #include <type_traits>
 
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -29,6 +30,10 @@ enum ProbeAPath : int64_t {
 enum ProbeBPath : int64_t {
   kBPathCuteShared = 0,
 };
+
+bool is_aligned_16(const void* ptr) {
+  return (reinterpret_cast<std::uintptr_t>(ptr) & 0xfu) == 0;
+}
 
 void check_probe_inputs(const at::Tensor& a, const at::Tensor& b,
                         int64_t cta_m, int64_t cta_n, int64_t cta_k,
@@ -83,6 +88,14 @@ void check_probe_inputs(const at::Tensor& a, const at::Tensor& b,
               "sm70_cutlass_matmul_probe: current CuTe probe requires N divisible by cta_n");
   TORCH_CHECK(a.size(1) % cta_k == 0,
               "sm70_cutlass_matmul_probe: current CuTe probe requires K divisible by cta_k");
+  if (a_path == kAPathCuteShared) {
+    TORCH_CHECK(is_aligned_16(a.data_ptr()),
+                "sm70_cutlass_matmul_probe: CuTe vectorized A copy requires A "
+                "to be 16-byte aligned");
+    TORCH_CHECK(is_aligned_16(b.data_ptr()),
+                "sm70_cutlass_matmul_probe: CuTe vectorized B copy requires B "
+                "to be 16-byte aligned");
+  }
 
   int major = 0;
   int minor = 0;
@@ -136,16 +149,37 @@ CUTE_HOST_DEVICE auto make_smem_b_layout() {
   return tile_to_shape(atom_layout, make_shape(Int<CTA_N>{}, Int<CTA_K>{}));
 }
 
+__device__ __forceinline__ cutlass::half_t half_from_uint4_lane(
+    uint4 packet, int lane) {
+  uint32_t word = lane < 2 ? packet.x : (lane < 4 ? packet.y
+                                                  : (lane < 6 ? packet.z
+                                                              : packet.w));
+  uint16_t bits = static_cast<uint16_t>((lane & 1) ? (word >> 16)
+                                                   : (word & 0xffffu));
+  return cutlass::half_t::bitcast(bits);
+}
+
 template <int CTA_M, int CTA_K, int Threads, class SmemTensor>
 __device__ __forceinline__ void copy_a_gmem_to_smem_bounded(
     const cutlass::half_t* __restrict__ a, SmemTensor& sA, int m0, int k0,
     int k) {
   static_assert(CTA_K == 32, "SM70 CuTe native A copy expects CTA_K=32.");
-  for (int linear = int(threadIdx.x); linear < CTA_M * CTA_K;
+  constexpr int kVecHalf = 8;
+  static_assert(CTA_K % kVecHalf == 0,
+                "SM70 CuTe native A vector copy expects CTA_K multiple of 8.");
+  constexpr int kPacketsPerRow = CTA_K / kVecHalf;
+  constexpr int kPackets = CTA_M * kPacketsPerRow;
+  for (int linear = int(threadIdx.x); linear < kPackets;
        linear += Threads) {
-    int row = linear / CTA_K;
-    int col = linear - row * CTA_K;
-    sA(row, col) = a[(m0 + row) * k + (k0 + col)];
+    int row = linear / kPacketsPerRow;
+    int packet_col = linear - row * kPacketsPerRow;
+    int col = packet_col * kVecHalf;
+    uint4 packet =
+        *reinterpret_cast<const uint4*>(a + (m0 + row) * k + (k0 + col));
+    CUTE_UNROLL
+    for (int i = 0; i < kVecHalf; ++i) {
+      sA(row, col + i) = half_from_uint4_lane(packet, i);
+    }
   }
 }
 
@@ -154,11 +188,22 @@ __device__ __forceinline__ void copy_b_gmem_to_smem_bounded(
     const cutlass::half_t* __restrict__ b, SmemTensor& sB, int n0, int k0,
     int n) {
   static_assert(CTA_K == 32, "SM70 CuTe native B copy expects CTA_K=32.");
-  for (int linear = int(threadIdx.x); linear < CTA_N * CTA_K;
+  constexpr int kVecHalf = 8;
+  static_assert(CTA_N % kVecHalf == 0,
+                "SM70 CuTe native B vector copy expects CTA_N multiple of 8.");
+  constexpr int kPacketsPerK = CTA_N / kVecHalf;
+  constexpr int kPackets = CTA_K * kPacketsPerK;
+  for (int linear = int(threadIdx.x); linear < kPackets;
        linear += Threads) {
-    int kk = linear / CTA_N;
-    int col = linear - kk * CTA_N;
-    sB(col, kk) = b[(k0 + kk) * n + (n0 + col)];
+    int kk = linear / kPacketsPerK;
+    int packet_col = linear - kk * kPacketsPerK;
+    int col = packet_col * kVecHalf;
+    uint4 packet =
+        *reinterpret_cast<const uint4*>(b + (k0 + kk) * n + (n0 + col));
+    CUTE_UNROLL
+    for (int i = 0; i < kVecHalf; ++i) {
+      sB(col + i, kk) = half_from_uint4_lane(packet, i);
+    }
   }
 }
 
@@ -235,6 +280,9 @@ template <int CTA_M, int CTA_N, int CTA_K, int Warps>
 at::Tensor run_sm70_cute_gemm(const at::Tensor& a, const at::Tensor& b) {
   c10::cuda::CUDAGuard device_guard(a.device());
   at::Tensor out = at::empty({a.size(0), b.size(1)}, a.options());
+  TORCH_CHECK(is_aligned_16(out.data_ptr()),
+              "sm70_cutlass_matmul_probe: CuTe C output must be 16-byte "
+              "aligned");
 
   constexpr int kThreads = Warps * 32;
   auto sA_layout = make_smem_a_layout<CTA_M, CTA_K>();
