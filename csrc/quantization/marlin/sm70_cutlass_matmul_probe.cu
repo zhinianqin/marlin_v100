@@ -156,8 +156,8 @@ __device__ __forceinline__ void copy_b_gmem_to_smem_bounded(
   static_assert(CTA_K == 32, "SM70 CuTe native B copy expects CTA_K=32.");
   for (int linear = int(threadIdx.x); linear < CTA_N * CTA_K;
        linear += Threads) {
-    int col = linear / CTA_K;
-    int kk = linear - col * CTA_K;
+    int kk = linear / CTA_N;
+    int col = linear - kk * CTA_N;
     sB(col, kk) = b[(k0 + kk) * n + (n0 + col)];
   }
 }
@@ -211,8 +211,13 @@ void sm70_cute_gemm_kernel(const cutlass::half_t* __restrict__ a,
     copy_b_gmem_to_smem_bounded<CTA_N, CTA_K, kThreads>(b, sB, n0, k0, n);
     __syncthreads();
 
-    cute::detail::cooperative_gemm_predication(thr_mma, sA, sB, tCrC,
-                                               identity{}, identity{});
+    if constexpr (CTA_M == 32 || CTA_M == 64) {
+      cute::cooperative_gemm(threadIdx.x, tiled_mma, sA, sB, tCrC, identity{},
+                             identity{});
+    } else {
+      cute::detail::cooperative_gemm_predication(thr_mma, sA, sB, tCrC,
+                                                 identity{}, identity{});
+    }
     __syncthreads();
   }
 
