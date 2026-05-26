@@ -583,7 +583,11 @@ def run_config_repeats(
             terminal_configs.add(term_key)
         return
 
-    if m % cta_m != 0 or n % cta_n != 0 or k % cta_k != 0:
+    if (
+        (a_path != "cutlass_threadblock" and m % cta_m != 0)
+        or n % cta_n != 0
+        or k % cta_k != 0
+    ):
         if args.include_unsupported:
             record = base_record(
                 a_path,

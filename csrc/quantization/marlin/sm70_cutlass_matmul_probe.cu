@@ -84,8 +84,11 @@ void check_probe_inputs(const at::Tensor& a, const at::Tensor& b,
               "sm70_cutlass_matmul_probe: cta_k must be 32, 64, or 128");
   TORCH_CHECK(warps == 4 || warps == 8,
               "sm70_cutlass_matmul_probe: warps must be 4 or 8");
-  TORCH_CHECK(a.size(0) % cta_m == 0,
-              "sm70_cutlass_matmul_probe: current CuTe probe requires M divisible by cta_m");
+  if (a_path == kAPathCuteShared || a_path == kAPathSm70Atom) {
+    TORCH_CHECK(a.size(0) % cta_m == 0,
+                "sm70_cutlass_matmul_probe: current CuTe/SM70 atom probe "
+                "requires M divisible by cta_m");
+  }
   TORCH_CHECK(b.size(1) % cta_n == 0,
               "sm70_cutlass_matmul_probe: current CuTe probe requires N divisible by cta_n");
   TORCH_CHECK(a.size(1) % cta_k == 0,
@@ -637,7 +640,7 @@ at::Tensor run_sm70_cute_gemm(const at::Tensor& a, const at::Tensor& b) {
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(smem_bytes)));
 
-  dim3 grid(static_cast<unsigned>(a.size(0) / CTA_M),
+  dim3 grid(static_cast<unsigned>((a.size(0) + CTA_M - 1) / CTA_M),
             static_cast<unsigned>(b.size(1) / CTA_N));
   dim3 block(kThreads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
@@ -872,7 +875,7 @@ at::Tensor run_sm70_cutlass_threadblock_gemm(const at::Tensor& a,
         static_cast<int>(smem_bytes)));
   }
 
-  dim3 grid(static_cast<unsigned>(a.size(0) / CTA_M),
+  dim3 grid(static_cast<unsigned>((a.size(0) + CTA_M - 1) / CTA_M),
             static_cast<unsigned>(b.size(1) / CTA_N));
   dim3 block(kThreads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();

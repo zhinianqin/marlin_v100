@@ -144,6 +144,34 @@ def test_sm70_cutlass_matmul_probe_threadblock_path_matches_torch_mm():
 
 
 @pytest.mark.parametrize(
+    ("m", "cta_m", "cta_n", "warps"),
+    [
+        (1, 32, 128, 4),
+        (2, 32, 128, 4),
+        (4, 32, 128, 4),
+        (8, 64, 128, 4),
+        (16, 64, 128, 4),
+    ],
+)
+def test_sm70_cutlass_matmul_probe_threadblock_small_m_matches_torch_mm(
+    m: int, cta_m: int, cta_n: int, warps: int
+):
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    n = 4096
+    k = 4096
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_probe(a, b, cta_m, cta_n, 32, warps, 2, 2, 0)
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
     ("m", "cta_m"),
     [
         (8, 8),
