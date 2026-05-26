@@ -29,12 +29,14 @@ THREADBLOCK_CTA_N_CANDIDATES = (64, 128, 256, 512)
 CUTE_CTA_M_CANDIDATES = (8, 16, 32, 48, 64)
 CUTE_CTA_N_CANDIDATES = (64, 128, 256)
 CTA_K = 32
+SM70_ATOM_CTA_K = 128
 CTA_K_CANDIDATES = (CTA_K,)
 WARP_CANDIDATES = (4, 8)
 STAGES = 2
 A_PATH_IDS = {
     "cute_shared": 0,
     "cutlass_threadblock": 2,
+    "sm70_atom": 3,
 }
 B_PATH_CUTLASS_SHARED = 0
 V100_PEAK_TFLOPS = 125.0
@@ -95,6 +97,10 @@ SUPPORTED_CUTE_CONFIGS = {
         WARP_CANDIDATES,
     )
 }
+SUPPORTED_SM70_ATOM_CONFIGS = {
+    (8, 64, SM70_ATOM_CTA_K, 4),
+    (16, 64, SM70_ATOM_CTA_K, 4),
+}
 
 RESULT_COLUMNS = (
     "M",
@@ -126,6 +132,9 @@ THREADBLOCK_KERNEL_RE = re.compile(
 CUTE_KERNEL_RE = re.compile(
     r"sm70_cute_gemm_kernel<\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*>"
 )
+SM70_ATOM_KERNEL_RE = re.compile(
+    r"sm70_atom_gemm_kernel<\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*>"
+)
 RESOURCE_RE = re.compile(r"([A-Z]+(?:\[\d+\])?):([0-9]+)")
 SPILL_RE = re.compile(
     r"(\d+)\s+bytes\s+stack\s+frame,\s+(\d+)\s+bytes\s+spill\s+stores,\s+(\d+)\s+bytes\s+spill\s+loads"
@@ -151,7 +160,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         type=int,
         default=None,
-        help="Compatibility option. The pure GEMM sweep only supports CTA_K=32.",
+        help="CTA K candidates. cute_shared/cutlass_threadblock use CTA_K=32; sm70_atom uses CTA_K=128.",
     )
     parser.add_argument("--warps", nargs="+", type=int, default=list(WARP_CANDIDATES))
     parser.add_argument("--repeats", type=int, default=5)
@@ -177,21 +186,26 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if args.cta_m is None:
-        args.cta_m = list(
-            CUTE_CTA_M_CANDIDATES
-            if args.a_path == "cute_shared"
-            else THREADBLOCK_CTA_M_CANDIDATES
-        )
+        if args.a_path == "cute_shared":
+            args.cta_m = list(CUTE_CTA_M_CANDIDATES)
+        elif args.a_path == "sm70_atom":
+            args.cta_m = [8, 16]
+        else:
+            args.cta_m = list(THREADBLOCK_CTA_M_CANDIDATES)
     if args.cta_n is None:
-        args.cta_n = list(
-            CUTE_CTA_N_CANDIDATES
-            if args.a_path == "cute_shared"
-            else THREADBLOCK_CTA_N_CANDIDATES
-        )
+        if args.a_path == "cute_shared":
+            args.cta_n = list(CUTE_CTA_N_CANDIDATES)
+        elif args.a_path == "sm70_atom":
+            args.cta_n = [64]
+        else:
+            args.cta_n = list(THREADBLOCK_CTA_N_CANDIDATES)
+    if args.a_path == "sm70_atom" and args.warps == list(WARP_CANDIDATES):
+        args.warps = [4]
     if args.cta_k is None:
-        args.cta_k = list(CTA_K_CANDIDATES)
-    if any(cta_k != CTA_K for cta_k in args.cta_k):
-        parser.error("pure GEMM sweep only supports CTA_K=32")
+        args.cta_k = [SM70_ATOM_CTA_K] if args.a_path == "sm70_atom" else list(CTA_K_CANDIDATES)
+    supported_cta_k = SM70_ATOM_CTA_K if args.a_path == "sm70_atom" else CTA_K
+    if any(cta_k != supported_cta_k for cta_k in args.cta_k):
+        parser.error(f"{args.a_path} pure GEMM sweep only supports CTA_K={supported_cta_k}")
     return args
 
 
@@ -325,6 +339,9 @@ def shape_from_text(text: str) -> KernelKey | None:
     match = CUTE_KERNEL_RE.search(text)
     if match:
         return ("cute_shared", *(int(group) for group in match.groups()))
+    match = SM70_ATOM_KERNEL_RE.search(text)
+    if match:
+        return ("sm70_atom", *(int(group) for group in match.groups()))
     return None
 
 
@@ -426,10 +443,11 @@ def time_probe(fn, warmup_iters: int, iters: int) -> dict[str, float]:
 
 def candidate_configs(args: argparse.Namespace) -> list[tuple[int, int, int, int]]:
     return [
-        (cta_m, cta_n, CTA_K, warps)
-        for cta_m, cta_n, warps in product(
+        (cta_m, cta_n, cta_k, warps)
+        for cta_m, cta_n, cta_k, warps in product(
             args.cta_m,
             args.cta_n,
+            args.cta_k,
             args.warps,
         )
     ]
@@ -461,8 +479,6 @@ def read_raw_records(raw_path: Path) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         record = json.loads(line)
-        if int(record.get("CTA_K", CTA_K)) != CTA_K:
-            continue
         records.append(record)
     return records
 
@@ -546,6 +562,8 @@ def run_config_repeats(
     supported_configs = (
         SUPPORTED_CUTE_CONFIGS
         if a_path == "cute_shared"
+        else SUPPORTED_SM70_ATOM_CONFIGS
+        if a_path == "sm70_atom"
         else SUPPORTED_THREADBLOCK_CONFIGS
     )
     if cfg not in supported_configs:

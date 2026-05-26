@@ -19,6 +19,7 @@ from marlin_v100 import ops
 CTA_M_CANDIDATES = (8, 16, 32, 48, 64)
 CTA_N_CANDIDATES = (64, 128, 256)
 CTA_K = 32
+SM70_ATOM_CTA_K = 128
 CTA_K_CANDIDATES = (CTA_K,)
 WARP_CANDIDATES = (4, 8)
 STAGE_CANDIDATES = (2,)
@@ -26,6 +27,7 @@ A_PATH_IDS = {
     "cutlass_shared": 0,
     "direct_global": 1,
     "cutlass_threadblock": 2,
+    "sm70_atom": 3,
 }
 B_PATH_IDS = {
     "cutlass_shared": 0,
@@ -51,7 +53,7 @@ def parse_args() -> argparse.Namespace:
         "--cta-k",
         nargs="+",
         type=int,
-        help="CTA K candidates. Only CTA_K=32 is supported by benchmark defaults.",
+        help="CTA K candidates. Most paths use CTA_K=32; sm70_atom uses CTA_K=128.",
     )
     parser.add_argument("--warps", nargs="+", type=int, help="Warp-count candidates.")
     parser.add_argument(
@@ -73,8 +75,10 @@ def parse_args() -> argparse.Namespace:
         help="Print unsupported candidate rows instead of silently skipping them.",
     )
     args = parser.parse_args()
-    if args.cta_k and any(cta_k != CTA_K for cta_k in args.cta_k):
-        parser.error("SM70 matmul benchmark only supports CTA_K=32")
+    if args.cta_k:
+        allowed_cta_k = {CTA_K, SM70_ATOM_CTA_K}
+        if any(cta_k not in allowed_cta_k for cta_k in args.cta_k):
+            parser.error("SM70 matmul benchmark only supports CTA_K=32 or CTA_K=128")
     return args
 
 
@@ -89,17 +93,19 @@ def max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
 
 
 def candidate_configs(args: argparse.Namespace):
+    requested_a_paths = tuple(args.a_paths or ())
+    atom_only = requested_a_paths == ("sm70_atom",)
     if args.preset == "quick":
-        cta_m_values = (8, 32, 64)
-        cta_n_values = (64, 128)
-        cta_k_values = (32,)
-        warp_values = (4, 8)
+        cta_m_values = (8, 16) if atom_only else (8, 32, 64)
+        cta_n_values = (64,) if atom_only else (64, 128)
+        cta_k_values = (SM70_ATOM_CTA_K,) if atom_only else CTA_K_CANDIDATES
+        warp_values = (4,) if atom_only else WARP_CANDIDATES
         a_paths = args.a_paths or ("cutlass_shared",)
     else:
-        cta_m_values = CTA_M_CANDIDATES
-        cta_n_values = CTA_N_CANDIDATES
-        cta_k_values = CTA_K_CANDIDATES
-        warp_values = WARP_CANDIDATES
+        cta_m_values = (8, 16) if atom_only else CTA_M_CANDIDATES
+        cta_n_values = (64,) if atom_only else CTA_N_CANDIDATES
+        cta_k_values = (SM70_ATOM_CTA_K,) if atom_only else CTA_K_CANDIDATES
+        warp_values = (4,) if atom_only else WARP_CANDIDATES
         a_paths = args.a_paths or ("cutlass_shared",)
 
     cta_m_values = tuple(args.cta_m or cta_m_values)

@@ -144,6 +144,33 @@ def test_sm70_cutlass_matmul_probe_threadblock_path_matches_torch_mm():
 
 
 @pytest.mark.parametrize(
+    ("m", "cta_m"),
+    [
+        (8, 8),
+        (16, 16),
+        (64, 16),
+        (128, 16),
+    ],
+)
+def test_sm70_cutlass_matmul_probe_sm70_atom_path_matches_torch_mm(
+    m: int, cta_m: int
+):
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    n = 4096
+    k = 4096
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_probe(a, b, cta_m, 64, 128, 4, 2, 3, 0)
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-1)
+
+
+@pytest.mark.parametrize(
     ("cta_m", "cta_n", "warps"),
     [
         (32, 256, 4),
@@ -201,6 +228,35 @@ def test_sm70_cutlass_matmul_probe_rejects_direct_a_path():
 
     with pytest.raises(RuntimeError, match="A direct-global path is TODO"):
         ops.sm70_cutlass_matmul_probe(a, b, 32, 64, 64, 4, 2, 1, 0)
+
+
+@pytest.mark.parametrize(
+    ("cta_m", "cta_n", "cta_k", "warps", "match"),
+    [
+        (8, 64, 32, 4, "unsupported SM70 atom config"),
+        (8, 64, 128, 8, "unsupported SM70 atom config"),
+        (8, 128, 128, 4, "unsupported SM70 atom config"),
+        (32, 64, 128, 4, "unsupported SM70 atom config"),
+    ],
+)
+def test_sm70_cutlass_matmul_probe_rejects_unsupported_sm70_atom_shape(
+    cta_m: int, cta_n: int, cta_k: int, warps: int, match: str
+):
+    _require_marlin_cuda()
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match=match):
+        ops.sm70_cutlass_matmul_probe(a, b, cta_m, cta_n, cta_k, warps, 2, 3, 0)
+
+
+def test_sm70_cutlass_matmul_probe_rejects_sm70_atom_non_divisible_shape():
+    _require_marlin_cuda()
+    a = torch.randn((24, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="requires M divisible by cta_m"):
+        ops.sm70_cutlass_matmul_probe(a, b, 16, 64, 128, 4, 2, 3, 0)
 
 
 def test_sm70_cutlass_matmul_probe_rejects_non_pure_b_path():
