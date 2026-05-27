@@ -36,7 +36,7 @@ torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_scales,
                                   torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
-                                  int64_t group_size);
+                                  int64_t group_size, bool use_fp32_reduce);
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
@@ -924,7 +924,7 @@ torch::Tensor marlin_gemm(
         has_zp && is_zp_float,
         "SM70 CUTLASS uint4 dense prototype requires fp16 zero points.");
     return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size);
+                               size_n, size_k, group_size, use_fp32_reduce);
   }
 
   if (b_type == vllm::kU8) {

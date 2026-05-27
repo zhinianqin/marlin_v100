@@ -617,6 +617,7 @@ def _run_dense_uint4_zp_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
+    use_fp32_reduce: bool = True,
 ) -> None:
     _require_marlin_cuda()
     assert_repack_layout_matches_reference(
@@ -651,7 +652,7 @@ def _run_dense_uint4_zp_accuracy_case(
         w.shape[0],
         True,
         False,
-        True,
+        use_fp32_reduce,
         True,
     )
     reference = torch.matmul(a.to(torch.float32), dequantized.to(torch.float32)).to(
@@ -1049,6 +1050,128 @@ def test_marlin_dense_uint4_zp_env_cta_geometry_rejects_unsupported(
             size_m=32,
             size_k=256,
             size_n=64,
+        )
+
+
+@pytest.mark.parametrize("size_m", (1, 2, 4, 8, 16, 32, 64))
+def test_marlin_dense_uint4_zp_split_k_small_m_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    size_m: int,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "4")
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=size_m,
+        size_k=256,
+        size_n=256,
+    )
+
+
+@pytest.mark.parametrize("group_size", _GROUP_SIZES)
+def test_marlin_dense_uint4_zp_split_k_group_sizes_match_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "8")
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=group_size,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=16,
+        size_k=256,
+        size_n=256,
+    )
+
+
+@pytest.mark.parametrize(
+    ("cta_geometry", "split_k"),
+    (("128x256x8", "2"), ("32x128x4", "4"), ("128x256x8", "8")),
+)
+def test_marlin_dense_uint4_zp_split_k_cta_geometry_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    cta_geometry: str,
+    split_k: str,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_CTA", cta_geometry)
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", split_k)
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=32,
+        size_k=256,
+        size_n=256,
+    )
+
+
+def test_marlin_dense_uint4_zp_split_k_large_k_smoke_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "4")
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=5e-1,
+        size_m=1,
+        size_k=4096,
+        size_n=4096,
+    )
+
+
+@pytest.mark.parametrize("split_k", ("3", "abc"))
+def test_marlin_dense_uint4_zp_split_k_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+    split_k: str,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", split_k)
+    with pytest.raises(RuntimeError, match="SM70_MARLIN_U4_SPLIT_K"):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=256,
+            size_n=256,
+        )
+
+
+def test_marlin_dense_uint4_zp_split_k_rejects_k_partition_tail(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "8")
+    with pytest.raises(RuntimeError, match="divisible by 32 \\* split_k"):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=-1,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=288,
+            size_n=256,
+        )
+
+
+def test_marlin_dense_uint4_zp_split_k_requires_fp32_reduce(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "2")
+    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=True"):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=256,
+            size_n=256,
+            use_fp32_reduce=False,
         )
 
 

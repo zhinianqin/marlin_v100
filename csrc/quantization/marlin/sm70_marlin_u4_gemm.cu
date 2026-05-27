@@ -10,6 +10,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
 #include <torch/library.h>
 #include <cstdlib>
 #include <sstream>
@@ -42,6 +43,22 @@ using marlin::sm70_dense::u4_macro_n_qweight_offset_from_logical;
 namespace {
 
 constexpr int kU4ValuesPerWord = 8;
+constexpr char const* kSm70MarlinU4SplitKEnv = "SM70_MARLIN_U4_SPLIT_K";
+
+int parse_sm70_marlin_u4_split_k() {
+  char const* env = std::getenv(kSm70MarlinU4SplitKEnv);
+  if (env == nullptr || env[0] == '\0') {
+    return 1;
+  }
+
+  std::string value(env);
+  if (value == "1" || value == "2" || value == "4" || value == "8") {
+    return std::stoi(value);
+  }
+  TORCH_CHECK(false, kSm70MarlinU4SplitKEnv,
+              " supports only 1, 2, 4, or 8. Got: ", env);
+  return 1;
+}
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
 class Sm70U4ZpIteratorB {
@@ -424,6 +441,135 @@ template <int CtaM, int CtaN, int Warps, int GroupSize>
 using Sm70U4ZpGemmTraits =
     Sm70DenseGemmTraits<Sm70U4ZpGemmSpec, CtaM, CtaN, Warps, GroupSize>;
 
+template <typename Traits>
+class Sm70U4AtomicFp32Epilogue {
+ public:
+  using CutlassEpilogue = typename Traits::Epilogue;
+  using SharedStorage = typename CutlassEpilogue::Base::SharedStorage;
+  using AccumulatorTile = typename CutlassEpilogue::AccumulatorTile;
+  using AccumulatorFragmentIterator =
+      typename CutlassEpilogue::AccumulatorFragmentIterator;
+  using WarpTileIterator = typename CutlassEpilogue::WarpTileIterator;
+  using SharedLoadIterator = typename CutlassEpilogue::SharedLoadIterator;
+  using OutputTileIterator = typename CutlassEpilogue::OutputTileIterator;
+  using ThreadMap = typename OutputTileIterator::ThreadMap;
+
+ private:
+  WarpTileIterator warp_tile_iterator_;
+  SharedLoadIterator shared_load_iterator_;
+
+  CUTLASS_DEVICE
+  void atomic_store_fragment(OutputTileIterator const& destination_iterator,
+                             typename SharedLoadIterator::Fragment const& frag,
+                             float* __restrict__ c_tmp, int n) const {
+    float const* frag_ptr = reinterpret_cast<float const*>(&frag);
+    int const thread_start_row = destination_iterator.thread_start_row();
+    int const thread_start_column = destination_iterator.thread_start_column();
+    int const extent_row = destination_iterator.extent_row();
+    int const extent_column = destination_iterator.extent_column();
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster;
+         ++cluster) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int group = 0; group < ThreadMap::Iterations::kGroup; ++group) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int row = 0; row < ThreadMap::Iterations::kRow; ++row) {
+          int const frag_row_idx =
+              row + ThreadMap::Iterations::kRow *
+                        (group + ThreadMap::Iterations::kGroup * cluster);
+          int const row_offset =
+              row * ThreadMap::Delta::kRow +
+              group * ThreadMap::Delta::kGroup +
+              cluster * ThreadMap::Delta::kCluster;
+          int const logical_row = thread_start_row + row_offset;
+          bool const row_guard = logical_row < extent_row;
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int column = 0; column < ThreadMap::Iterations::kColumn;
+               ++column) {
+            int const logical_column_base =
+                thread_start_column + column * ThreadMap::Delta::kColumn;
+            int const frag_base =
+                (frag_row_idx * ThreadMap::Iterations::kColumn + column) *
+                ThreadMap::kElementsPerAccess;
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
+              int const logical_column = logical_column_base + e;
+              if (row_guard && logical_column < extent_column) {
+                atomicAdd(c_tmp + int64_t(logical_row) * n + logical_column,
+                          frag_ptr[frag_base + e]);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+ public:
+  CUTLASS_DEVICE
+  Sm70U4AtomicFp32Epilogue(SharedStorage& shared_storage, int thread_idx,
+                           int warp_idx, int lane_idx)
+      : warp_tile_iterator_(shared_storage.reference(), lane_idx),
+        shared_load_iterator_(shared_storage.reference(), thread_idx) {
+    using WarpCount = typename CutlassEpilogue::WarpCount;
+    int const warp_k = warp_idx / (WarpCount::kM * WarpCount::kN);
+    int const warp_mn = warp_idx % (WarpCount::kM * WarpCount::kN);
+    int const warp_m = warp_mn % WarpCount::kM;
+    int const warp_n = warp_mn / WarpCount::kM;
+
+    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m,
+                                     warp_n};
+    warp_tile_iterator_.add_tile_offset(warp_offset);
+  }
+
+  CUTLASS_DEVICE
+  void operator()(OutputTileIterator destination_iterator,
+                  AccumulatorTile const& accumulators,
+                  float* __restrict__ c_tmp, int n) {
+    AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int iter = 0; iter < OutputTileIterator::kIterations; ++iter) {
+      __syncthreads();
+
+      typename AccumulatorFragmentIterator::Fragment accum_fragment;
+      accum_fragment_iterator.load(accum_fragment);
+      ++accum_fragment_iterator;
+      warp_tile_iterator_.store(accum_fragment);
+
+      __syncthreads();
+
+      typename SharedLoadIterator::Fragment aligned_accum_fragment;
+      shared_load_iterator_.load(aligned_accum_fragment);
+
+      if (CutlassEpilogue::kPartitionsK > 1) {
+        cutlass::plus<typename SharedLoadIterator::Fragment> add_fragments;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 1; i < CutlassEpilogue::kPartitionsK; ++i) {
+          typename SharedLoadIterator::Fragment aligned_addend_fragment;
+          shared_load_iterator_.add_pointer_offset(
+              CutlassEpilogue::kSmemPointerOffset);
+          shared_load_iterator_.load(aligned_addend_fragment);
+          aligned_accum_fragment =
+              add_fragments(aligned_accum_fragment, aligned_addend_fragment);
+        }
+
+        shared_load_iterator_.add_pointer_offset(
+            (1 - CutlassEpilogue::kPartitionsK) *
+            CutlassEpilogue::kSmemPointerOffset);
+      }
+
+      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c_tmp,
+                            n);
+      ++destination_iterator;
+    }
+  }
+};
+
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 __global__ __launch_bounds__(Warps * 32, 1)
 void sm70_marlin_u4_gemm_kernel(
@@ -481,31 +627,139 @@ void sm70_marlin_u4_gemm_kernel(
   epilogue(output_op, iterator_D, accumulators, iterator_C);
 }
 
+template <int CtaM, int CtaN, int Warps, int GroupSize>
+__global__ __launch_bounds__(Warps * 32, 1)
+void sm70_marlin_u4_gemm_splitk_kernel(
+    cutlass::half_t const* __restrict__ a,
+    uint32_t const* __restrict__ b_q_weight,
+    cutlass::half_t const* __restrict__ b_scales,
+    cutlass::half_t const* __restrict__ b_zeros,
+    float* __restrict__ c_tmp, int m, int n, int k, int lda, int split_k) {
+  using Traits = Sm70U4ZpGemmTraits<CtaM, CtaN, Warps, GroupSize>;
+  using Mma = typename Traits::Mma;
+  using AtomicEpilogue = Sm70U4AtomicFp32Epilogue<Traits>;
+
+  extern __shared__ char smem[];
+  auto& shared_storage =
+      *reinterpret_cast<typename Traits::SharedStorage*>(smem);
+
+  int const thread_idx = threadIdx.x;
+  int const warp_idx = cutlass::canonical_warp_idx_sync();
+  int const lane_idx = threadIdx.x % 32;
+  int const k_partition = k / split_k;
+  int const k_begin = int(blockIdx.z) * k_partition;
+
+  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CtaM, k_begin};
+  cutlass::MatrixCoord tb_offset_B{k_begin, int(blockIdx.y) * CtaN};
+  cutlass::MatrixCoord tb_offset_C{int(blockIdx.x) * CtaM,
+                                   int(blockIdx.y) * CtaN};
+
+  typename Traits::LayoutA layout_a(lda);
+  typename Traits::LayoutC layout_c(n);
+
+  typename Mma::IteratorA iterator_A(
+      typename Mma::IteratorA::Params(layout_a),
+      const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
+      tb_offset_A);
+  typename Mma::IteratorB iterator_B(
+      typename Mma::IteratorB::Params(k, n),
+      reinterpret_cast<uint32_t const*>(b_q_weight),
+      reinterpret_cast<half const*>(b_scales),
+      reinterpret_cast<half const*>(b_zeros), thread_idx, tb_offset_B);
+
+  Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+  typename Mma::FragmentC accumulators;
+  accumulators.clear();
+
+  int const gemm_k_iterations = k_partition / kCtaK;
+  mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
+
+  typename AtomicEpilogue::OutputTileIterator iterator_D(
+      typename AtomicEpilogue::OutputTileIterator::Params(layout_c),
+      reinterpret_cast<cutlass::half_t*>(c_tmp), cutlass::MatrixCoord(m, n),
+      thread_idx, tb_offset_C);
+
+  AtomicEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx,
+                          lane_idx);
+  epilogue(iterator_D, accumulators, c_tmp, n);
+}
+
+__global__ void sm70_marlin_u4_fp32_to_fp16_kernel(
+    float const* __restrict__ c_tmp, cutlass::half_t* __restrict__ c,
+    int64_t numel) {
+  int64_t const idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < numel) {
+    reinterpret_cast<half*>(c)[idx] = __float2half_rn(c_tmp[idx]);
+  }
+}
+
 }  // namespace
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 torch::Tensor launch_sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k) {
-  auto kernel =
-      sm70_marlin_u4_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
+    int64_t size_n, int64_t size_k, int split_k, bool use_fp32_reduce) {
+  auto kernel = sm70_marlin_u4_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
   using SharedStorage = typename Sm70U4ZpGemmTraits<
       CtaM, CtaN, Warps, GroupSize>::SharedStorage;
   size_t smem_bytes = configure_dynamic_smem<SharedStorage>(kernel);
-
-  dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
-  kernel<<<grid, block, smem_bytes, stream>>>(
+  if (split_k == 1) {
+    dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
+    kernel<<<grid, block, smem_bytes, stream>>>(
+        reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
+        reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
+        reinterpret_cast<cutlass::half_t const*>(
+            b_scales.data_ptr<at::Half>()),
+        reinterpret_cast<cutlass::half_t const*>(b_zeros.data_ptr<at::Half>()),
+        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+        static_cast<int>(size_m), static_cast<int>(size_n),
+        static_cast<int>(size_k), static_cast<int>(a.stride(0)));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return c;
+  }
+
+  TORCH_CHECK(use_fp32_reduce, kSm70MarlinU4SplitKEnv,
+              " requires use_fp32_reduce=True for split_k > 1.");
+  TORCH_CHECK(size_k % (int64_t(kCtaK) * split_k) == 0,
+              kSm70MarlinU4SplitKEnv,
+              " requires K divisible by 32 * split_k for split_k > 1. Got K=",
+              size_k, ", split_k=", split_k, ".");
+
+  auto split_kernel =
+      sm70_marlin_u4_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
+  smem_bytes = configure_dynamic_smem<SharedStorage>(split_kernel);
+
+  auto c_tmp = torch::empty(
+      {size_m, size_n},
+      torch::TensorOptions().dtype(at::kFloat).device(a.device()));
+  C10_CUDA_CHECK(cudaMemsetAsync(
+      c_tmp.data_ptr<float>(), 0,
+      static_cast<size_t>(c_tmp.numel()) * sizeof(float), stream));
+
+  dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
+  grid.z = static_cast<unsigned>(split_k);
+  split_kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
       reinterpret_cast<cutlass::half_t const*>(b_zeros.data_ptr<at::Half>()),
-      reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+      c_tmp.data_ptr<float>(),
       static_cast<int>(size_m), static_cast<int>(size_n),
-      static_cast<int>(size_k), static_cast<int>(a.stride(0)));
+      static_cast<int>(size_k), static_cast<int>(a.stride(0)), split_k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  int64_t const numel = size_m * size_n;
+  dim3 convert_block(256);
+  dim3 convert_grid(
+      static_cast<unsigned>((numel + convert_block.x - 1) / convert_block.x));
+  sm70_marlin_u4_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0,
+                                       stream>>>(
+      c_tmp.data_ptr<float>(),
+      reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()), numel);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return c;
 }
@@ -519,18 +773,22 @@ struct Sm70U4Launcher {
   int64_t size_m;
   int64_t size_n;
   int64_t size_k;
+  int split_k;
+  bool use_fp32_reduce;
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
     return launch_sm70_marlin_u4_gemm<CtaM, CtaN, Warps, GroupSize>(
-        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k);
+        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k,
+        use_fp32_reduce);
   }
 };
 
 torch::Tensor sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int64_t group_size) {
+    int64_t size_n, int64_t size_k, int64_t group_size,
+    bool use_fp32_reduce) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
   char const* env_name = "SM70_MARLIN_U4_CTA";
@@ -538,8 +796,10 @@ torch::Tensor sm70_marlin_u4_gemm(
       parse_sm70_dense_cta_geometry(env_name);
   check_sm70_dense_cta_geometry(env_name, geometry);
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
+  int const split_k = parse_sm70_marlin_u4_split_k();
   Sm70U4Launcher const launcher{
-      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k};
+      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k,
+      use_fp32_reduce};
   return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,
                            "uint4");
 }
