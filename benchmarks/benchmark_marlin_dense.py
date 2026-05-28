@@ -36,7 +36,6 @@ from marlin_v100.calibration import (
 )
 from marlin_v100 import dense, ops
 from tests.helpers import (
-    marlin_make_workspace_new,
     marlin_quantize,
     marlin_quantize_mxfp4,
     marlin_quantize_nvfp4,
@@ -243,6 +242,7 @@ def run_case(
     use_fp32_reduce: bool,
     warmup_iters: int,
     iters: int,
+    c_tmp: torch.Tensor | None = None,
 ) -> dict[str, object] | None:
     if not _is_supported_dense_benchmark_case(
         quant_name=quant_name,
@@ -289,7 +289,6 @@ def run_case(
         weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
             weight, quant_type, group_size, act_order
         )
-    workspace = marlin_make_workspace_new(device)
     torch_output = torch.empty((size_m, size_n), device=device, dtype=torch.float16)
     marlin_output = torch.empty((size_m, size_n), device=device, dtype=torch.float16)
     flops = dense_flops(size_m, size_k, size_n)
@@ -306,7 +305,7 @@ def run_case(
             size_m,
             size_n,
             size_k,
-            workspace=workspace,
+            c_tmp=c_tmp,
             b_zeros=b_zeros,
             global_scale=global_scale,
             g_idx=g_idx,
@@ -341,7 +340,7 @@ def run_case(
                 size_m,
                 size_n,
                 size_k,
-                workspace=workspace,
+                c_tmp=c_tmp,
                 c=marlin_output,
                 b_zeros=b_zeros,
                 global_scale=global_scale,

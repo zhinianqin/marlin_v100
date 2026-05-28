@@ -36,7 +36,9 @@ torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_scales,
                                   torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
-                                  int64_t group_size);
+                                  int64_t group_size,
+                                  std::optional<torch::Tensor> const&
+                                      c_tmp_or_none);
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
@@ -91,7 +93,8 @@ torch::Tensor marlin_gemm(
     std::optional<torch::Tensor> const& b_bias_or_none, torch::Tensor& b_scales,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    std::optional<torch::Tensor> const& perm_or_none,
+    std::optional<torch::Tensor> const& c_tmp_or_none,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
@@ -563,7 +566,8 @@ torch::Tensor marlin_gemm(
     std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    std::optional<torch::Tensor> const& perm_or_none,
+    std::optional<torch::Tensor> const& c_tmp_or_none,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
@@ -862,16 +866,10 @@ torch::Tensor marlin_gemm(
                 "is_zp_float is true but b_zeros was not provided.");
   }
 
-  // Verify workspace size
   TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
               "SM70 CUTLASS dense prototype requires size_n % 64 == 0. "
               "size_n = ",
               size_n, ", min_thread_n = ", MARLIN_NAMESPACE_NAME::min_thread_n);
-
-  int min_workspace_size = sms;
-  TORCH_CHECK(workspace.numel() >= min_workspace_size,
-              "workspace.numel = ", workspace.numel(),
-              " is below min_workspace_size = ", min_workspace_size);
 
   int dev = a.get_device();
 
@@ -914,7 +912,7 @@ torch::Tensor marlin_gemm(
         has_zp && is_zp_float,
         "SM70 CUTLASS uint4 dense prototype requires fp16 zero points.");
     return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size);
+                               size_n, size_k, group_size, c_tmp_or_none);
   }
 
   if (b_type == vllm::kU8) {
@@ -1001,7 +999,7 @@ torch::Tensor marlin_gemm(
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
       global_scale.data_ptr(), b_zeros.data_ptr(), g_idx.data_ptr(),
       perm.data_ptr(), a_tmp.data_ptr(), size_m, size_n, size_k, a.stride(0),
-      workspace.data_ptr(), a_type, b_type, c_type, s_type, has_bias,
+      nullptr, a_type, b_type, c_type, s_type, has_bias,
       has_act_order, is_k_full, has_zp, num_groups, group_size, dev,
       at::cuda::getCurrentCUDAStream(dev), thread_k, thread_n, sms,
       use_atomic_add, use_fp32_reduce, is_zp_float);

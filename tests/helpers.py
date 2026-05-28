@@ -74,6 +74,15 @@ def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 4) 
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
 
 
+def marlin_make_c_tmp(
+    device: torch.device,
+    numel_or_shape: int | tuple[int, ...],
+) -> torch.Tensor:
+    if isinstance(numel_or_shape, tuple):
+        return torch.empty(numel_or_shape, dtype=torch.float32, device=device)
+    return torch.empty((numel_or_shape,), dtype=torch.float32, device=device)
+
+
 def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int, device=device)
 

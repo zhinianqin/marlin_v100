@@ -3,18 +3,11 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // Note about marlin kernel 'workspace' arguments:
-  // Technically these should be mutable since they are modified by the kernel.
-  // But since they are set back to zero once the kernel is finished we can
-  // hand wave and say that they have no net effect.
-  //
-  // The reason to mark 'workspace' as immutable is so that they don't
-  // interfere with using ScalarType arguments in the ops.
   ops.def(
       "marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
       "Tensor? b_bias_or_none,Tensor b_scales, "
       "Tensor? a_scales, Tensor? global_scale, Tensor? b_zeros_or_none, "
-      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor workspace, "
+      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor? c_tmp_or_none, "
       "int b_type_id, SymInt size_m, SymInt size_n, SymInt size_k, "
       "bool is_k_full, bool use_atomic_add, bool use_fp32_reduce, "
       "bool is_zp_float) -> Tensor");

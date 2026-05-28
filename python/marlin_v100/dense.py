@@ -33,15 +33,15 @@ def marlin_permute_bias(bias: torch.Tensor) -> torch.Tensor:
     return bias.reshape(*origin_shape).contiguous()
 
 
-def marlin_make_workspace(
+def marlin_make_c_tmp(
     device: torch.device,
-    size: int = 0,
-    max_blocks_per_sm: int = 4,
+    numel_or_shape: int | tuple[int, ...] = 0,
 ) -> torch.Tensor:
-    if size <= 0:
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        size = sms * max_blocks_per_sm
-    return torch.zeros(size, dtype=torch.int, device=device)
+    if isinstance(numel_or_shape, tuple):
+        return torch.empty(numel_or_shape, dtype=torch.float32, device=device)
+    if numel_or_shape <= 0:
+        return torch.empty((0,), dtype=torch.float32, device=device)
+    return torch.empty((numel_or_shape,), dtype=torch.float32, device=device)
 
 
 def run_marlin_gemm(
@@ -52,7 +52,7 @@ def run_marlin_gemm(
     size_m: int,
     size_n: int,
     size_k: int,
-    workspace: torch.Tensor | None = None,
+    c_tmp: torch.Tensor | None = None,
     c: torch.Tensor | None = None,
     b_bias: torch.Tensor | None = None,
     a_scales: torch.Tensor | None = None,
@@ -65,8 +65,6 @@ def run_marlin_gemm(
     use_fp32_reduce: bool = True,
     is_zp_float: bool | None = None,
 ) -> torch.Tensor:
-    if workspace is None:
-        workspace = marlin_make_workspace(a.device)
     if is_zp_float is None:
         is_zp_float = b_zeros is not None
     validate_dense_marlin_call(
@@ -89,7 +87,7 @@ def run_marlin_gemm(
         b_zeros,
         g_idx,
         perm,
-        workspace,
+        c_tmp,
         b_type_id,
         size_m,
         size_n,

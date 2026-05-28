@@ -60,6 +60,26 @@ int parse_sm70_marlin_u4_split_k() {
   return 1;
 }
 
+torch::Tensor sm70_marlin_u4_get_splitk_ctmp(
+    std::optional<torch::Tensor> const& c_tmp_or_none, torch::Device device,
+    int64_t required_numel) {
+  if (!c_tmp_or_none.has_value()) {
+    return torch::empty({required_numel},
+                        torch::TensorOptions().dtype(at::kFloat).device(device));
+  }
+
+  torch::Tensor c_tmp = c_tmp_or_none.value();
+  TORCH_CHECK(c_tmp.device().is_cuda(), "c_tmp must be a CUDA tensor.");
+  TORCH_CHECK(c_tmp.device() == device,
+              "c_tmp device must match the activation device.");
+  TORCH_CHECK(c_tmp.scalar_type() == at::ScalarType::Float,
+              "c_tmp must have dtype torch.float32.");
+  TORCH_CHECK(c_tmp.is_contiguous(), "c_tmp must be contiguous.");
+  TORCH_CHECK(c_tmp.numel() >= required_numel, "c_tmp.numel = ", c_tmp.numel(),
+              " is smaller than M*N = ", required_numel, ".");
+  return c_tmp;
+}
+
 struct Sm70U4SplitKPartition {
   int k_begin;
   int partition_k;
@@ -799,7 +819,8 @@ template <int CtaM, int CtaN, int Warps, int GroupSize>
 torch::Tensor launch_sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int split_k) {
+    int64_t size_n, int64_t size_k, int split_k,
+    std::optional<torch::Tensor> const& c_tmp_or_none) {
   auto kernel = sm70_marlin_u4_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
   using SharedStorage = typename Sm70U4ZpGemmTraits<
       CtaM, CtaN, Warps, GroupSize>::SharedStorage;
@@ -830,12 +851,12 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       sm70_marlin_u4_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
   smem_bytes = configure_dynamic_smem<SharedStorage>(split_kernel);
 
-  auto c_tmp = torch::empty(
-      {size_m, size_n},
-      torch::TensorOptions().dtype(at::kFloat).device(a.device()));
+  int64_t const numel = size_m * size_n;
+  auto c_tmp =
+      sm70_marlin_u4_get_splitk_ctmp(c_tmp_or_none, a.device(), numel);
   C10_CUDA_CHECK(cudaMemsetAsync(
       c_tmp.data_ptr<float>(), 0,
-      static_cast<size_t>(c_tmp.numel()) * sizeof(float), stream));
+      static_cast<size_t>(numel) * sizeof(float), stream));
 
   dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
@@ -851,7 +872,6 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       static_cast<int>(size_k), static_cast<int>(a.stride(0)), split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  int64_t const numel = size_m * size_n;
   dim3 convert_block(256);
   dim3 convert_grid(static_cast<unsigned>(
       (numel + int64_t(convert_block.x) * 4 - 1) /
@@ -874,18 +894,21 @@ struct Sm70U4Launcher {
   int64_t size_n;
   int64_t size_k;
   int split_k;
+  std::optional<torch::Tensor> const& c_tmp_or_none;
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
     return launch_sm70_marlin_u4_gemm<CtaM, CtaN, Warps, GroupSize>(
-        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k);
+        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k,
+        c_tmp_or_none);
   }
 };
 
 torch::Tensor sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int64_t group_size) {
+    int64_t size_n, int64_t size_k, int64_t group_size,
+    std::optional<torch::Tensor> const& c_tmp_or_none) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
   char const* env_name = "SM70_MARLIN_U4_CTA";
@@ -895,7 +918,8 @@ torch::Tensor sm70_marlin_u4_gemm(
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   int const split_k = parse_sm70_marlin_u4_split_k();
   Sm70U4Launcher const launcher{
-      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k};
+      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n,
+      size_k, split_k, c_tmp_or_none};
   return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,
                            "uint4");
 }

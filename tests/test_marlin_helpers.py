@@ -484,7 +484,7 @@ def test_dense_wrapper_rejects_incomplete_act_order_metadata_before_loading_exte
     a = torch.randn((4, 128), dtype=torch.float16)
     b_q_weight = torch.zeros((8, 256), dtype=torch.int32)
     b_scales = torch.ones((2, 256), dtype=torch.float16)
-    workspace = torch.zeros((1,), dtype=torch.int32)
+    c_tmp = torch.empty((0,), dtype=torch.float32)
     g_idx = torch.arange(128, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="g_idx and perm must be provided together"):
@@ -496,7 +496,7 @@ def test_dense_wrapper_rejects_incomplete_act_order_metadata_before_loading_exte
             size_m=a.shape[0],
             size_n=256,
             size_k=a.shape[1],
-            workspace=workspace,
+            c_tmp=c_tmp,
             g_idx=g_idx,
             perm=None,
             is_k_full=True,
@@ -509,7 +509,7 @@ def test_dense_wrapper_rejects_act_order_metadata_before_loading_extension():
     _, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
         weight, scalar_types.uint4b8, 64, True
     )
-    workspace = torch.zeros((1,), dtype=torch.int32)
+    c_tmp = torch.empty((0,), dtype=torch.float32)
 
     with pytest.raises(ValueError, match="act_order is not supported"):
         dense.run_marlin_gemm(
@@ -520,7 +520,7 @@ def test_dense_wrapper_rejects_act_order_metadata_before_loading_extension():
             size_m=a.shape[0],
             size_n=weight.shape[1],
             size_k=weight.shape[0],
-            workspace=workspace,
+            c_tmp=c_tmp,
             g_idx=g_idx,
             perm=sort_indices,
             is_k_full=True,
