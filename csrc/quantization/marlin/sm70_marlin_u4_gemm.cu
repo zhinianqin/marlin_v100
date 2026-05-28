@@ -687,9 +687,23 @@ void sm70_marlin_u4_gemm_splitk_kernel(
 __global__ void sm70_marlin_u4_fp32_to_fp16_kernel(
     float const* __restrict__ c_tmp, cutlass::half_t* __restrict__ c,
     int64_t numel) {
-  int64_t const idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx < numel) {
-    reinterpret_cast<half*>(c)[idx] = __float2half_rn(c_tmp[idx]);
+  int64_t const base =
+      (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+  half* c_half = reinterpret_cast<half*>(c);
+
+  if (base + 3 < numel) {
+    float4 const values = *reinterpret_cast<float4 const*>(c_tmp + base);
+    half2* c_half2 = reinterpret_cast<half2*>(c_half + base);
+    c_half2[0] = __floats2half2_rn(values.x, values.y);
+    c_half2[1] = __floats2half2_rn(values.z, values.w);
+    return;
+  }
+
+  for (int offset = 0; offset < 4; ++offset) {
+    int64_t const idx = base + offset;
+    if (idx < numel) {
+      c_half[idx] = __float2half_rn(c_tmp[idx]);
+    }
   }
 }
 
@@ -754,8 +768,9 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
 
   int64_t const numel = size_m * size_n;
   dim3 convert_block(256);
-  dim3 convert_grid(
-      static_cast<unsigned>((numel + convert_block.x - 1) / convert_block.x));
+  dim3 convert_grid(static_cast<unsigned>(
+      (numel + int64_t(convert_block.x) * 4 - 1) /
+      (int64_t(convert_block.x) * 4)));
   sm70_marlin_u4_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0,
                                        stream>>>(
       c_tmp.data_ptr<float>(),
