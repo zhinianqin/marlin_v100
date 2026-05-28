@@ -799,7 +799,7 @@ template <int CtaM, int CtaN, int Warps, int GroupSize>
 torch::Tensor launch_sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int split_k, bool use_fp32_reduce) {
+    int64_t size_n, int64_t size_k, int split_k) {
   auto kernel = sm70_marlin_u4_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
   using SharedStorage = typename Sm70U4ZpGemmTraits<
       CtaM, CtaN, Warps, GroupSize>::SharedStorage;
@@ -822,8 +822,6 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
     return c;
   }
 
-  TORCH_CHECK(use_fp32_reduce, kSm70MarlinU4SplitKEnv,
-              " requires use_fp32_reduce=True for split_k > 1.");
   TORCH_CHECK(size_k % int64_t(kCtaK) == 0, kSm70MarlinU4SplitKEnv,
               " requires K divisible by 32 for split_k > 1. Got K=", size_k,
               ", split_k=", split_k, ".");
@@ -876,21 +874,18 @@ struct Sm70U4Launcher {
   int64_t size_n;
   int64_t size_k;
   int split_k;
-  bool use_fp32_reduce;
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
     return launch_sm70_marlin_u4_gemm<CtaM, CtaN, Warps, GroupSize>(
-        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k,
-        use_fp32_reduce);
+        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k);
   }
 };
 
 torch::Tensor sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int64_t group_size,
-    bool use_fp32_reduce) {
+    int64_t size_n, int64_t size_k, int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
   char const* env_name = "SM70_MARLIN_U4_CTA";
@@ -900,8 +895,7 @@ torch::Tensor sm70_marlin_u4_gemm(
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   int const split_k = parse_sm70_marlin_u4_split_k();
   Sm70U4Launcher const launcher{
-      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k,
-      use_fp32_reduce};
+      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k};
   return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,
                            "uint4");
 }

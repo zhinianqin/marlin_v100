@@ -36,7 +36,7 @@ torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_scales,
                                   torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
-                                  int64_t group_size, bool use_fp32_reduce);
+                                  int64_t group_size);
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
@@ -643,6 +643,8 @@ torch::Tensor marlin_gemm(
               "SM70 CUTLASS prototype currently implements only uint4, "
               "uint4b8, uint8, uint8b128, fp8_e4m3fn, nvfp4, and "
               "mxfp4 dense weights.");
+  TORCH_CHECK(use_fp32_reduce,
+              "SM70 CUTLASS dense prototype requires use_fp32_reduce=True.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -733,18 +735,6 @@ torch::Tensor marlin_gemm(
     c = torch::empty({size_m, size_n}, options);
   }
   if (size_m == 0) return c;
-
-  // Alloc C tmp buffer that is going to be used for the global reduce
-  torch::Tensor c_tmp;
-  if (use_fp32_reduce) {
-    int max_m_block_size = (size_m + 16 - 1) / 16 * 16;
-    max_m_block_size = min(max_m_block_size, 64);
-    int max_c_tmp_size =
-        sms * max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n;
-    c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
-  } else {
-    c_tmp = torch::empty({0}, options_fp32);
-  }
 
   // Detect groupsize and act_order
   int num_groups = -1;
@@ -924,7 +914,7 @@ torch::Tensor marlin_gemm(
         has_zp && is_zp_float,
         "SM70 CUTLASS uint4 dense prototype requires fp16 zero points.");
     return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size, use_fp32_reduce);
+                               size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kU8) {
@@ -997,6 +987,14 @@ torch::Tensor marlin_gemm(
               "metadata.");
   return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                size_k, group_size);
+
+  // Alloc C tmp buffer that is going to be used for the legacy global reduce.
+  torch::Tensor c_tmp;
+  int max_m_block_size = (size_m + 16 - 1) / 16 * 16;
+  max_m_block_size = min(max_m_block_size, 64);
+  int max_c_tmp_size =
+      sms * max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n;
+  c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
 
   marlin::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),

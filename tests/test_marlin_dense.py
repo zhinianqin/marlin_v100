@@ -1201,6 +1201,20 @@ def test_marlin_dense_uint4_zp_split_k_requires_fp32_reduce(
         )
 
 
+def test_marlin_dense_uint4_zp_rejects_fp16_reduce_without_split_k():
+    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=True"):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=8,
+            size_k=256,
+            size_n=256,
+            use_fp32_reduce=False,
+        )
+
+
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_marlin_dense_uint8_zp_accuracy(group_size: int, repack_impl: str):
