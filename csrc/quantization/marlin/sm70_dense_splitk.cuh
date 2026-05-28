@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
+#include <torch/types.h>
 
 #include <cstdint>
 #include <cstdlib>
