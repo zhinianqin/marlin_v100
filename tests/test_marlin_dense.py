@@ -68,6 +68,14 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 scales\."
 )
 _N_TILE_ALIGNMENT_ERROR = "requires N alignment for macro-N qweight layout"
+_SPLIT_K_QUANT_CASES = (
+    ("uint4b8", "SM70_MARLIN_U4B8_SPLIT_K", 128, 384, 5e-2, 2.5e-1),
+    ("uint8", "SM70_MARLIN_U8_SPLIT_K", 32, 352, 5e-2, 2.5e-1),
+    ("uint8b128", "SM70_MARLIN_U8B128_SPLIT_K", 128, 384, 4e-2, 2e-1),
+    ("fp8", "SM70_MARLIN_FP8_SPLIT_K", 128, 384, 4e-2, 2e-1),
+    ("nvfp4", "SM70_MARLIN_NVFP4_SPLIT_K", 16, 288, 5e-2, 2.5e-1),
+    ("mxfp4", "SM70_MARLIN_MXFP4_SPLIT_K", 32, 352, 5e-2, 2.5e-1),
+)
 
 
 def _require_marlin_cuda() -> None:
@@ -361,6 +369,7 @@ def _run_dense_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
+    c_tmp: torch.Tensor | None = None,
 ) -> None:
     if act_order:
         raise AssertionError("act_order accuracy coverage was replaced by explicit rejection tests")
@@ -391,7 +400,7 @@ def _run_dense_accuracy_case(
         marlin_make_empty_g_idx(a.device),
         g_idx,
         sort_indices,
-        None,
+        c_tmp,
         quant_type.id,
         a.shape[0],
         w.shape[1],
@@ -426,6 +435,7 @@ def _run_fp8_dense_accuracy_case(
     size_n: int = 256,
     rtol: float = 4e-2,
     atol: float = 2e-1,
+    c_tmp: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -450,7 +460,7 @@ def _run_fp8_dense_accuracy_case(
         None,
         g_idx,
         sort_indices,
-        None,
+        c_tmp,
         scalar_types.float8_e4m3fn.id,
         a.shape[0],
         w.shape[1],
@@ -483,6 +493,7 @@ def _run_nvfp4_dense_accuracy_case(
     size_n: int = 256,
     rtol: float = 5e-2,
     atol: float = 2.5e-1,
+    c_tmp: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -501,7 +512,7 @@ def _run_nvfp4_dense_accuracy_case(
         a.shape[0],
         w.shape[1],
         w.shape[0],
-        c_tmp=None,
+        c_tmp=c_tmp,
         global_scale=global_scale,
         g_idx=g_idx,
         perm=sort_indices,
@@ -526,6 +537,7 @@ def _run_mxfp4_dense_accuracy_case(
     size_n: int = 256,
     rtol: float = 5e-2,
     atol: float = 2.5e-1,
+    c_tmp: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -542,7 +554,7 @@ def _run_mxfp4_dense_accuracy_case(
         a.shape[0],
         w.shape[1],
         w.shape[0],
-        c_tmp=None,
+        c_tmp=c_tmp,
         g_idx=g_idx,
         perm=sort_indices,
         is_k_full=True,
@@ -675,6 +687,7 @@ def _run_dense_uint8_zp_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
+    c_tmp: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     assert_repack_layout_matches_reference(
@@ -702,7 +715,7 @@ def _run_dense_uint8_zp_accuracy_case(
         zp,
         None,
         None,
-        None,
+        c_tmp,
         scalar_types.uint8.id,
         a.shape[0],
         w.shape[1],
@@ -720,6 +733,205 @@ def _run_dense_uint8_zp_accuracy_case(
     assert not torch.all(output == 0)
     assert output.float().std().item() > 0
     torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
+def _run_split_k_quant_accuracy_case(
+    quant_name: str,
+    *,
+    group_size: int,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+    rtol: float,
+    atol: float,
+    c_tmp: torch.Tensor | None = None,
+) -> None:
+    if quant_name == "uint4b8":
+        _run_dense_accuracy_case(
+            scalar_types.uint4b8,
+            repack_impl="gptq",
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            rtol=rtol,
+            atol=atol,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            c_tmp=c_tmp,
+        )
+    elif quant_name == "uint8":
+        _run_dense_uint8_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=group_size,
+            rtol=rtol,
+            atol=atol,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            c_tmp=c_tmp,
+        )
+    elif quant_name == "uint8b128":
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            repack_impl="gptq",
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            rtol=rtol,
+            atol=atol,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            c_tmp=c_tmp,
+        )
+    elif quant_name == "fp8":
+        _run_fp8_dense_accuracy_case(
+            group_size=group_size,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            rtol=rtol,
+            atol=atol,
+            c_tmp=c_tmp,
+        )
+    elif quant_name == "nvfp4":
+        _run_nvfp4_dense_accuracy_case(
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            rtol=rtol,
+            atol=atol,
+            c_tmp=c_tmp,
+        )
+    elif quant_name == "mxfp4":
+        _run_mxfp4_dense_accuracy_case(
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            rtol=rtol,
+            atol=atol,
+            c_tmp=c_tmp,
+        )
+    else:
+        raise AssertionError(f"Unsupported split-K quant_name={quant_name}")
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "split_env", "group_size", "size_k", "rtol", "atol"),
+    _SPLIT_K_QUANT_CASES,
+)
+@pytest.mark.parametrize("split_k", ("2", "4", "8"))
+def test_marlin_dense_split_k_quant_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    split_env: str,
+    group_size: int,
+    size_k: int,
+    rtol: float,
+    atol: float,
+    split_k: str,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.setenv(split_env, split_k)
+    _run_split_k_quant_accuracy_case(
+        quant_name,
+        group_size=group_size,
+        size_m=16,
+        size_k=size_k,
+        size_n=256,
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "split_env", "group_size", "_size_k", "rtol", "atol"),
+    _SPLIT_K_QUANT_CASES,
+)
+def test_marlin_dense_split_k_quant_reuses_c_tmp_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    split_env: str,
+    group_size: int,
+    _size_k: int,
+    rtol: float,
+    atol: float,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.setenv(split_env, "4")
+    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 16 * 256)
+    _run_split_k_quant_accuracy_case(
+        quant_name,
+        group_size=group_size,
+        size_m=16,
+        size_k=256,
+        size_n=256,
+        rtol=rtol,
+        atol=atol,
+        c_tmp=c_tmp,
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "split_env", "group_size", "_size_k", "rtol", "atol"),
+    _SPLIT_K_QUANT_CASES,
+)
+def test_marlin_dense_split_k_quant_no_split_accepts_unused_c_tmp(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    split_env: str,
+    group_size: int,
+    _size_k: int,
+    rtol: float,
+    atol: float,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.delenv(split_env, raising=False)
+    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 1)
+    _run_split_k_quant_accuracy_case(
+        quant_name,
+        group_size=group_size,
+        size_m=16,
+        size_k=256,
+        size_n=256,
+        rtol=rtol,
+        atol=atol,
+        c_tmp=c_tmp,
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "split_env", "group_size", "_size_k", "rtol", "atol"),
+    _SPLIT_K_QUANT_CASES,
+)
+@pytest.mark.parametrize("split_k", ("3", "abc"))
+def test_marlin_dense_split_k_quant_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    split_env: str,
+    group_size: int,
+    _size_k: int,
+    rtol: float,
+    atol: float,
+    split_k: str,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.setenv(split_env, split_k)
+    with pytest.raises(RuntimeError, match=split_env):
+        _run_split_k_quant_accuracy_case(
+            quant_name,
+            group_size=group_size,
+            size_m=8,
+            size_k=256,
+            size_n=256,
+            rtol=rtol,
+            atol=atol,
+        )
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
