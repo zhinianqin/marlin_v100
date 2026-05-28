@@ -1082,7 +1082,33 @@ def test_marlin_dense_uint4_zp_split_k_group_sizes_match_reference(
         rtol=5e-2,
         atol=2.5e-1,
         size_m=16,
-        size_k=256,
+        size_k=1024,
+        size_n=256,
+    )
+
+
+@pytest.mark.parametrize(
+    ("group_size", "split_k", "size_k"),
+    (
+        (128, "2", 384),
+        (-1, "4", 352),
+        (32, "8", 288),
+    ),
+)
+def test_marlin_dense_uint4_zp_split_k_nonuniform_k_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int,
+    split_k: str,
+    size_k: int,
+):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", split_k)
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=group_size,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=16,
+        size_k=size_k,
         size_n=256,
     )
 
@@ -1145,15 +1171,15 @@ def test_marlin_dense_uint4_zp_split_k_rejects_invalid_env(
 def test_marlin_dense_uint4_zp_split_k_rejects_k_partition_tail(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "8")
-    with pytest.raises(RuntimeError, match="divisible by 32 \\* split_k"):
+    monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", "2")
+    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl="gptq",
             group_size=-1,
             rtol=5e-2,
             atol=2.5e-1,
             size_m=8,
-            size_k=288,
+            size_k=144,
             size_n=256,
         )
 

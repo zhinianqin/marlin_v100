@@ -60,6 +60,88 @@ int parse_sm70_marlin_u4_split_k() {
   return 1;
 }
 
+struct Sm70U4SplitKPartition {
+  int k_begin;
+  int partition_k;
+};
+
+CUTLASS_HOST_DEVICE
+int ceil_div_int(int numerator, int denominator) {
+  return (numerator + denominator - 1) / denominator;
+}
+
+CUTLASS_HOST_DEVICE
+int min_int(int lhs, int rhs) {
+  return lhs < rhs ? lhs : rhs;
+}
+
+template <int GroupSize>
+CUTLASS_HOST_DEVICE int sm70_marlin_u4_splitk_group_tiles() {
+  if constexpr (GroupSize > 0) {
+    static_assert(GroupSize % kCtaK == 0,
+                  "SM70 U4 split-K group size must be CTA_K aligned.");
+    return GroupSize / kCtaK;
+  } else {
+    return 1;
+  }
+}
+
+CUTLASS_HOST_DEVICE
+int sm70_marlin_u4_active_split_k(int k, int requested_split_k) {
+  int const total_tiles = k / kCtaK;
+  if (total_tiles <= 0) {
+    return 0;
+  }
+  return min_int(requested_split_k, total_tiles);
+}
+
+CUTLASS_HOST_DEVICE
+int sm70_marlin_u4_partition_tile_count(int remaining_tiles,
+                                        int remaining_partitions,
+                                        int group_tiles) {
+  if (remaining_tiles <= 0 || remaining_partitions <= 0) {
+    return 0;
+  }
+  if (remaining_partitions == 1) {
+    return remaining_tiles;
+  }
+
+  int const target_tiles = ceil_div_int(remaining_tiles, remaining_partitions);
+  int const max_current_tiles = remaining_tiles - (remaining_partitions - 1);
+  int partition_tiles = target_tiles;
+  if (group_tiles > 1) {
+    int const rounded_tiles =
+        ceil_div_int(partition_tiles, group_tiles) * group_tiles;
+    if (rounded_tiles <= max_current_tiles) {
+      partition_tiles = rounded_tiles;
+    }
+  }
+  return min_int(partition_tiles, max_current_tiles);
+}
+
+template <int GroupSize>
+CUTLASS_HOST_DEVICE Sm70U4SplitKPartition sm70_marlin_u4_splitk_partition(
+    int k, int split_k, int partition_idx) {
+  int const active_split_k = sm70_marlin_u4_active_split_k(k, split_k);
+  if (partition_idx >= active_split_k) {
+    return {0, 0};
+  }
+
+  int const group_tiles = sm70_marlin_u4_splitk_group_tiles<GroupSize>();
+  int remaining_tiles = k / kCtaK;
+  int start_tiles = 0;
+  for (int idx = 0; idx < partition_idx; ++idx) {
+    int const partition_tiles = sm70_marlin_u4_partition_tile_count(
+        remaining_tiles, active_split_k - idx, group_tiles);
+    start_tiles += partition_tiles;
+    remaining_tiles -= partition_tiles;
+  }
+
+  int const partition_tiles = sm70_marlin_u4_partition_tile_count(
+      remaining_tiles, active_split_k - partition_idx, group_tiles);
+  return {start_tiles * kCtaK, partition_tiles * kCtaK};
+}
+
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
 class Sm70U4ZpIteratorB {
  public:
@@ -646,11 +728,15 @@ void sm70_marlin_u4_gemm_splitk_kernel(
   int const thread_idx = threadIdx.x;
   int const warp_idx = cutlass::canonical_warp_idx_sync();
   int const lane_idx = threadIdx.x % 32;
-  int const k_partition = k / split_k;
-  int const k_begin = int(blockIdx.z) * k_partition;
+  Sm70U4SplitKPartition const partition =
+      sm70_marlin_u4_splitk_partition<GroupSize>(k, split_k, int(blockIdx.z));
+  if (partition.partition_k == 0) {
+    return;
+  }
 
-  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CtaM, k_begin};
-  cutlass::MatrixCoord tb_offset_B{k_begin, int(blockIdx.y) * CtaN};
+  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CtaM,
+                                   partition.k_begin};
+  cutlass::MatrixCoord tb_offset_B{partition.k_begin, int(blockIdx.y) * CtaN};
   cutlass::MatrixCoord tb_offset_C{int(blockIdx.x) * CtaM,
                                    int(blockIdx.y) * CtaN};
 
@@ -671,7 +757,7 @@ void sm70_marlin_u4_gemm_splitk_kernel(
   typename Mma::FragmentC accumulators;
   accumulators.clear();
 
-  int const gemm_k_iterations = k_partition / kCtaK;
+  int const gemm_k_iterations = partition.partition_k / kCtaK;
   mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
 
   typename AtomicEpilogue::OutputTileIterator iterator_D(
@@ -738,10 +824,9 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
 
   TORCH_CHECK(use_fp32_reduce, kSm70MarlinU4SplitKEnv,
               " requires use_fp32_reduce=True for split_k > 1.");
-  TORCH_CHECK(size_k % (int64_t(kCtaK) * split_k) == 0,
-              kSm70MarlinU4SplitKEnv,
-              " requires K divisible by 32 * split_k for split_k > 1. Got K=",
-              size_k, ", split_k=", split_k, ".");
+  TORCH_CHECK(size_k % int64_t(kCtaK) == 0, kSm70MarlinU4SplitKEnv,
+              " requires K divisible by 32 for split_k > 1. Got K=", size_k,
+              ", split_k=", split_k, ".");
 
   auto split_kernel =
       sm70_marlin_u4_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
@@ -755,7 +840,9 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       static_cast<size_t>(c_tmp.numel()) * sizeof(float), stream));
 
   dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
-  grid.z = static_cast<unsigned>(split_k);
+  int const active_split_k =
+      sm70_marlin_u4_active_split_k(static_cast<int>(size_k), split_k);
+  grid.z = static_cast<unsigned>(active_split_k);
   split_kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
