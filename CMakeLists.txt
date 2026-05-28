@@ -157,7 +157,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
 endif()
 list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM70_SRC})
 
-set(MARLIN_MOE_OTHER_SRC "csrc/moe/marlin_moe_wna16/ops.cu")
+set(MARLIN_MOE_OTHER_SRC
+  "csrc/moe/marlin_moe_wna16/ops.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_u4_gemm.cu")
 set_gencode_flags_for_srcs(
   SRCS "${MARLIN_MOE_OTHER_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")

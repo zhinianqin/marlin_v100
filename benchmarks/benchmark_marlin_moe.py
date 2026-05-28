@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import os
+from contextlib import contextmanager
 
 import torch
 
-from benchmark_shapes import MOE_CASES, MOE_PRESETS
-from common import (
-    banner,
-    check_cuda_ready,
-    format_float,
-    print_table,
-    time_cuda_callable,
-    timestamp,
-)
+try:
+    from benchmark_shapes import MOE_CASES, MOE_PRESETS
+    from common import (
+        banner,
+        check_cuda_ready,
+        format_float,
+        print_table,
+        time_cuda_callable,
+        timestamp,
+    )
+except ModuleNotFoundError:
+    from benchmarks.benchmark_shapes import MOE_CASES, MOE_PRESETS
+    from benchmarks.common import (
+        banner,
+        check_cuda_ready,
+        format_float,
+        print_table,
+        time_cuda_callable,
+        timestamp,
+    )
 from marlin_v100.calibration import (
     architecture_support,
     format_capability,
@@ -26,11 +39,13 @@ from marlin_v100 import moe, ops
 from tests.helpers import (
     make_moe_model_like_inputs,
     marlin_moe_reference,
+    marlin_quantize_experts_uint4_zp_with_metadata,
     marlin_quantize_experts_with_metadata,
     scalar_types,
 )
 
 _MOE_QUANT_TYPE_CANDIDATES = {
+    "uint4": scalar_types.uint4,
     "uint4b8": scalar_types.uint4b8,
     "uint8b128": scalar_types.uint8b128,
 }
@@ -39,6 +54,23 @@ QUANT_TYPES = {
     for name in supported_moe_quant_type_names(_MOE_QUANT_TYPE_CANDIDATES)
 }
 GROUP_SIZES = supported_dense_group_sizes((-1, 32, 64, 128))
+SM70_MOE_U4_SPLIT_K_ENV = "SM70_MARLIN_MOE_U4_SPLIT_K"
+
+
+@contextmanager
+def sm70_moe_u4_split_k_env(split_k: str):
+    old_value = os.environ.get(SM70_MOE_U4_SPLIT_K_ENV)
+    try:
+        if split_k == "unset":
+            os.environ.pop(SM70_MOE_U4_SPLIT_K_ENV, None)
+        else:
+            os.environ[SM70_MOE_U4_SPLIT_K_ENV] = split_k
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(SM70_MOE_U4_SPLIT_K_ENV, None)
+        else:
+            os.environ[SM70_MOE_U4_SPLIT_K_ENV] = old_value
 
 
 def parse_act_order_values(mode: str) -> list[bool]:
@@ -119,7 +151,38 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a small correctness sanity check before timing each case.",
     )
+    parser.add_argument(
+        "--split-k",
+        nargs="+",
+        choices=("unset", "1", "2", "4", "8"),
+        default=["unset"],
+        help=(
+            "SM70 uint4 zero-point split-K settings to benchmark. "
+            "Only uint4 uses SM70_MARLIN_MOE_U4_SPLIT_K; other quant types "
+            "run only the unset case."
+        ),
+    )
     return parser.parse_args()
+
+
+def _is_supported_moe_benchmark_case(
+    quant_name: str,
+    group_size: int,
+    act_order: bool,
+    is_k_full: bool,
+    hidden: int,
+    intermediate: int,
+) -> tuple[bool, str]:
+    if group_size != -1 and (hidden % group_size != 0 or intermediate % group_size != 0):
+        return False, "group_size does not divide both MoE K dimensions"
+    if act_order and is_k_full and group_size == -1:
+        return False, "act_order with is_k_full=True requires more than one scale group"
+    if quant_name == "uint4":
+        if act_order:
+            return False, "uint4 zero-point MoE does not support act_order"
+        if not is_k_full:
+            return False, "uint4 zero-point MoE requires is_k_full=True"
+    return True, ""
 
 
 def run_case(
@@ -129,6 +192,7 @@ def run_case(
     group_size: int,
     act_order: bool,
     is_k_full: bool,
+    split_k: str,
     warmup_iters: int,
     iters: int,
     check: bool,
@@ -141,13 +205,22 @@ def run_case(
 
     quant_type = QUANT_TYPES[quant_name]
     device = torch.device("cuda")
-    if act_order and is_k_full and group_size == -1:
+    supported, unsupported_reason = _is_supported_moe_benchmark_case(
+        quant_name=quant_name,
+        group_size=group_size,
+        act_order=act_order,
+        is_k_full=is_k_full,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    if not supported:
         return [
             case_name,
             quant_name,
             str(group_size),
-            "yes",
-            "yes",
+            split_k,
+            "yes" if act_order else "no",
+            "yes" if is_k_full else "no",
             str(tokens),
             str(experts),
             str(hidden),
@@ -157,7 +230,26 @@ def run_case(
             "n/a",
             "n/a",
             "n/a",
-            "act_order with is_k_full=True requires more than one scale group",
+            unsupported_reason,
+        ]
+    if quant_name != "uint4" and split_k != "unset":
+        return [
+            case_name,
+            quant_name,
+            str(group_size),
+            split_k,
+            "yes" if act_order else "no",
+            "yes" if is_k_full else "no",
+            str(tokens),
+            str(experts),
+            str(hidden),
+            str(intermediate),
+            "SKIP",
+            "unsupported",
+            "n/a",
+            "n/a",
+            "n/a",
+            "split_k is only implemented for uint4 zero-point MoE",
         ]
     hidden_states, topk_weights, topk_ids, w1, w2 = make_moe_model_like_inputs(
         tokens=tokens,
@@ -167,29 +259,48 @@ def run_case(
         topk=topk,
         device=device,
     )
-    w1_q, w1_scales, w1_dequant, w1_g_idx, w1_perm = marlin_quantize_experts_with_metadata(
-        w1, quant_type, group_size, act_order
-    )
-    w2_q, w2_scales, w2_dequant, w2_g_idx, w2_perm = marlin_quantize_experts_with_metadata(
-        w2, quant_type, group_size, act_order
-    )
+    w1_zeros = None
+    w2_zeros = None
+    if quant_name == "uint4":
+        w1_q, w1_scales, w1_zeros, w1_dequant, w1_g_idx, w1_perm = (
+            marlin_quantize_experts_uint4_zp_with_metadata(w1, group_size)
+        )
+        w2_q, w2_scales, w2_zeros, w2_dequant, w2_g_idx, w2_perm = (
+            marlin_quantize_experts_uint4_zp_with_metadata(w2, group_size)
+        )
+    else:
+        w1_q, w1_scales, w1_dequant, w1_g_idx, w1_perm = (
+            marlin_quantize_experts_with_metadata(w1, quant_type, group_size, act_order)
+        )
+        w2_q, w2_scales, w2_dequant, w2_g_idx, w2_perm = (
+            marlin_quantize_experts_with_metadata(w2, quant_type, group_size, act_order)
+        )
+
+    c_tmp = None
+    if quant_name == "uint4":
+        max_stage_numel = tokens * topk * max(2 * intermediate, hidden)
+        c_tmp = torch.empty((max_stage_numel,), dtype=torch.float32, device=device)
 
     def run_marlin() -> torch.Tensor:
-        return moe.fused_marlin_moe(
-            hidden_states=hidden_states,
-            w1=w1_q,
-            w2=w2_q,
-            w1_scale=w1_scales,
-            w2_scale=w2_scales,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            quant_type_id=quant_type.id,
-            g_idx1=w1_g_idx,
-            g_idx2=w2_g_idx,
-            sort_indices1=w1_perm,
-            sort_indices2=w2_perm,
-            is_k_full=is_k_full,
-        )
+        with sm70_moe_u4_split_k_env(split_k):
+            return moe.fused_marlin_moe(
+                hidden_states=hidden_states,
+                w1=w1_q,
+                w2=w2_q,
+                w1_scale=w1_scales,
+                w2_scale=w2_scales,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                quant_type_id=quant_type.id,
+                c_tmp=c_tmp,
+                w1_zeros=w1_zeros,
+                w2_zeros=w2_zeros,
+                g_idx1=w1_g_idx,
+                g_idx2=w2_g_idx,
+                sort_indices1=w1_perm,
+                sort_indices2=w2_perm,
+                is_k_full=is_k_full,
+            )
 
     status = "unchecked"
     all_finite = "n/a"
@@ -212,7 +323,10 @@ def run_case(
             diff = (output - reference).abs().to(torch.float32)
             max_abs_err = format_float(float(diff.max().item()))
             try:
-                torch.testing.assert_close(output, reference, rtol=7e-2, atol=1e-2)
+                if quant_name == "uint4":
+                    torch.testing.assert_close(output, reference, rtol=2e-1, atol=1.25)
+                else:
+                    torch.testing.assert_close(output, reference, rtol=7e-2, atol=1e-2)
                 status = "ok"
                 check_pass = "yes"
             except AssertionError as exc:
@@ -239,6 +353,7 @@ def run_case(
         case_name,
         quant_name,
         str(group_size),
+        split_k,
         "yes" if act_order else "no",
         "yes" if is_k_full else "no",
         str(tokens),
@@ -272,6 +387,7 @@ def main() -> None:
     print(f"tokens={tokens_list}")
     print(f"quant_types={args.quant_types}")
     print(f"group_sizes={args.group_sizes}")
+    print(f"split_k={args.split_k}")
     print(f"act_order={args.act_order}")
     print(f"is_k_full={args.is_k_full}")
     print(f"warmup_iters={args.warmup_iters}, iters={args.iters}, check={args.check}")
@@ -286,19 +402,22 @@ def main() -> None:
                     for act_order in act_order_values:
                         is_k_full_values = requested_is_k_full if act_order else [True]
                         for is_k_full in is_k_full_values:
-                            rows.append(
-                                run_case(
-                                    case_name=case_name,
-                                    tokens=tokens,
-                                    quant_name=quant_name,
-                                    group_size=group_size,
-                                    act_order=act_order,
-                                    is_k_full=is_k_full,
-                                    warmup_iters=args.warmup_iters,
-                                    iters=args.iters,
-                                    check=args.check,
+                            split_k_values = args.split_k if quant_name == "uint4" else ["unset"]
+                            for split_k in split_k_values:
+                                rows.append(
+                                    run_case(
+                                        case_name=case_name,
+                                        tokens=tokens,
+                                        quant_name=quant_name,
+                                        group_size=group_size,
+                                        act_order=act_order,
+                                        is_k_full=is_k_full,
+                                        split_k=split_k,
+                                        warmup_iters=args.warmup_iters,
+                                        iters=args.iters,
+                                        check=args.check,
+                                    )
                                 )
-                            )
 
     print()
     print_table(
@@ -306,6 +425,7 @@ def main() -> None:
             "case",
             "quant",
             "group_size",
+            "split_k",
             "act_order",
             "is_k_full",
             "tokens",

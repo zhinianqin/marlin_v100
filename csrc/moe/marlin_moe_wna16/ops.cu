@@ -33,6 +33,15 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
+torch::Tensor sm70_marlin_u4_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& b_zeros,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
+    std::optional<torch::Tensor> const& c_tmp_or_none);
+
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
@@ -526,7 +535,8 @@ torch::Tensor moe_wna16_marlin_gemm(
     std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    std::optional<torch::Tensor> const& perm_or_none,
+    std::optional<torch::Tensor> const& c_tmp_or_none,
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
@@ -602,6 +612,8 @@ torch::Tensor moe_wna16_marlin_gemm(
                   b_type == vllm::kU8B128,
               "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
   TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
+  TORCH_CHECK(use_fp32_reduce,
+              "SM70 Marlin MoE requires use_fp32_reduce=True.");
 
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
@@ -681,18 +693,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     c = torch::empty({size_m * top_k, size_n}, options);
   }
 
-  // Alloc C tmp buffer that is going to be used for the global reduce
-  torch::Tensor c_tmp;
-  if (use_fp32_reduce && !use_atomic_add) {
-    // max num of threadblocks is sms * 4
-    long max_c_tmp_size = min(
-        (long)size_n * sorted_token_ids.size(0),
-        (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
-    if (moe_block_size == 8) max_c_tmp_size *= 2;
-    c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
-  } else {
-    c_tmp = torch::empty({0}, options_fp32);
-  }
+  torch::Tensor c_tmp = torch::empty({0}, options_fp32);
 
   // Detect groupsize and act_order
   int num_groups = -1;
@@ -780,10 +781,10 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
-    TORCH_CHECK(
-        false,
-        "SM70 MoE build currently does not enable uint4 zero-point kernels; "
-        "use uint4b8 or uint8b128 weights on the GPU Marlin path.");
+    TORCH_CHECK(b_type == vllm::kU4,
+                "SM70 MoE build only supports uint4 weights when zero-points "
+                "are enabled. Got = ",
+                b_type.str());
   } else {
     TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
                 "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
@@ -812,17 +813,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     }
   }
 
-  // Verify workspace size
   TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
               "size_n = ", size_n, ", is not divisible by min_thread_n = ",
               MARLIN_NAMESPACE_NAME::min_thread_n);
-
-  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
-  int min_workspace_size = min(
-      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
-  TORCH_CHECK(workspace.numel() >= min_workspace_size,
-              "workspace.numel = ", workspace.numel(),
-              " is below min_workspace_size = ", min_workspace_size);
 
   int dev = a.get_device();
 
@@ -836,6 +829,15 @@ torch::Tensor moe_wna16_marlin_gemm(
         "scalar type of a must be the same with c for 16 bit activation");
   }
 
+  if (b_type == vllm::kU4 && has_zp && !has_act_order) {
+    TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
+    TORCH_CHECK(!has_bias, "SM70 Marlin MoE uint4 path does not support bias.");
+    return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
+        a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+  }
+
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
@@ -843,7 +845,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       perm.data_ptr(), a_tmp.data_ptr(), sorted_token_ids.data_ptr(),
       expert_ids.data_ptr(), num_tokens_past_padded.data_ptr(),
       topk_weights.data_ptr(), moe_block_size, num_experts, top_k,
-      mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
+      mul_topk_weights, size_m, size_n, size_k, nullptr, a_type,
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,

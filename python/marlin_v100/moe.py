@@ -41,6 +41,7 @@ def fused_marlin_moe(
     moe_block_size: int = 16,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    c_tmp: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
     global_scale1: torch.Tensor | None = None,
     global_scale2: torch.Tensor | None = None,
@@ -73,9 +74,8 @@ def fused_marlin_moe(
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
     )
-    if workspace is None:
-        sms = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
-        workspace = torch.zeros(sms * 4, dtype=torch.int, device=hidden_states.device)
+    if c_tmp is None:
+        c_tmp = workspace
 
     # Local quantized expert helpers preserve the logical output width in the
     # scale tensors, which is the most reliable source for the dense width here.
@@ -92,7 +92,7 @@ def fused_marlin_moe(
         w1_zeros,
         g_idx1,
         sort_indices1,
-        workspace,
+        c_tmp,
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
@@ -126,7 +126,7 @@ def fused_marlin_moe(
         w2_zeros,
         g_idx2,
         sort_indices2,
-        workspace,
+        c_tmp,
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
