@@ -568,7 +568,6 @@ class Sm70U4AtomicFp32Epilogue {
     int const thread_start_row = destination_iterator.thread_start_row();
     int const thread_start_column = destination_iterator.thread_start_column();
     int const extent_row = destination_iterator.extent_row();
-    int const extent_column = destination_iterator.extent_column();
 
     CUTLASS_PRAGMA_UNROLL
     for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster;
@@ -596,11 +595,11 @@ class Sm70U4AtomicFp32Epilogue {
                 (frag_row_idx * ThreadMap::Iterations::kColumn + column) *
                 ThreadMap::kElementsPerAccess;
 
-            CUTLASS_PRAGMA_UNROLL
-            for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
-              int const logical_column = logical_column_base + e;
-              if (row_guard && logical_column < extent_column) {
-                atomicAdd(c_tmp + int64_t(logical_row) * n + logical_column,
+            if (row_guard) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
+                atomicAdd(c_tmp + int64_t(logical_row) * n +
+                              logical_column_base + e,
                           frag_ptr[frag_base + e]);
               }
             }
