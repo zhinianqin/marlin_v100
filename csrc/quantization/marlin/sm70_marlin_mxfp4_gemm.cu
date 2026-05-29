@@ -53,36 +53,49 @@ constexpr int kMxfp4ValuesPerWord = 8;
 constexpr char const* kSm70MarlinMxfp4SplitKEnv =
     "SM70_MARLIN_MXFP4_SPLIT_K";
 
+// 将底层的 uint16 (包含2个 8-bit e8m0) 极速转为 __half2
 CUTLASS_DEVICE
-uint16_t e8m0_byte_to_half_bits(uint32_t exponent_byte) {
-  int const exponent = static_cast<int>(exponent_byte & 0xffu) - 127;
-  if (exponent < -24) {
-    return 0;
-  }
-  if (exponent < -14) {
-    return static_cast<uint16_t>(1u << (exponent + 24));
-  }
-  if (exponent <= 15) {
-    return static_cast<uint16_t>((exponent + 15) << 10);
-  }
-  return 0x7c00u;
-}
+__half2 e8m0x2_to_half2_fast(uint16_t e8m0_x2) {
+    // 1. 解析出两个 8-bit 值 (v0, v1)
+    int v0 = e8m0_x2 & 0xFF;
+    int v1 = e8m0_x2 >> 8;
 
-CUTLASS_DEVICE
-half2 e8m0_half2_from_bytes(uint32_t low_byte, uint32_t high_byte) {
-  uint32_t const bits =
-      static_cast<uint32_t>(e8m0_byte_to_half_bits(low_byte)) |
-      (static_cast<uint32_t>(e8m0_byte_to_half_bits(high_byte)) << 16);
-  half2 result;
-  *reinterpret_cast<uint32_t*>(&result) = bits;
-  return result;
+    // 2. 指数重映射并截断 (Clamp)
+    // 范围约束：FP16 指数最大值为 30 (31 为 NaN/Inf)，对应 e8m0 最大安全值为 142
+    // 使用三目运算符，编译器会自动优化为 PTX 的单条 min.s32 / max.s32 指令
+    int e0 = v0 - 112;
+    e0 = e0 < 0 ? 0 : (e0 > 31 ? 31 : e0);
+
+    int e1 = v1 - 112;
+    e1 = e1 < 0 ? 0 : (e1 > 31 ? 31 : e1);
+
+    // 3. 移位至 FP16 指数位 (10位) 并组合为 32-bit 的 __half2
+    uint32_t res = ((e1 << 10) << 16) | (e0 << 10);
+
+    return *reinterpret_cast<__half2*>(&res);
 }
 
 CUTLASS_DEVICE
 void dequant_e8m0_scales_to_half2(int q, half2* scale_cache) {
-  uint32_t const word = static_cast<uint32_t>(q);
-  scale_cache[0] = e8m0_half2_from_bytes(word, word >> 8);
-  scale_cache[1] = e8m0_half2_from_bytes(word >> 16, word >> 24);
+    uint32_t const word = static_cast<uint32_t>(q);
+
+    // 1. 直接截取高低 16 位
+    // 编译器会将其优化为极低开销的寄存器提取指令 (例如 BFE 提取位字段)
+    uint16_t lo_16 = static_cast<uint16_t>(word);         // 包含 byte0 和 byte1
+    uint16_t hi_16 = static_cast<uint16_t>(word >> 16);   // 包含 byte2 和 byte3
+
+    // 2. 直接调用最底层的 fast 函数
+    __half2 res0 = e8m0x2_to_half2_fast(lo_16);
+    __half2 res1 = e8m0x2_to_half2_fast(hi_16);
+
+    // 3. 向量化合并写入 (Vectorized Store)
+    // 将两个 32-bit 的 half2 组合成一个 64-bit 的 uint2 结构
+    uint2 vec_res;
+    vec_res.x = *reinterpret_cast<uint32_t*>(&res0);
+    vec_res.y = *reinterpret_cast<uint32_t*>(&res1);
+
+    // 强制编译器生成单条 64-bit 的写入指令 (例如 st.u64 或 st.shared.u64)
+    *reinterpret_cast<uint2*>(scale_cache) = vec_res;
 }
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
