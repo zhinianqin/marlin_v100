@@ -90,7 +90,7 @@ inline size_t configure_dynamic_smem(Kernel kernel) {
 
 inline dim3 cta_grid(int64_t size_m, int64_t size_n, int cta_m, int cta_n) {
   return dim3(static_cast<unsigned>((size_m + cta_m - 1) / cta_m),
-              static_cast<unsigned>((size_n + cta_n - 1) / cta_n));
+              static_cast<unsigned>(size_n / cta_n));
 }
 
 template <int CtaM, int CtaN, int Warps, typename Launcher>

@@ -1159,7 +1159,7 @@ def _marlin_unpack_impl(
                 for local_k in range(16):
                     for local_n_vec in range(8):
                         local_word = local_k * 8 + local_n_vec
-                        word_offset = quant_utils._sm70_u4_macro_n_offset(
+                        word_offset = quant_utils._sm70_u4_cta_n_offset(
                             n_tiles,
                             n_tile,
                             local_word,
@@ -1183,7 +1183,7 @@ def _marlin_unpack_impl(
                 for local_k in range(16):
                     for local_n_word in range(16):
                         local_word = local_k * 16 + local_n_word
-                        word_offset = quant_utils._sm70_u8_macro_n_offset(
+                        word_offset = quant_utils._sm70_u8_cta_n_offset(
                             n_tiles,
                             n_tile,
                             local_word,

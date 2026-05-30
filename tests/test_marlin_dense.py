@@ -32,21 +32,21 @@ _DENSE_SUPPORTED_QUANT_NAMES = frozenset(
 )
 _GROUP_SIZES = (-1, 32, 64, 128)
 _CTA_GEOMETRY_CASES = (
-    ("32x128x4", 32, 256),
+    ("32x128x4", 32, 128),
     ("32x256x4", 32, 256),
-    ("64x64x4", 64, 256),
-    ("64x128x4", 64, 256),
-    ("64x128x8", 64, 256),
+    ("64x64x4", 64, 64),
+    ("64x128x4", 64, 128),
+    ("64x128x8", 64, 128),
     ("64x256x4", 64, 256),
     ("64x256x8", 64, 256),
-    ("128x64x4", 128, 256),
-    ("128x64x8", 128, 256),
-    ("128x128x4", 128, 256),
-    ("128x128x8", 128, 256),
+    ("128x64x4", 128, 64),
+    ("128x64x8", 128, 64),
+    ("128x128x4", 128, 128),
+    ("128x128x8", 128, 128),
     ("128x256x8", 128, 256),
-    ("256x64x4", 256, 256),
-    ("256x64x8", 256, 256),
-    ("256x128x8", 256, 256),
+    ("256x64x4", 256, 64),
+    ("256x64x8", 256, 64),
+    ("256x128x8", 256, 128),
 )
 _SM70_CUTE_NATIVE_CASES = tuple(
     (cta_m, cta_n, warps)
@@ -55,9 +55,9 @@ _SM70_CUTE_NATIVE_CASES = tuple(
     for warps in (4, 8)
 )
 _FP8_CTA_GEOMETRY_CASES = (
-    ("64x128x4", 64, 256),
+    ("64x128x4", 64, 128),
     ("128x256x8", 128, 256),
-    ("256x64x8", 256, 256),
+    ("256x64x8", 256, 64),
 )
 _FLOAT16_ACTIVATION_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
@@ -67,7 +67,8 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 outputs\."
     rf"|{source_target_label()} build only supports float16 scales\."
 )
-_N_TILE_ALIGNMENT_ERROR = "requires N alignment for macro-N qweight layout"
+_N_TILE_ALIGNMENT_ERROR = "requires size_n divisible by 64"
+_CTA_N_AUTO_ERROR = "requires auto CTA_N"
 _SPLIT_K_QUANT_CASES = (
     ("uint4b8", "SM70_MARLIN_U4B8_SPLIT_K", 128, 384, 5e-2, 2.5e-1),
     ("uint8", "SM70_MARLIN_U8_SPLIT_K", 32, 352, 5e-2, 2.5e-1),
@@ -75,6 +76,15 @@ _SPLIT_K_QUANT_CASES = (
     ("fp8", "SM70_MARLIN_FP8_SPLIT_K", 128, 384, 4e-2, 2e-1),
     ("nvfp4", "SM70_MARLIN_NVFP4_SPLIT_K", 16, 288, 5e-2, 2.5e-1),
     ("mxfp4", "SM70_MARLIN_MXFP4_SPLIT_K", 32, 352, 5e-2, 2.5e-1),
+)
+_AUTO_CTA_N_QUANT_CASES = (
+    ("uint4b8", "SM70_MARLIN_U4B8_CTA", 128, 5e-2, 2.5e-1),
+    ("uint4", "SM70_MARLIN_U4_CTA", 128, 5e-2, 2.5e-1),
+    ("uint8", "SM70_MARLIN_U8_CTA", 128, 5e-2, 2.5e-1),
+    ("uint8b128", "SM70_MARLIN_U8B128_CTA", 128, 4e-2, 2e-1),
+    ("fp8", "SM70_MARLIN_FP8_CTA", 128, 4e-2, 2e-1),
+    ("nvfp4", "SM70_MARLIN_NVFP4_CTA", 16, 5e-2, 2.5e-1),
+    ("mxfp4", "SM70_MARLIN_MXFP4_CTA", 32, 5e-2, 2.5e-1),
 )
 
 
@@ -817,6 +827,131 @@ def _run_split_k_quant_accuracy_case(
         raise AssertionError(f"Unsupported split-K quant_name={quant_name}")
 
 
+def _run_auto_cta_n_quant_accuracy_case(
+    quant_name: str,
+    *,
+    group_size: int,
+    size_m: int,
+    size_k: int,
+    size_n: int,
+    rtol: float,
+    atol: float,
+) -> None:
+    if quant_name == "uint4":
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=group_size,
+            rtol=rtol,
+            atol=atol,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+        )
+    else:
+        _run_split_k_quant_accuracy_case(
+            quant_name,
+            group_size=group_size,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "cta_env", "group_size", "rtol", "atol"),
+    _AUTO_CTA_N_QUANT_CASES,
+)
+@pytest.mark.parametrize("size_n", (64, 128, 192, 320))
+def test_marlin_dense_auto_cta_n_partial_n_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    cta_env: str,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    size_n: int,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.delenv(cta_env, raising=False)
+    _run_auto_cta_n_quant_accuracy_case(
+        quant_name,
+        group_size=group_size,
+        size_m=8,
+        size_k=256,
+        size_n=size_n,
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "cta_env", "group_size", "rtol", "atol"),
+    _AUTO_CTA_N_QUANT_CASES,
+)
+@pytest.mark.parametrize(
+    ("cta_geometry", "size_n"),
+    (("128x128x8", 256), ("128x256x8", 128)),
+)
+def test_marlin_dense_auto_cta_n_rejects_mismatched_env_cta_n(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    cta_env: str,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    cta_geometry: str,
+    size_n: int,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.setenv(cta_env, cta_geometry)
+    with pytest.raises(RuntimeError, match=_CTA_N_AUTO_ERROR):
+        _run_auto_cta_n_quant_accuracy_case(
+            quant_name,
+            group_size=group_size,
+            size_m=8,
+            size_k=256,
+            size_n=size_n,
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "split_env", "group_size", "_size_k", "rtol", "atol"),
+    _SPLIT_K_QUANT_CASES,
+)
+@pytest.mark.parametrize(("split_k", "size_n"), (("2", 64), ("4", 128), ("2", 320)))
+def test_marlin_dense_split_k_quant_partial_n_auto_cta_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    split_env: str,
+    group_size: int,
+    _size_k: int,
+    rtol: float,
+    atol: float,
+    split_k: str,
+    size_n: int,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.setenv(split_env, split_k)
+    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 16 * size_n)
+    _run_split_k_quant_accuracy_case(
+        quant_name,
+        group_size=group_size,
+        size_m=16,
+        size_k=256,
+        size_n=size_n,
+        rtol=rtol,
+        atol=atol,
+        c_tmp=c_tmp,
+    )
+
+
 @pytest.mark.parametrize(
     ("quant_name", "split_env", "group_size", "size_k", "rtol", "atol"),
     _SPLIT_K_QUANT_CASES,
@@ -997,23 +1132,22 @@ def test_marlin_dense_uint4b8_sm70_scale_zp_math_consistency_matches_reference(
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_residue_n_rejects_n_tile_alignment_contract(
+def test_marlin_dense_uint4b8_partial_n_auto_cta_matches_reference(
     group_size: int,
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-        _run_dense_accuracy_case(
-            scalar_types.uint4b8,
-            repack_impl=repack_impl,
-            group_size=group_size,
-            act_order=False,
-            is_k_full=True,
-            rtol=5e-2,
-            atol=2.5e-1,
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    _run_dense_accuracy_case(
+        scalar_types.uint4b8,
+        repack_impl=repack_impl,
+        group_size=group_size,
+        act_order=False,
+        is_k_full=True,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=128,
+    )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
@@ -1216,19 +1350,18 @@ def test_marlin_dense_uint4_zp_small_tile_matches_reference(repack_impl: str):
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4_zp_residue_n_rejects_n_tile_alignment_contract(
+def test_marlin_dense_uint4_zp_partial_n_auto_cta_matches_reference(
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-        _run_dense_uint4_zp_accuracy_case(
-            repack_impl=repack_impl,
-            group_size=128,
-            rtol=5e-2,
-            atol=2.5e-1,
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=128,
+    )
 
 
 @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
@@ -1327,13 +1460,18 @@ def test_marlin_dense_uint4_zp_split_k_nonuniform_k_matches_reference(
 
 
 @pytest.mark.parametrize(
-    ("cta_geometry", "split_k"),
-    (("128x256x8", "2"), ("32x128x4", "4"), ("128x256x8", "8")),
+    ("cta_geometry", "split_k", "size_n"),
+    (
+        ("128x256x8", "2", 256),
+        ("32x128x4", "4", 128),
+        ("128x256x8", "8", 256),
+    ),
 )
 def test_marlin_dense_uint4_zp_split_k_cta_geometry_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
     cta_geometry: str,
     split_k: str,
+    size_n: int,
 ):
     monkeypatch.setenv("SM70_MARLIN_U4_CTA", cta_geometry)
     monkeypatch.setenv("SM70_MARLIN_U4_SPLIT_K", split_k)
@@ -1344,7 +1482,7 @@ def test_marlin_dense_uint4_zp_split_k_cta_geometry_matches_reference(
         atol=2.5e-1,
         size_m=32,
         size_k=256,
-        size_n=256,
+        size_n=size_n,
     )
 
 
@@ -1541,19 +1679,18 @@ def test_marlin_dense_uint8_zp_small_tile_matches_reference(repack_impl: str):
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint8_zp_residue_n_rejects_n_tile_alignment_contract(
+def test_marlin_dense_uint8_zp_partial_n_auto_cta_matches_reference(
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-        _run_dense_uint8_zp_accuracy_case(
-            repack_impl=repack_impl,
-            group_size=128,
-            rtol=5e-2,
-            atol=2.5e-1,
-            size_m=8,
-            size_k=256,
-            size_n=128,
-        )
+    _run_dense_uint8_zp_accuracy_case(
+        repack_impl=repack_impl,
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=128,
+    )
 
 
 @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
@@ -2007,22 +2144,21 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
 
     @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-    def test_marlin_dense_uint8b128_residue_n_rejects_n_tile_alignment_contract(
+    def test_marlin_dense_uint8b128_partial_n_auto_cta_matches_reference(
         repack_impl: str,
     ):
-        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-            _run_dense_accuracy_case(
-                scalar_types.uint8b128,
-                repack_impl=repack_impl,
-                group_size=128,
-                act_order=False,
-                is_k_full=True,
-                rtol=4e-2,
-                atol=2e-1,
-                size_m=8,
-                size_k=256,
-                size_n=128,
-            )
+        _run_dense_accuracy_case(
+            scalar_types.uint8b128,
+            repack_impl=repack_impl,
+            group_size=128,
+            act_order=False,
+            is_k_full=True,
+            rtol=4e-2,
+            atol=2e-1,
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _CTA_GEOMETRY_CASES)
     def test_marlin_dense_uint8b128_env_cta_geometry_matches_reference(
@@ -2070,14 +2206,13 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_fp8_weight_accuracy(group_size: int):
         _run_fp8_dense_accuracy_case(group_size=group_size)
 
-    def test_marlin_dense_fp8_weight_residue_n_rejects_n_tile_alignment_contract():
-        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-            _run_fp8_dense_accuracy_case(
-                group_size=128,
-                size_m=8,
-                size_k=256,
-                size_n=128,
-            )
+    def test_marlin_dense_fp8_weight_partial_n_auto_cta_matches_reference():
+        _run_fp8_dense_accuracy_case(
+            group_size=128,
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
     def test_marlin_dense_fp8_env_cta_geometry_matches_reference(
@@ -2424,13 +2559,12 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_nvfp4_weight_accuracy():
         _run_nvfp4_dense_accuracy_case()
 
-    def test_marlin_dense_nvfp4_weight_residue_n_rejects_n_tile_alignment_contract():
-        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-            _run_nvfp4_dense_accuracy_case(
-                size_m=8,
-                size_k=256,
-                size_n=128,
-            )
+    def test_marlin_dense_nvfp4_weight_partial_n_auto_cta_matches_reference():
+        _run_nvfp4_dense_accuracy_case(
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
     def test_marlin_dense_nvfp4_env_cta_geometry_matches_reference(
@@ -2672,13 +2806,12 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_mxfp4_weight_accuracy():
         _run_mxfp4_dense_accuracy_case()
 
-    def test_marlin_dense_mxfp4_weight_residue_n_rejects_n_tile_alignment_contract():
-        with pytest.raises(RuntimeError, match=_N_TILE_ALIGNMENT_ERROR):
-            _run_mxfp4_dense_accuracy_case(
-                size_m=8,
-                size_k=256,
-                size_n=128,
-            )
+    def test_marlin_dense_mxfp4_weight_partial_n_auto_cta_matches_reference():
+        _run_mxfp4_dense_accuracy_case(
+            size_m=8,
+            size_k=256,
+            size_n=128,
+        )
 
     @pytest.mark.parametrize(("cta_geometry", "size_m", "size_n"), _FP8_CTA_GEOMETRY_CASES)
     def test_marlin_dense_mxfp4_env_cta_geometry_matches_reference(

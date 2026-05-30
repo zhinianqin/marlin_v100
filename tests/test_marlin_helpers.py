@@ -83,7 +83,7 @@ def test_mxfp4_scale_scalar_type_id_matches_vllm_encoding():
     assert scalar_types.float8_e8m0fnu.id == expected_id
 
 
-@pytest.mark.parametrize("size_n", (64, 128, 256))
+@pytest.mark.parametrize("size_n", (64, 128, 192, 256, 320, 384))
 def test_fp8_marlin_weight_pack_unpack_preserves_raw_bytes(size_n: int):
     size_k = 16
     raw = torch.arange(size_k * size_n, dtype=torch.uint8).reshape(size_k, size_n)
@@ -100,7 +100,7 @@ def test_fp8_marlin_weight_pack_unpack_preserves_raw_bytes(size_n: int):
     assert torch.equal(unpacked.to(torch.uint8), raw)
 
 
-@pytest.mark.parametrize("size_n", (64, 128, 256))
+@pytest.mark.parametrize("size_n", (64, 128, 192, 256, 320, 384))
 def test_nvfp4_marlin_weight_pack_unpack_preserves_raw_nibbles(size_n: int):
     size_k = 16
     raw = torch.arange(size_k * size_n, dtype=torch.int32).reshape(size_k, size_n) % 16
@@ -317,12 +317,16 @@ def test_marlin_quantize_act_order_round_trip_matches_original_weight(
 
 @pytest.mark.parametrize("quant_type", _REPACK_QUANT_CASES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+@pytest.mark.parametrize("size_n", (64, 128, 192, 256, 320, 384))
 def test_repack_layout_matches_reference_for_supported_dense_quant_types(
     quant_type,
     repack_impl: str,
+    size_n: int,
 ):
     _require_repack_cuda()
-    assert_repack_layout_matches_reference(repack_impl, quant_type=quant_type)
+    assert_repack_layout_matches_reference(
+        repack_impl, quant_type=quant_type, size_n=size_n
+    )
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)

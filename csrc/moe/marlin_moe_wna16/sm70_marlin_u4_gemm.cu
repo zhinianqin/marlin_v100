@@ -32,25 +32,21 @@ using marlin::sm70_dense::Sm70DenseSplitKPartition;
 using marlin::sm70_dense::Sm70DenseWarpShape;
 using marlin::sm70_dense::configure_dynamic_smem;
 using marlin::sm70_dense::kCtaK;
-using marlin::sm70_dense::kMacroN;
-using marlin::sm70_dense::kMacroNTiles;
 using marlin::sm70_dense::kQuantTileK;
 using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
 using marlin::sm70_dense::parse_sm70_dense_split_k;
 using marlin::sm70_dense::qword_from_vector;
 using marlin::sm70_dense::sm70_dense_active_split_k;
+using marlin::sm70_dense::sm70_dense_auto_cta_n;
 using marlin::sm70_dense::sm70_dense_get_splitk_ctmp;
 using marlin::sm70_dense::sm70_dense_splitk_partition;
-using marlin::sm70_dense::u4_macro_n_qweight_offset_from_logical;
+using marlin::sm70_dense::u4_cta_n_qweight_offset_from_logical;
 
 namespace marlin_moe_wna16 {
 namespace {
 
 constexpr int kU4ValuesPerWord = 8;
-constexpr int kDefaultMoeCtaM = 32;
-constexpr int kDefaultMoeCtaN = 128;
-constexpr int kDefaultMoeWarps = 4;
 constexpr char const* kSm70MarlinMoeU4CtaEnv = "SM70_MARLIN_MOE_U4_CTA";
 constexpr char const* kSm70MarlinMoeU4SplitKEnv =
     "SM70_MARLIN_MOE_U4_SPLIT_K";
@@ -60,9 +56,9 @@ constexpr char const* kSupportedSm70MoeU4CtaGeometries =
 
 Sm70DenseCtaGeometry parse_sm70_moe_cta_geometry(char const* env_name) {
   char const* env = std::getenv(env_name);
-  if (env == nullptr || env[0] == '\0') {
-    return {kDefaultMoeCtaM, kDefaultMoeCtaN, kDefaultMoeWarps};
-  }
+  TORCH_CHECK(env != nullptr && env[0] != '\0', env_name,
+              " must use format CTA_MxCTA_NxWarps when explicitly parsed, "
+              "for example 32x128x4.");
 
   std::string spec(env);
   for (char& ch : spec) {
@@ -82,6 +78,38 @@ Sm70DenseCtaGeometry parse_sm70_moe_cta_geometry(char const* env_name) {
               "Got: ",
               env);
   return {cta_m, cta_n, warps};
+}
+
+Sm70DenseCtaGeometry default_sm70_moe_cta_geometry(int auto_cta_n) {
+  switch (auto_cta_n) {
+    case 64:
+      return {64, 64, 4};
+    case 128:
+      return {32, 128, 4};
+    case 256:
+      return {32, 256, 4};
+    default:
+      TORCH_CHECK(false, "Unsupported SM70 Marlin MoE uint4 auto CTA_N=",
+                  auto_cta_n, ".");
+  }
+  return {0, 0, 0};
+}
+
+Sm70DenseCtaGeometry resolve_sm70_moe_cta_geometry(char const* env_name,
+                                                   int64_t size_n) {
+  int const auto_cta_n = sm70_dense_auto_cta_n(size_n);
+  char const* env = std::getenv(env_name);
+  if (env == nullptr || env[0] == '\0') {
+    return default_sm70_moe_cta_geometry(auto_cta_n);
+  }
+
+  Sm70DenseCtaGeometry geometry = parse_sm70_moe_cta_geometry(env_name);
+  TORCH_CHECK(geometry.cta_n == auto_cta_n, env_name,
+              " specifies CTA_N=", geometry.cta_n, " but size_n=", size_n,
+              " requires auto CTA_N=", auto_cta_n,
+              ". CTA_N is selected from 256, 128, and 64 and is not a free "
+              "SM70 MoE uint4 tuning parameter.");
+  return geometry;
 }
 
 bool sm70_moe_cta_geometry_supported(Sm70DenseCtaGeometry geometry) {
@@ -126,7 +154,7 @@ int moe_route_tile_count(int64_t padded_tokens, int64_t moe_block_size,
 }
 
 int moe_n_tile_count(int64_t size_n, int cta_n) {
-  return static_cast<int>((size_n + cta_n - 1) / cta_n);
+  return static_cast<int>(size_n / cta_n);
 }
 
 template <int CtaM, int CtaN>
@@ -401,8 +429,8 @@ class Sm70MoeU4ZpIteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u4_macro_n_qweight_offset_from_logical(params.size_n, logical_k,
-                                                  logical_n);
+    return u4_cta_n_qweight_offset_from_logical<Shape::kN>(
+        params.size_n, logical_k, logical_n);
   }
 
   CUTLASS_DEVICE
@@ -507,7 +535,7 @@ class Sm70MoeU4ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  void load_macro_n_aligned(Fragment& frag) const {
+  void load_cta_n_aligned(Fragment& frag) const {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
         uint4 const qwords =
@@ -656,7 +684,7 @@ class Sm70MoeU4ZpIteratorB {
       cache_current_group_metadata(scale_group(first_logical_k));
     }
 
-    load_macro_n_aligned(frag);
+    load_cta_n_aligned(frag);
   }
 };
 
@@ -1121,7 +1149,7 @@ torch::Tensor sm70_marlin_u4_gemm(
   c10::cuda::CUDAGuard device_guard(a.device());
 
   Sm70DenseCtaGeometry const geometry =
-      parse_sm70_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv);
+      resolve_sm70_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv, size_n);
   check_sm70_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv, geometry);
   check_sm70_moe_n_tile_alignment(kSm70MarlinMoeU4CtaEnv, geometry, size_n);
   TORCH_CHECK(size_k % kCtaK == 0,

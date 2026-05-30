@@ -1276,7 +1276,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         _run_fused_moe_accuracy_case(
             scalar_types.uint4,
             repack_impl="gptq",
-            group_size=128,
+            group_size=32,
             act_order=False,
             is_k_full=True,
             tokens=2,
@@ -1294,7 +1294,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         _run_stage1_kernel_case(
             scalar_types.uint4,
             repack_impl="gptq",
-            group_size=128,
+            group_size=32,
             act_order=False,
             is_k_full=True,
             tokens=3,
@@ -1314,7 +1314,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         _run_stage1_kernel_case(
             scalar_types.uint4,
             repack_impl="gptq",
-            group_size=128,
+            group_size=32,
             act_order=False,
             is_k_full=True,
             tokens=2,
@@ -1323,25 +1323,68 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
             atol=2.0,
         )
 
-    @pytest.mark.parametrize("cta", ("32x128x4", "32x256x4", "64x64x4", "64x128x4"))
+    @pytest.mark.parametrize(
+        ("intermediate", "case_id"),
+        (
+            pytest.param(32, "auto_n64", id="auto_n64"),
+            pytest.param(64, "auto_n128", id="auto_n128"),
+            pytest.param(128, "auto_n256", id="auto_n256"),
+            pytest.param(2048, "auto_n4096", id="auto_n4096"),
+        ),
+    )
+    def test_moe_wna16_uint4_zp_auto_cta_n_unset_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        intermediate: int,
+        case_id: str,
+    ):
+        del case_id
+        monkeypatch.delenv(_SM70_MOE_U4_CTA_ENV, raising=False)
+        _run_stage1_kernel_case(
+            scalar_types.uint4,
+            repack_impl="gptq",
+            group_size=32,
+            act_order=False,
+            is_k_full=True,
+            tokens=1,
+            intermediate=intermediate,
+            topk=1,
+            moe_block_size=8,
+            rtol=2e-1,
+            atol=2.0,
+        )
+
+    @pytest.mark.parametrize(
+        ("cta", "intermediate"),
+        (
+            pytest.param("64x64x4", 32, id="64x64x4_n64"),
+            pytest.param("32x128x4", 64, id="32x128x4_n128"),
+            pytest.param("64x128x4", 64, id="64x128x4_n128"),
+            pytest.param("64x128x8", 64, id="64x128x8_n128"),
+            pytest.param("32x256x4", 128, id="32x256x4_n256"),
+            pytest.param("64x256x4", 128, id="64x256x4_n256"),
+            pytest.param("64x256x8", 128, id="64x256x8_n256"),
+        ),
+    )
     def test_moe_wna16_uint4_zp_supported_cta_matches_reference(
         monkeypatch: pytest.MonkeyPatch,
         cta: str,
+        intermediate: int,
     ):
         monkeypatch.setenv(_SM70_MOE_U4_CTA_ENV, cta)
         _run_stage1_kernel_case(
             scalar_types.uint4,
             repack_impl="gptq",
-            group_size=128,
+            group_size=32,
             act_order=False,
             is_k_full=True,
             tokens=2,
+            intermediate=intermediate,
             moe_block_size=16,
             rtol=2e-1,
             atol=2.0,
         )
 
-    @pytest.mark.parametrize("cta", ("bad", "128x128x4"))
+    @pytest.mark.parametrize("cta", ("bad", "128x256x4"))
     def test_moe_wna16_uint4_zp_rejects_invalid_cta(
         monkeypatch: pytest.MonkeyPatch,
         cta: str,
@@ -1360,22 +1403,90 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 atol=2.0,
             )
 
-    def test_moe_wna16_uint4_zp_rejects_cta_n_alignment(
+    @pytest.mark.parametrize(
+        ("cta", "intermediate"),
+        (
+            pytest.param("32x128x4", 2048, id="n4096_env_n128"),
+            pytest.param("32x256x4", 64, id="n128_env_n256"),
+        ),
+    )
+    def test_moe_wna16_uint4_zp_rejects_wrong_auto_cta_n(
         monkeypatch: pytest.MonkeyPatch,
+        cta: str,
+        intermediate: int,
     ):
-        monkeypatch.setenv(_SM70_MOE_U4_CTA_ENV, "32x256x4")
-        with pytest.raises(RuntimeError, match="size_n must be divisible by both CTA_N and 64"):
+        monkeypatch.setenv(_SM70_MOE_U4_CTA_ENV, cta)
+        with pytest.raises(RuntimeError, match="requires auto CTA_N"):
             _run_stage1_kernel_case(
                 scalar_types.uint4,
                 repack_impl="gptq",
                 group_size=-1,
                 act_order=False,
                 is_k_full=True,
-                tokens=2,
-                intermediate=160,
-                moe_block_size=16,
+                tokens=1,
+                intermediate=intermediate,
+                topk=1,
+                moe_block_size=8,
                 rtol=2e-1,
                 atol=2.0,
+            )
+
+    def test_moe_wna16_uint4_zp_rejects_non_64_n_alignment(
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv(_SM70_MOE_U4_CTA_ENV, raising=False)
+        _require_moe_cuda()
+
+        tokens = 2
+        topk = 1
+        experts = 1
+        size_k = 128
+        size_n = 160
+        pack_factor = 8
+        topk_ids = torch.zeros((tokens, topk), dtype=torch.int32, device="cuda")
+        sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+            topk_ids, block_size=16, num_experts=experts
+        )
+
+        with pytest.raises(RuntimeError, match="min_thread_n"):
+            ops.moe_wna16_marlin_gemm(
+                torch.empty((tokens, size_k), device="cuda", dtype=torch.float16),
+                torch.empty((tokens * topk, size_n), device="cuda", dtype=torch.float16),
+                torch.empty(
+                    (experts, size_k // 16, size_n * 16 // pack_factor),
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+                None,
+                torch.empty((experts, 1, size_n), device="cuda", dtype=torch.float16),
+                None,
+                None,
+                torch.empty(
+                    (experts, 1, size_n // pack_factor),
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+                torch.empty((0,), device="cuda", dtype=torch.int32),
+                torch.empty((0,), device="cuda", dtype=torch.int32),
+                None,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                torch.ones((tokens, topk), device="cuda", dtype=torch.float32),
+                16,
+                topk,
+                False,
+                scalar_types.uint4.id,
+                tokens,
+                size_n,
+                size_k,
+                True,
+                False,
+                True,
+                False,
+                -1,
+                -1,
+                -1,
             )
 
     @pytest.mark.parametrize("split_k", ("3", "abc"))

@@ -1,10 +1,11 @@
 #include "marlin.cuh"
 
 #include "core/registration.h"
+#include "quantization/marlin/sm70_dense_common.cuh"
 
 namespace marlin {
 
-template <int const num_threads, int const num_bits, bool is_a_8bit>
+template <int const num_threads, int const num_bits, bool is_a_8bit, int CtaN>
 __global__ void awq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr, uint32_t* __restrict__ out_ptr,
     int size_k, int size_n) {
@@ -12,6 +13,9 @@ __global__ void awq_marlin_repack_kernel(
 
   constexpr int target_tile_n_size = tile_n_size / (is_a_8bit ? 2 : 1);
   constexpr int target_tile_k_size = tile_k_size * (is_a_8bit ? 2 : 1);
+  static_assert(CtaN % target_tile_n_size == 0,
+                "CTA_N must be a multiple of the repack N tile size.");
+  constexpr int cta_n_tiles = CtaN / target_tile_n_size;
   int k_tiles = size_k / target_tile_k_size;
   int n_tiles = size_n / target_tile_n_size;
   int block_k_tiles = div_ceil(k_tiles, gridDim.x);
@@ -106,14 +110,14 @@ __global__ void awq_marlin_repack_kernel(
         res |= vals[pack_idx[i]] << (i * 4);
       }
 
-      int const macro_n_tile = n_tile_id / 4;
-      int const macro_first_n_tile = macro_n_tile * 4;
-      int const subtile = n_tile_id - macro_first_n_tile;
-      int const subtile_count = min(4, n_tiles - macro_first_n_tile);
+      int const cta_n_tile = n_tile_id / cta_n_tiles;
+      int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
+      int const subtile = n_tile_id - cta_first_n_tile;
       int const local_word = local_k * 8 + local_n_vec;
-      int const macro_offset =
-          macro_n_tile * 4 * tile_size + local_word * subtile_count + subtile;
-      out_ptr[k_tile_id * n_tiles * tile_size + macro_offset] = res;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
+      out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
       return;
     }
 
@@ -147,14 +151,14 @@ __global__ void awq_marlin_repack_kernel(
         res |= vals[pack_idx[i]] << (i * 8);
       }
 
-      int const macro_n_tile = n_tile_id / 4;
-      int const macro_first_n_tile = macro_n_tile * 4;
-      int const subtile = n_tile_id - macro_first_n_tile;
-      int const subtile_count = min(4, n_tiles - macro_first_n_tile);
+      int const cta_n_tile = n_tile_id / cta_n_tiles;
+      int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
+      int const subtile = n_tile_id - cta_first_n_tile;
       int const local_word = local_k * 16 + local_n_word;
-      int const macro_offset =
-          macro_n_tile * 4 * tile_size + local_word * subtile_count + subtile;
-      out_ptr[k_tile_id * n_tiles * tile_size + macro_offset] = res;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
+      out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
       return;
     }
 
@@ -288,17 +292,29 @@ __global__ void awq_marlin_repack_kernel(
 
 }  // namespace marlin
 
-#define CALL_IF(NUM_BITS, IS_A_8BIT)                                       \
-  else if (num_bits == NUM_BITS && is_a_8bit == IS_A_8BIT) {               \
+#define CALL_IF(NUM_BITS, IS_A_8BIT, CTA_N)                                \
+  if (num_bits == NUM_BITS && is_a_8bit == IS_A_8BIT) {                    \
     cudaFuncSetAttribute(                                                  \
         marlin::awq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS, \
-                                         IS_A_8BIT>,                       \
+                                         IS_A_8BIT, CTA_N>,                \
         cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);      \
     marlin::awq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS,     \
-                                     IS_A_8BIT>                            \
+                                     IS_A_8BIT, CTA_N>                     \
         <<<blocks, marlin::repack_threads, max_shared_mem, stream>>>(      \
             b_q_weight_ptr, out_ptr, size_k, size_n);                      \
-  }
+  } else
+
+#define CALL_FOR_CTA(CTA_N)                                                \
+  do {                                                                     \
+    CALL_IF(4, false, CTA_N)                                               \
+    CALL_IF(8, false, CTA_N)                                               \
+    CALL_IF(4, true, CTA_N)                                                \
+    CALL_IF(8, true, CTA_N)                                                \
+    {                                                                      \
+      TORCH_CHECK(false, "Unsupported repack config: num_bits = ",         \
+                  num_bits, ", is_a_8bit = ", is_a_8bit);                 \
+    }                                                                      \
+  } while (false)
 
 torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
                                 int64_t size_n, int64_t num_bits,
@@ -351,15 +367,13 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(max_shared_mem > 0);
 
-  if (false) {
-  }
-  CALL_IF(4, false)
-  CALL_IF(8, false)
-  CALL_IF(4, true)
-  CALL_IF(8, true)
-  else {
-    TORCH_CHECK(false, "Unsupported repack config: num_bits = ", num_bits,
-                ", is_a_8bit = ", is_a_8bit);
+  int const cta_n = marlin::sm70_dense::sm70_dense_auto_cta_n(size_n);
+  if (cta_n == 64) {
+    CALL_FOR_CTA(64);
+  } else if (cta_n == 128) {
+    CALL_FOR_CTA(128);
+  } else {
+    CALL_FOR_CTA(256);
   }
 
   return out;

@@ -63,7 +63,6 @@ _SM70_ROW_GROUPS = (
     (6, 7, 14, 15),
 )
 _SM70_U4_PACK_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
-_SM70_U4_MACRO_N_TILES = 4
 _SM70_U4_ZERO_WORDS_PER_CTA_N = 16
 _SM70_U4_ZERO_WORD_PAIR_ORDER = (
     0,
@@ -84,6 +83,20 @@ _SM70_U4_ZERO_WORD_PAIR_ORDER = (
     15,
 )
 _SM70_U8_PACK_ORDER = (0, 2, 1, 3)
+
+
+def _sm70_auto_cta_n(size_n: int) -> int:
+    if size_n % 256 == 0:
+        return 256
+    if size_n % 128 == 0:
+        return 128
+    if size_n % 64 == 0:
+        return 64
+    raise ValueError(f"SM70 native Marlin layout expects size_n%64==0, got {size_n}")
+
+
+def _sm70_cta_n_group_tiles(n_tiles: int) -> int:
+    return _sm70_auto_cta_n(n_tiles * 64) // 64
 
 
 def _legacy_marlin_weights(
@@ -144,36 +157,36 @@ def _pack_sm70_native_tile(q_tile: np.ndarray, num_bits: int) -> np.ndarray:
     raise ValueError(f"Unsupported num_bits={num_bits}")
 
 
-def _sm70_u4_macro_n_offset(
+def _sm70_u4_cta_n_offset(
     n_tiles: int,
     n_tile: int,
     local_word: int,
 ) -> int:
-    macro_n_tile = n_tile // _SM70_U4_MACRO_N_TILES
-    macro_first_n_tile = macro_n_tile * _SM70_U4_MACRO_N_TILES
-    subtile = n_tile - macro_first_n_tile
-    subtile_count = min(_SM70_U4_MACRO_N_TILES, n_tiles - macro_first_n_tile)
+    group_tiles = _sm70_cta_n_group_tiles(n_tiles)
+    group_n_tile = n_tile // group_tiles
+    group_first_n_tile = group_n_tile * group_tiles
+    subtile = n_tile - group_first_n_tile
     tile_words = 16 * 64 // get_pack_factor(4)
     return (
-        macro_n_tile * _SM70_U4_MACRO_N_TILES * tile_words
-        + local_word * subtile_count
+        group_n_tile * group_tiles * tile_words
+        + local_word * group_tiles
         + subtile
     )
 
 
-def _sm70_u8_macro_n_offset(
+def _sm70_u8_cta_n_offset(
     n_tiles: int,
     n_tile: int,
     local_word: int,
 ) -> int:
-    macro_n_tile = n_tile // _SM70_U4_MACRO_N_TILES
-    macro_first_n_tile = macro_n_tile * _SM70_U4_MACRO_N_TILES
-    subtile = n_tile - macro_first_n_tile
-    subtile_count = min(_SM70_U4_MACRO_N_TILES, n_tiles - macro_first_n_tile)
+    group_tiles = _sm70_cta_n_group_tiles(n_tiles)
+    group_n_tile = n_tile // group_tiles
+    group_first_n_tile = group_n_tile * group_tiles
+    subtile = n_tile - group_first_n_tile
     tile_words = 16 * 64 // get_pack_factor(8)
     return (
-        macro_n_tile * _SM70_U4_MACRO_N_TILES * tile_words
-        + local_word * subtile_count
+        group_n_tile * group_tiles * tile_words
+        + local_word * group_tiles
         + subtile
     )
 
@@ -212,13 +225,13 @@ def marlin_weights(
             )
             for local_word, word in enumerate(tile):
                 if num_bits == 4:
-                    word_offset = _sm70_u4_macro_n_offset(
+                    word_offset = _sm70_u4_cta_n_offset(
                         n_tiles,
                         n_tile,
                         local_word,
                     )
                 else:
-                    word_offset = _sm70_u8_macro_n_offset(
+                    word_offset = _sm70_u8_cta_n_offset(
                         n_tiles,
                         n_tile,
                         local_word,

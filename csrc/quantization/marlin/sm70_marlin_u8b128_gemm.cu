@@ -34,19 +34,17 @@ using marlin::sm70_dense::configure_dynamic_smem;
 using marlin::sm70_dense::cta_grid;
 using marlin::sm70_dense::dispatch_geometry;
 using marlin::sm70_dense::kCtaK;
-using marlin::sm70_dense::kMacroN;
-using marlin::sm70_dense::kMacroNTiles;
 using marlin::sm70_dense::kQuantTileK;
 using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
-using marlin::sm70_dense::parse_sm70_dense_cta_geometry;
+using marlin::sm70_dense::resolve_sm70_dense_cta_geometry;
 using marlin::sm70_dense::parse_sm70_dense_split_k;
 using marlin::sm70_dense::qword_from_vector;
 using marlin::sm70_dense::sm70_dense_active_split_k;
 using marlin::sm70_dense::sm70_dense_get_splitk_ctmp;
 using marlin::sm70_dense::sm70_dense_splitk_partition;
-using marlin::sm70_dense::u8_macro_n_qweight_offset_from_logical;
-using marlin::sm70_dense::u8_macro_n_qweight_word_stride_from_logical;
+using marlin::sm70_dense::u8_cta_n_qweight_offset_from_logical;
+using marlin::sm70_dense::u8_cta_n_qweight_word_stride_from_logical;
 
 namespace {
 
@@ -181,14 +179,14 @@ class Sm70U8B128IteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u8_macro_n_qweight_offset_from_logical(params.size_n, logical_k,
+    return u8_cta_n_qweight_offset_from_logical<Shape::kN>(params.size_n, logical_k,
                                                      logical_n);
   }
 
   CUTLASS_DEVICE
   static int qweight_word_stride_from_logical(Params const&,
                                               int logical_n) {
-    return u8_macro_n_qweight_word_stride_from_logical(logical_n);
+    return u8_cta_n_qweight_word_stride_from_logical<Shape::kN>();
   }
 
   CUTLASS_DEVICE
@@ -254,7 +252,7 @@ class Sm70U8B128IteratorB {
   }
 
   CUTLASS_DEVICE
-  void load_macro_n_aligned(Fragment& frag) const {
+  void load_cta_n_aligned(Fragment& frag) const {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
         uint4 const qwords0 =
@@ -417,7 +415,7 @@ class Sm70U8B128IteratorB {
       cache_current_group_metadata(scale_group(first_logical_k));
     }
 
-    load_macro_n_aligned(frag);
+    load_cta_n_aligned(frag);
   }
 };
 
@@ -640,7 +638,7 @@ torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
 
   char const* env_name = "SM70_MARLIN_U8B128_CTA";
   Sm70DenseCtaGeometry const geometry =
-      parse_sm70_dense_cta_geometry(env_name);
+      resolve_sm70_dense_cta_geometry(env_name, size_n);
   check_sm70_dense_cta_geometry(env_name, geometry);
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   int const split_k = parse_sm70_dense_split_k(kSm70MarlinU8B128SplitKEnv);
