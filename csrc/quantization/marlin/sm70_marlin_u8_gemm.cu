@@ -206,30 +206,6 @@ class Sm70U8ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  int qweight_word_stride(int c) const {
-    int const logical_n =
-        n_offset_ + thread_offset_.contiguous() +
-        c * ThreadMap::Delta::kContiguous;
-    return qweight_word_stride_from_logical(params_, logical_n);
-  }
-
-  CUTLASS_DEVICE
-  int qweight_offset(int s, int c, int word) const {
-    if constexpr (ThreadMap::Iterations::kStrided == 1) {
-      return qweight_base_offset_ + word * qweight_word_stride(c) + c;
-    } else {
-      int const logical_k =
-          k_offset_ + thread_offset_.strided() +
-          s * ThreadMap::Delta::kStrided;
-      int const logical_n =
-          n_offset_ + thread_offset_.contiguous() +
-          c * ThreadMap::Delta::kContiguous;
-      return qweight_offset_from_logical(params_, logical_k, logical_n) +
-             word * qweight_word_stride_from_logical(params_, logical_n);
-    }
-  }
-
-  CUTLASS_DEVICE
   void cache_metadata_lane_vectors(int c, int group, int cache_n) const {
     half2 const* scale_vec = reinterpret_cast<half2 const*>(
         scales_ + group * params_.size_n + cache_n);
@@ -359,7 +335,7 @@ class Sm70U8ZpIteratorB {
         frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
       }
     } else {
-      int const qweight_base = qweight_offset(0, 0, 0);
+      int const qweight_base = qweight_base_offset_;
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
         int const qweight_base_s =

@@ -166,21 +166,6 @@ class Sm70Nvfp4IteratorB {
   }
 
   CUTLASS_DEVICE
-  int qweight_offset(int s, int c) const {
-    if constexpr (ThreadMap::Iterations::kStrided == 1) {
-      return qweight_base_offset_ + c;
-    } else {
-      int const logical_k =
-          k_offset_ + thread_offset_.strided() +
-          s * ThreadMap::Delta::kStrided;
-      int const logical_n =
-          n_offset_ + thread_offset_.contiguous() +
-          c * ThreadMap::Delta::kContiguous;
-      return qweight_offset_from_logical(params_, logical_k, logical_n);
-    }
-  }
-
-  CUTLASS_DEVICE
   void cache_metadata_fp8_scales(int cache_index, int group,
                                  int cache_n) const {
     uint2 const scale_words = *reinterpret_cast<uint2 const*>(
@@ -274,7 +259,7 @@ class Sm70Nvfp4IteratorB {
         frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
       }
     } else {
-      int const qweight_base = qweight_offset(0, 0);
+      int const qweight_base = qweight_base_offset_;
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
         int const qweight_base_s =
