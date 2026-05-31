@@ -347,8 +347,8 @@ class Sm70MoeU4ZpIteratorB {
 
  private:
   uint32_t const* qweight_;
-  half const* scales_;
-  half const* zp_;
+  half const* scales_expert_base_;
+  half const* zp_expert_base_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
   int qweight_base_offset_;
@@ -365,8 +365,11 @@ class Sm70MoeU4ZpIteratorB {
                        half const* scales, half const* zp, int thread_id,
                        int expert, int k_offset, int n_offset)
       : qweight_(qweight),
-        scales_(scales),
-        zp_(zp),
+        scales_expert_base_(scales +
+                            (expert >= 0 ? expert : 0) *
+                                params.num_groups * params.size_n),
+        zp_expert_base_(zp + (expert >= 0 ? expert : 0) *
+                                 params.num_groups * params.size_n),
         params_(params),
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         expert_(expert),
@@ -408,8 +411,8 @@ class Sm70MoeU4ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  int expert_metadata_group_offset(int group) const {
-    return (expert_ * params_.num_groups + group) * params_.size_n;
+  int metadata_group_offset(int group) const {
+    return group * params_.size_n;
   }
 
   CUTLASS_DEVICE
@@ -434,8 +437,9 @@ class Sm70MoeU4ZpIteratorB {
 
   CUTLASS_DEVICE
   void cache_metadata_lane_vectors(int c, int group, int cache_n) const {
+    int const metadata_offset = metadata_group_offset(group) + cache_n;
     half2 const* scale_vec = reinterpret_cast<half2 const*>(
-        scales_ + expert_metadata_group_offset(group) + cache_n);
+        scales_expert_base_ + metadata_offset);
     half2* scale_cache = cached_scales_ + c * 4;
     scale_cache[0] = scale_vec[0];
     scale_cache[1] = scale_vec[1];
@@ -443,7 +447,7 @@ class Sm70MoeU4ZpIteratorB {
     scale_cache[3] = scale_vec[3];
 
     half2 const* zp_vec = reinterpret_cast<half2 const*>(
-        zp_ + expert_metadata_group_offset(group) + cache_n);
+        zp_expert_base_ + metadata_offset);
     half2* zp_cache = cached_zp_ + c * 4;
     zp_cache[0] = zp_vec[0];
     zp_cache[1] = zp_vec[1];
@@ -453,8 +457,9 @@ class Sm70MoeU4ZpIteratorB {
 
   CUTLASS_DEVICE
   void cache_metadata_vector_words(int c, int group, int cache_n) const {
+    int const metadata_offset = metadata_group_offset(group) + cache_n;
     uint4 const scale_words = *reinterpret_cast<uint4 const*>(
-        scales_ + expert_metadata_group_offset(group) + cache_n);
+        scales_expert_base_ + metadata_offset);
     half2 const* scale_vec = reinterpret_cast<half2 const*>(&scale_words);
     half2* scale_cache = cached_scales_ + c * 4;
     scale_cache[0] = scale_vec[0];
@@ -463,7 +468,7 @@ class Sm70MoeU4ZpIteratorB {
     scale_cache[3] = scale_vec[3];
 
     uint4 const zp_words = *reinterpret_cast<uint4 const*>(
-        zp_ + expert_metadata_group_offset(group) + cache_n);
+        zp_expert_base_ + metadata_offset);
     half2 const* zp_vec = reinterpret_cast<half2 const*>(&zp_words);
     half2* zp_cache = cached_zp_ + c * 4;
     zp_cache[0] = zp_vec[0];
