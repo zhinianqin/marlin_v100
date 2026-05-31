@@ -547,7 +547,7 @@ def _assert_moe_backend_rejects_act_order(
             is_k_full,
             False,
             True,
-            False,
+            inputs["w1_zeros"] is not None,
             -1,
             -1,
             -1,
@@ -781,7 +781,7 @@ def _run_stage1_kernel_case(
         is_k_full,
         False,
         True,
-        False,
+        inputs["w1_zeros"] is not None,
         thread_k,
         thread_n,
         blocks_per_sm,
@@ -868,7 +868,7 @@ def _run_forced_fused_kernel_case(
         True,
         False,
         True,
-        False,
+        inputs["w1_zeros"] is not None,
         thread_k,
         thread_n,
         blocks_per_sm,
@@ -901,7 +901,7 @@ def _run_forced_fused_kernel_case(
         True,
         False,
         True,
-        False,
+        inputs["w2_zeros"] is not None,
         thread_k,
         thread_n,
         blocks_per_sm,
@@ -983,7 +983,7 @@ def _assert_stage1_kernel_rejects_unsupported_config(
             True,
             False,
             True,
-            False,
+            inputs["w1_zeros"] is not None,
             thread_k,
             thread_n,
             -1,
@@ -1461,11 +1461,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 torch.empty((experts, 1, size_n), device="cuda", dtype=torch.float16),
                 None,
                 None,
-                torch.empty(
-                    (experts, 1, size_n // pack_factor),
-                    device="cuda",
-                    dtype=torch.int32,
-                ),
+                torch.empty((experts, 1, size_n), device="cuda", dtype=torch.float16),
                 torch.empty((0,), device="cuda", dtype=torch.int32),
                 torch.empty((0,), device="cuda", dtype=torch.int32),
                 None,
@@ -1483,7 +1479,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 True,
                 False,
                 True,
-                False,
+                True,
                 -1,
                 -1,
                 -1,
@@ -1561,7 +1557,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 True,
                 False,
                 True,
-                False,
+                True,
                 -1,
                 -1,
                 -1,
@@ -1612,7 +1608,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 True,
                 False,
                 False,
-                False,
+                True,
                 -1,
                 -1,
                 -1,
@@ -1811,14 +1807,14 @@ def test_moe_wna16_uint4_zp_rejects_non_uint4_quant_type():
             True,
             False,
             True,
-            False,
+            True,
             -1,
             -1,
             -1,
         )
 
 
-def test_moe_wna16_uint4_zp_rejects_float_zero_points():
+def test_moe_wna16_uint4_zp_rejects_packed_zero_points():
     _require_moe_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -1835,7 +1831,17 @@ def test_moe_wna16_uint4_zp_rejects_float_zero_points():
         inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
     )
 
-    with pytest.raises(RuntimeError, match="does not support float zero-points"):
+    packed_zero_points = torch.empty(
+        (
+            inputs["experts"],
+            inputs["w1_scales"].shape[1],
+            inputs["w1_scales"].shape[2] // 8,
+        ),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    with pytest.raises(RuntimeError, match="requires fp16 zero points"):
         ops.moe_wna16_marlin_gemm(
             hidden_states,
             torch.empty(
@@ -1848,7 +1854,7 @@ def test_moe_wna16_uint4_zp_rejects_float_zero_points():
             inputs["w1_scales"],
             None,
             None,
-            inputs["w1_zeros"].to(torch.float16),
+            packed_zero_points,
             inputs["w1_g_idx"],
             inputs["w1_perm"],
             None,
@@ -1866,7 +1872,7 @@ def test_moe_wna16_uint4_zp_rejects_float_zero_points():
             True,
             False,
             True,
-            True,
+            False,
             -1,
             -1,
             -1,
@@ -1922,7 +1928,7 @@ def test_moe_wna16_uint4_zp_rejects_mismatched_zero_point_shape():
             True,
             False,
             True,
-            False,
+            True,
             -1,
             -1,
             -1,

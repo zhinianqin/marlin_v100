@@ -1,5 +1,4 @@
 #include "core/registration.h"
-#include "core/scalar_type.hpp"
 #include "quantization/marlin/dequant.h"
 #include "quantization/marlin/sm70_dense_common.cuh"
 #include "quantization/marlin/sm70_dense_gemm.cuh"
@@ -349,7 +348,7 @@ class Sm70MoeU4ZpIteratorB {
  private:
   uint32_t const* qweight_;
   half const* scales_;
-  uint32_t const* zp_;
+  half const* zp_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
   int qweight_base_offset_;
@@ -363,7 +362,7 @@ class Sm70MoeU4ZpIteratorB {
  public:
   CUTLASS_DEVICE
   Sm70MoeU4ZpIteratorB(Params const& params, uint32_t const* qweight,
-                       half const* scales, uint32_t const* zp, int thread_id,
+                       half const* scales, half const* zp, int thread_id,
                        int expert, int k_offset, int n_offset)
       : qweight_(qweight),
         scales_(scales),
@@ -414,12 +413,6 @@ class Sm70MoeU4ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  int expert_zero_group_offset(int group) const {
-    return (expert_ * params_.num_groups + group) *
-           (params_.size_n / kU4ValuesPerWord);
-  }
-
-  CUTLASS_DEVICE
   int scale_group(int logical_k) const {
     if constexpr (kGroupSize == -1) {
       return 0;
@@ -440,24 +433,6 @@ class Sm70MoeU4ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  static int zero_offset_from_logical(Params const& params, int group,
-                                      int logical_n) {
-    constexpr int kZeroWordsPerTile = 16;
-    constexpr int kZeroColumnsPerTile = kZeroWordsPerTile * kU4ValuesPerWord;
-    int const zero_tile = logical_n / kZeroColumnsPerTile;
-    int const local_n = logical_n - zero_tile * kZeroColumnsPerTile;
-    int const local_word = local_n / kU4ValuesPerWord;
-    int const ordered_word = (local_word % 8) * 2 + local_word / 8;
-    int const zero_tile_base = zero_tile * kZeroWordsPerTile;
-    bool const full_zero_tile =
-        zero_tile_base + kZeroWordsPerTile <=
-        params.size_n / kU4ValuesPerWord;
-    int const stored_word = full_zero_tile ? ordered_word : local_word;
-    return group * (params.size_n / kU4ValuesPerWord) +
-           zero_tile_base + stored_word;
-  }
-
-  CUTLASS_DEVICE
   void cache_metadata_lane_vectors(int c, int group, int cache_n) const {
     half2 const* scale_vec = reinterpret_cast<half2 const*>(
         scales_ + expert_metadata_group_offset(group) + cache_n);
@@ -467,19 +442,13 @@ class Sm70MoeU4ZpIteratorB {
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
 
-    uint32_t const zp_word =
-        zp_[expert_zero_group_offset(group) +
-            zero_offset_from_logical(params_, 0, cache_n)];
+    half2 const* zp_vec = reinterpret_cast<half2 const*>(
+        zp_ + expert_metadata_group_offset(group) + cache_n);
     half2* zp_cache = cached_zp_ + c * 4;
-    half2 deq[2];
-    marlin::dequant<half2, vllm::kU4.id(), false>(
-        static_cast<int>(zp_word), deq);
-    zp_cache[0] = deq[0];
-    zp_cache[1] = deq[1];
-    marlin::dequant<half2, vllm::kU4.id(), false>(
-        static_cast<int>(zp_word >> 8), deq);
-    zp_cache[2] = deq[0];
-    zp_cache[3] = deq[1];
+    zp_cache[0] = zp_vec[0];
+    zp_cache[1] = zp_vec[1];
+    zp_cache[2] = zp_vec[2];
+    zp_cache[3] = zp_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -494,19 +463,13 @@ class Sm70MoeU4ZpIteratorB {
     scale_cache[3] = scale_vec[3];
 
     uint4 const zp_words = *reinterpret_cast<uint4 const*>(
-        zp_ + expert_zero_group_offset(group) +
-        zero_offset_from_logical(params_, 0, cache_n));
-    uint32_t const zp_word = qword_from_vector(zp_words, 0);
+        zp_ + expert_metadata_group_offset(group) + cache_n);
+    half2 const* zp_vec = reinterpret_cast<half2 const*>(&zp_words);
     half2* zp_cache = cached_zp_ + c * 4;
-    half2 deq[2];
-    marlin::dequant<half2, vllm::kU4.id(), false>(
-        static_cast<int>(zp_word), deq);
-    zp_cache[0] = deq[0];
-    zp_cache[1] = deq[1];
-    marlin::dequant<half2, vllm::kU4.id(), false>(
-        static_cast<int>(zp_word >> 8), deq);
-    zp_cache[2] = deq[0];
-    zp_cache[3] = deq[1];
+    zp_cache[0] = zp_vec[0];
+    zp_cache[1] = zp_vec[1];
+    zp_cache[2] = zp_vec[2];
+    zp_cache[3] = zp_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -542,12 +505,12 @@ class Sm70MoeU4ZpIteratorB {
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
           marlin::dequant<half2, vllm::kU4.id(), false>(
               static_cast<int>(qword), deq);
-          frag_vec[0] = __hmul2(__hsub2(deq[0], zp_vec[0]), scale_vec[0]);
-          frag_vec[1] = __hmul2(__hsub2(deq[1], zp_vec[1]), scale_vec[1]);
+          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
           marlin::dequant<half2, vllm::kU4.id(), false>(
               static_cast<int>(qword >> 8), deq);
-          frag_vec[2] = __hmul2(__hsub2(deq[0], zp_vec[2]), scale_vec[2]);
-          frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
+          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
         auto const qwords =
@@ -564,12 +527,12 @@ class Sm70MoeU4ZpIteratorB {
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
           marlin::dequant<half2, vllm::kU4.id(), false>(
               static_cast<int>(qword), deq);
-          frag_vec[0] = __hmul2(__hsub2(deq[0], zp_vec[0]), scale_vec[0]);
-          frag_vec[1] = __hmul2(__hsub2(deq[1], zp_vec[1]), scale_vec[1]);
+          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
           marlin::dequant<half2, vllm::kU4.id(), false>(
               static_cast<int>(qword >> 8), deq);
-          frag_vec[2] = __hmul2(__hsub2(deq[0], zp_vec[2]), scale_vec[2]);
-          frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
+          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
@@ -582,12 +545,12 @@ class Sm70MoeU4ZpIteratorB {
         half2* frag_vec = reinterpret_cast<half2*>(frag.data());
         marlin::dequant<half2, vllm::kU4.id(), false>(
             static_cast<int>(qword), deq);
-        frag_vec[0] = __hmul2(__hsub2(deq[0], zp_vec[0]), scale_vec[0]);
-        frag_vec[1] = __hmul2(__hsub2(deq[1], zp_vec[1]), scale_vec[1]);
+        frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+        frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
         marlin::dequant<half2, vllm::kU4.id(), false>(
             static_cast<int>(qword >> 8), deq);
-        frag_vec[2] = __hmul2(__hsub2(deq[0], zp_vec[2]), scale_vec[2]);
-        frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
+        frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+        frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
       }
     } else {
       int const qweight_base = qweight_base_offset_;
@@ -611,12 +574,12 @@ class Sm70MoeU4ZpIteratorB {
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
             marlin::dequant<half2, vllm::kU4.id(), false>(
                 static_cast<int>(qword), deq);
-            frag_vec[0] = __hmul2(__hsub2(deq[0], zp_vec[0]), scale_vec[0]);
-            frag_vec[1] = __hmul2(__hsub2(deq[1], zp_vec[1]), scale_vec[1]);
+            frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+            frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
             marlin::dequant<half2, vllm::kU4.id(), false>(
                 static_cast<int>(qword >> 8), deq);
-            frag_vec[2] = __hmul2(__hsub2(deq[0], zp_vec[2]), scale_vec[2]);
-            frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
+            frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+            frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
           auto const qwords =
@@ -634,12 +597,12 @@ class Sm70MoeU4ZpIteratorB {
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
             marlin::dequant<half2, vllm::kU4.id(), false>(
                 static_cast<int>(qword), deq);
-            frag_vec[0] = __hmul2(__hsub2(deq[0], zp_vec[0]), scale_vec[0]);
-            frag_vec[1] = __hmul2(__hsub2(deq[1], zp_vec[1]), scale_vec[1]);
+            frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+            frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
             marlin::dequant<half2, vllm::kU4.id(), false>(
                 static_cast<int>(qword >> 8), deq);
-            frag_vec[2] = __hmul2(__hsub2(deq[0], zp_vec[2]), scale_vec[2]);
-            frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
+            frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+            frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
           }
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
@@ -654,12 +617,12 @@ class Sm70MoeU4ZpIteratorB {
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
           marlin::dequant<half2, vllm::kU4.id(), false>(
               static_cast<int>(qword), deq);
-          frag_vec[0] = __hmul2(__hsub2(deq[0], zp_vec[0]), scale_vec[0]);
-          frag_vec[1] = __hmul2(__hsub2(deq[1], zp_vec[1]), scale_vec[1]);
+          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
           marlin::dequant<half2, vllm::kU4.id(), false>(
               static_cast<int>(qword >> 8), deq);
-          frag_vec[2] = __hmul2(__hsub2(deq[0], zp_vec[2]), scale_vec[2]);
-          frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
+          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       }
     }
@@ -668,7 +631,6 @@ class Sm70MoeU4ZpIteratorB {
   CUTLASS_DEVICE
   void load(Fragment& frag) const {
     if (!mask_enabled_) {
-      frag.clear();
       return;
     }
 
@@ -901,7 +863,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void sm70_marlin_u4_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
-    uint32_t const* __restrict__ b_zeros,
+    cutlass::half_t const* __restrict__ b_zeros,
     cutlass::half_t* __restrict__ c, float* __restrict__ c_tmp,
     int32_t const* __restrict__ sorted_token_ids,
     int32_t const* __restrict__ expert_ids,
@@ -956,7 +918,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void sm70_marlin_u4_gemm_kernel(
       typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
       reinterpret_cast<half const*>(b_scales),
-      reinterpret_cast<uint32_t const*>(b_zeros), thread_idx, expert, k_begin,
+      reinterpret_cast<half const*>(b_zeros), thread_idx, expert, k_begin,
       n_offset);
 
   Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
@@ -1008,7 +970,7 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
         reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
         reinterpret_cast<cutlass::half_t const*>(
             b_scales.data_ptr<at::Half>()),
-        reinterpret_cast<uint32_t const*>(b_zeros.data_ptr<int32_t>()),
+        reinterpret_cast<cutlass::half_t const*>(b_zeros.data_ptr<at::Half>()),
         reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()), nullptr,
         sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
         num_tokens_past_padded.data_ptr<int32_t>(),
@@ -1040,7 +1002,7 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       reinterpret_cast<cutlass::half_t const*>(b_scales.data_ptr<at::Half>()),
-      reinterpret_cast<uint32_t const*>(b_zeros.data_ptr<int32_t>()),
+      reinterpret_cast<cutlass::half_t const*>(b_zeros.data_ptr<at::Half>()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
       c_tmp.data_ptr<float>(), sorted_token_ids.data_ptr<int32_t>(),
       expert_ids.data_ptr<int32_t>(), num_tokens_past_padded.data_ptr<int32_t>(),

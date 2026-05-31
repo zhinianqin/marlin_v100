@@ -611,7 +611,6 @@ torch::Tensor moe_wna16_marlin_gemm(
   TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
                   b_type == vllm::kU8B128,
               "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
-  TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
   TORCH_CHECK(use_fp32_reduce,
               "SM70 Marlin MoE requires use_fp32_reduce=True.");
 
@@ -793,24 +792,25 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   // Verify b_zeros
   if (has_zp) {
+    TORCH_CHECK(is_zp_float,
+                "SM70 Marlin MoE uint4 path requires fp16 zero points "
+                "with is_zp_float=true.");
     int rank = b_zeros.sizes().size();
     TORCH_CHECK(rank == 3, "b_zeros rank = ", rank, " is not 3");
-    if (is_zp_float) {
-      TORCH_CHECK(b_zeros.size(2) == size_n,
-                  "b_zeros dim 2 = ", b_zeros.size(2),
-                  " is not size_n = ", size_n);
-      TORCH_CHECK(num_groups == b_zeros.size(1),
-                  "b_zeros dim 1 = ", b_zeros.size(1),
-                  " is not num_groups = ", num_groups);
-      TORCH_CHECK(num_groups != -1, "num_groups must be != -1");
-    } else {
-      TORCH_CHECK(b_zeros.size(1) == num_groups,
-                  "b_zeros dim 1 = ", b_zeros.size(1),
-                  " is not num_groups = ", num_groups);
-      TORCH_CHECK(b_zeros.size(2) == size_n / pack_factor,
-                  "b_zeros dim 2 = ", b_zeros.size(2),
-                  " is not size_n / pack_factor = ", size_n / pack_factor);
-    }
+    TORCH_CHECK(b_zeros.scalar_type() == at::ScalarType::Half,
+                "SM70 Marlin MoE uint4 path expects fp16 zero points.");
+    TORCH_CHECK(b_zeros.size(0) == num_experts,
+                "b_zeros dim 0 = ", b_zeros.size(0),
+                " is not num_experts = ", num_experts);
+    TORCH_CHECK(num_groups == b_zeros.size(1),
+                "b_zeros dim 1 = ", b_zeros.size(1),
+                " is not num_groups = ", num_groups);
+    TORCH_CHECK(b_zeros.size(2) == size_n,
+                "b_zeros dim 2 = ", b_zeros.size(2),
+                " is not size_n = ", size_n);
+  } else {
+    TORCH_CHECK(!is_zp_float,
+                "is_zp_float is true but b_zeros was not provided.");
   }
 
   TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
@@ -830,7 +830,6 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
 
   if (b_type == vllm::kU4 && has_zp && !has_act_order) {
-    TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
     TORCH_CHECK(!has_bias, "SM70 Marlin MoE uint4 path does not support bias.");
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
         a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,

@@ -1308,13 +1308,13 @@ def marlin_quantize_experts_uint4_zp_with_metadata(
     g_indices = []
     perms = []
     for expert in range(weights.shape[0]):
-        _, q_weight, scale, packed_zero_points, expert_dequantized = marlin_quantize_uint4_packed_zp(
+        _, q_weight, scale, zero_point, expert_dequantized = marlin_quantize_uint4_zp(
             weights[expert],
             group_size,
         )
         q_weights.append(q_weight)
         scales.append(scale)
-        zero_points.append(packed_zero_points)
+        zero_points.append(zero_point)
         dequantized.append(expert_dequantized)
         g_indices.append(torch.empty((0,), dtype=torch.int, device=weights.device))
         perms.append(torch.empty((0,), dtype=torch.int, device=weights.device))
