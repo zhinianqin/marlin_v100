@@ -68,7 +68,7 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 scales\."
 )
 _N_TILE_ALIGNMENT_ERROR = "requires size_n divisible by 64"
-_CTA_N_AUTO_ERROR = "requires auto CTA_N"
+_CTA_AUTO_ERROR = "requires auto CTA_M=.*auto CTA_N"
 _SPLIT_K_QUANT_CASES = (
     ("uint4b8", "SM70_MARLIN_U4B8_SPLIT_K", 128, 384, 5e-2, 2.5e-1),
     ("uint8", "SM70_MARLIN_U8_SPLIT_K", 32, 352, 5e-2, 2.5e-1),
@@ -864,13 +864,15 @@ def _run_auto_cta_n_quant_accuracy_case(
     _AUTO_CTA_N_QUANT_CASES,
 )
 @pytest.mark.parametrize("size_n", (64, 128, 192, 320))
-def test_marlin_dense_auto_cta_n_partial_n_matches_reference(
+@pytest.mark.parametrize("size_m", (16, 64, 128, 5120))
+def test_marlin_dense_auto_cta_mn_partial_n_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
     cta_env: str,
     group_size: int,
     rtol: float,
     atol: float,
+    size_m: int,
     size_n: int,
 ):
     if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
@@ -879,7 +881,7 @@ def test_marlin_dense_auto_cta_n_partial_n_matches_reference(
     _run_auto_cta_n_quant_accuracy_case(
         quant_name,
         group_size=group_size,
-        size_m=8,
+        size_m=size_m,
         size_k=256,
         size_n=size_n,
         rtol=rtol,
@@ -908,11 +910,45 @@ def test_marlin_dense_auto_cta_n_rejects_mismatched_env_cta_n(
     if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
         pytest.skip(f"{quant_name} dense path is not supported in this build")
     monkeypatch.setenv(cta_env, cta_geometry)
-    with pytest.raises(RuntimeError, match=_CTA_N_AUTO_ERROR):
+    with pytest.raises(RuntimeError, match=_CTA_AUTO_ERROR):
         _run_auto_cta_n_quant_accuracy_case(
             quant_name,
             group_size=group_size,
-            size_m=8,
+            size_m=128,
+            size_k=256,
+            size_n=size_n,
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+@pytest.mark.parametrize(
+    ("quant_name", "cta_env", "group_size", "rtol", "atol"),
+    _AUTO_CTA_N_QUANT_CASES,
+)
+@pytest.mark.parametrize(
+    ("cta_geometry", "size_m", "size_n"),
+    (("128x256x8", 16, 256), ("32x128x4", 5120, 128)),
+)
+def test_marlin_dense_auto_cta_m_rejects_mismatched_env_cta_m(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_name: str,
+    cta_env: str,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    cta_geometry: str,
+    size_m: int,
+    size_n: int,
+):
+    if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
+        pytest.skip(f"{quant_name} dense path is not supported in this build")
+    monkeypatch.setenv(cta_env, cta_geometry)
+    with pytest.raises(RuntimeError, match=_CTA_AUTO_ERROR):
+        _run_auto_cta_n_quant_accuracy_case(
+            quant_name,
+            group_size=group_size,
+            size_m=size_m,
             size_k=256,
             size_n=size_n,
             rtol=rtol,
@@ -1283,7 +1319,7 @@ def test_marlin_dense_uint4b8_env_cta_geometry_matches_reference(
 def test_marlin_dense_uint4b8_env_cta_geometry_rejects_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("SM70_MARLIN_U4B8_CTA", "32x64x4")
+    monkeypatch.setenv("SM70_MARLIN_U4B8_CTA", "64x64x8")
     with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U4B8_CTA"):
         _run_dense_accuracy_case(
             scalar_types.uint4b8,
@@ -1386,7 +1422,7 @@ def test_marlin_dense_uint4_zp_env_cta_geometry_matches_reference(
 def test_marlin_dense_uint4_zp_env_cta_geometry_rejects_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("SM70_MARLIN_U4_CTA", "32x64x4")
+    monkeypatch.setenv("SM70_MARLIN_U4_CTA", "64x64x8")
     with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U4_CTA"):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl="gptq",
@@ -1460,17 +1496,18 @@ def test_marlin_dense_uint4_zp_split_k_nonuniform_k_matches_reference(
 
 
 @pytest.mark.parametrize(
-    ("cta_geometry", "split_k", "size_n"),
+    ("cta_geometry", "split_k", "size_m", "size_n"),
     (
-        ("128x256x8", "2", 256),
-        ("32x128x4", "4", 128),
-        ("128x256x8", "8", 256),
+        ("128x256x8", "2", 128, 256),
+        ("32x128x4", "4", 32, 128),
+        ("128x256x8", "8", 128, 256),
     ),
 )
 def test_marlin_dense_uint4_zp_split_k_cta_geometry_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
     cta_geometry: str,
     split_k: str,
+    size_m: int,
     size_n: int,
 ):
     monkeypatch.setenv("SM70_MARLIN_U4_CTA", cta_geometry)
@@ -1480,7 +1517,7 @@ def test_marlin_dense_uint4_zp_split_k_cta_geometry_matches_reference(
         group_size=128,
         rtol=5e-2,
         atol=2.5e-1,
-        size_m=32,
+        size_m=size_m,
         size_k=256,
         size_n=size_n,
     )
@@ -1715,7 +1752,7 @@ def test_marlin_dense_uint8_zp_env_cta_geometry_matches_reference(
 def test_marlin_dense_uint8_zp_env_cta_geometry_rejects_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setenv("SM70_MARLIN_U8_CTA", "32x64x4")
+    monkeypatch.setenv("SM70_MARLIN_U8_CTA", "64x64x8")
     with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U8_CTA"):
         _run_dense_uint8_zp_accuracy_case(
             repack_impl="gptq",
@@ -2184,7 +2221,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_uint8b128_env_cta_geometry_rejects_unsupported(
         monkeypatch: pytest.MonkeyPatch,
     ):
-        monkeypatch.setenv("SM70_MARLIN_U8B128_CTA", "32x64x4")
+        monkeypatch.setenv("SM70_MARLIN_U8B128_CTA", "64x64x8")
         with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_U8B128_CTA"):
             _run_dense_accuracy_case(
                 scalar_types.uint8b128,
@@ -2232,7 +2269,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_fp8_env_cta_geometry_rejects_unsupported(
         monkeypatch: pytest.MonkeyPatch,
     ):
-        monkeypatch.setenv("SM70_MARLIN_FP8_CTA", "32x64x4")
+        monkeypatch.setenv("SM70_MARLIN_FP8_CTA", "64x64x8")
         with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_FP8_CTA"):
             _run_fp8_dense_accuracy_case(
                 group_size=128,
@@ -2583,7 +2620,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_nvfp4_env_cta_geometry_rejects_unsupported(
         monkeypatch: pytest.MonkeyPatch,
     ):
-        monkeypatch.setenv("SM70_MARLIN_NVFP4_CTA", "32x64x4")
+        monkeypatch.setenv("SM70_MARLIN_NVFP4_CTA", "64x64x8")
         with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_NVFP4_CTA"):
             _run_nvfp4_dense_accuracy_case(
                 size_m=32,
@@ -2830,7 +2867,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
     def test_marlin_dense_mxfp4_env_cta_geometry_rejects_unsupported(
         monkeypatch: pytest.MonkeyPatch,
     ):
-        monkeypatch.setenv("SM70_MARLIN_MXFP4_CTA", "32x64x4")
+        monkeypatch.setenv("SM70_MARLIN_MXFP4_CTA", "64x64x8")
         with pytest.raises(RuntimeError, match="Unsupported SM70_MARLIN_MXFP4_CTA"):
             _run_mxfp4_dense_accuracy_case(
                 size_m=32,

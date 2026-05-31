@@ -39,6 +39,7 @@ using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
 using marlin::sm70_dense::resolve_sm70_dense_cta_geometry;
 using marlin::sm70_dense::parse_sm70_dense_split_k;
+using marlin::sm70_dense::load_qword_vector;
 using marlin::sm70_dense::qword_from_vector;
 using marlin::sm70_dense::sm70_dense_active_split_k;
 using marlin::sm70_dense::sm70_dense_get_splitk_ctmp;
@@ -73,6 +74,13 @@ class Sm70Fp8IteratorB {
   static_assert(ThreadMap::kElementsPerAccess == kFp8ValuesPerAccess,
                 "The SM70 FP8 IteratorB expects two packed FP8 words per "
                 "access.");
+  static_assert(ThreadMap::Iterations::kStrided == 1 ||
+                    ThreadMap::Iterations::kStrided == 2,
+                "SM70 U8-family IteratorB expects one or two strided "
+                "iterations.");
+  static constexpr int kQweightWordStrideWords = Shape::kN / kQuantTileN;
+  static constexpr int kStridedQweightDeltaWords =
+      64 * kQweightWordStrideWords;
 
   struct Params {
     int size_n;
@@ -255,10 +263,9 @@ class Sm70Fp8IteratorB {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
         uint4 const qwords0 =
-            *reinterpret_cast<uint4 const*>(qweight_ + qweight_base_offset_);
-        uint4 const qwords1 =
-            *reinterpret_cast<uint4 const*>(
-                qweight_ + qweight_base_offset_ + qweight_word_stride(0));
+            load_qword_vector<4>(qweight_ + qweight_base_offset_);
+        uint4 const qwords1 = load_qword_vector<4>(
+            qweight_ + qweight_base_offset_ + kQweightWordStrideWords);
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -280,10 +287,9 @@ class Sm70Fp8IteratorB {
         }
       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
         uint2 const qwords0 =
-            *reinterpret_cast<uint2 const*>(qweight_ + qweight_base_offset_);
-        uint2 const qwords1 =
-            *reinterpret_cast<uint2 const*>(
-                qweight_ + qweight_base_offset_ + qweight_word_stride(0));
+            load_qword_vector<2>(qweight_ + qweight_base_offset_);
+        uint2 const qwords1 = load_qword_vector<2>(
+            qweight_ + qweight_base_offset_ + kQweightWordStrideWords);
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -306,9 +312,10 @@ class Sm70Fp8IteratorB {
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
                       "Unsupported SM70 FP8 contiguous iteration count.");
-        uint32_t const qword0 = qweight_[qweight_base_offset_];
-        uint32_t const qword1 =
-            qweight_[qweight_base_offset_ + qweight_word_stride(0)];
+        uint32_t const qword0 =
+            load_qword_vector<1>(qweight_ + qweight_base_offset_);
+        uint32_t const qword1 = load_qword_vector<1>(
+            qweight_ + qweight_base_offset_ + kQweightWordStrideWords);
         half2 const* scale_vec = cached_scales_;
 
         half2 deq[2];
@@ -323,15 +330,16 @@ class Sm70Fp8IteratorB {
         frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
       }
     } else {
+      int const qweight_base = qweight_offset(0, 0, 0);
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+        int const qweight_base_s =
+            qweight_base + s * kStridedQweightDeltaWords;
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
           uint4 const qwords0 =
-              *reinterpret_cast<uint4 const*>(
-                  qweight_ + qweight_offset(s, 0, 0));
-          uint4 const qwords1 =
-              *reinterpret_cast<uint4 const*>(
-                  qweight_ + qweight_offset(s, 0, 1));
+              load_qword_vector<4>(qweight_ + qweight_base_s);
+          uint4 const qwords1 = load_qword_vector<4>(
+              qweight_ + qweight_base_s + kQweightWordStrideWords);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -354,11 +362,9 @@ class Sm70Fp8IteratorB {
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
           uint2 const qwords0 =
-              *reinterpret_cast<uint2 const*>(
-                  qweight_ + qweight_offset(s, 0, 0));
-          uint2 const qwords1 =
-              *reinterpret_cast<uint2 const*>(
-                  qweight_ + qweight_offset(s, 0, 1));
+              load_qword_vector<2>(qweight_ + qweight_base_s);
+          uint2 const qwords1 = load_qword_vector<2>(
+              qweight_ + qweight_base_s + kQweightWordStrideWords);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -382,8 +388,10 @@ class Sm70Fp8IteratorB {
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
                         "Unsupported SM70 FP8 contiguous iteration count.");
-          uint32_t const qword0 = qweight_[qweight_offset(s, 0, 0)];
-          uint32_t const qword1 = qweight_[qweight_offset(s, 0, 1)];
+          uint32_t const qword0 =
+              load_qword_vector<1>(qweight_ + qweight_base_s);
+          uint32_t const qword1 = load_qword_vector<1>(
+              qweight_ + qweight_base_s + kQweightWordStrideWords);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
           half2 const* scale_vec = cached_scales_;
@@ -637,7 +645,7 @@ torch::Tensor sm70_marlin_fp8_gemm(torch::Tensor& a, torch::Tensor& c,
 
   char const* env_name = "SM70_MARLIN_FP8_CTA";
   Sm70DenseCtaGeometry const geometry =
-      resolve_sm70_dense_cta_geometry(env_name, size_n);
+      resolve_sm70_dense_cta_geometry(env_name, size_m, size_n);
   check_sm70_dense_cta_geometry(env_name, geometry);
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   int const split_k = parse_sm70_dense_split_k(kSm70MarlinFp8SplitKEnv);

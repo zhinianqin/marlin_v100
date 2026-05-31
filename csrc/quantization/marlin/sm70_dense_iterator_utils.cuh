@@ -9,6 +9,52 @@
 
 namespace marlin::sm70_dense {
 
+template <int ContiguousWords>
+struct QwordVector;
+
+template <>
+struct QwordVector<1> {
+  using Type = uint32_t;
+};
+
+template <>
+struct QwordVector<2> {
+  using Type = uint2;
+};
+
+template <>
+struct QwordVector<4> {
+  using Type = uint4;
+};
+
+template <int ContiguousWords>
+CUTLASS_DEVICE typename QwordVector<ContiguousWords>::Type load_qword_vector(
+    uint32_t const* ptr) {
+  static_assert(ContiguousWords == 1 || ContiguousWords == 2 ||
+                    ContiguousWords == 4,
+                "SM70 qword vector load supports 1, 2, or 4 words.");
+  if constexpr (ContiguousWords == 1) {
+    return *ptr;
+  } else {
+    return *reinterpret_cast<typename QwordVector<ContiguousWords>::Type const*>(
+        ptr);
+  }
+}
+
+template <int ContiguousWords>
+CUTLASS_DEVICE uint32_t qword_from_vector(
+    typename QwordVector<ContiguousWords>::Type const& words, int c) {
+  static_assert(ContiguousWords == 1 || ContiguousWords == 2 ||
+                    ContiguousWords == 4,
+                "SM70 qword vector access supports 1, 2, or 4 words.");
+  if constexpr (ContiguousWords == 1) {
+    return words;
+  } else {
+    uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
+    return words_ptr[c];
+  }
+}
+
 CUTLASS_DEVICE uint32_t qword_from_vector(uint4 const& words, int c) {
   uint32_t const* words_ptr = reinterpret_cast<uint32_t const*>(&words);
   return words_ptr[c];

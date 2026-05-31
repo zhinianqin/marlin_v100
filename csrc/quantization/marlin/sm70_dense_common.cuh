@@ -12,8 +12,6 @@
 namespace marlin::sm70_dense {
 
 constexpr int kCtaK = 32;
-constexpr int kDefaultCtaM = 128;
-constexpr int kDefaultWarps = 8;
 constexpr int kQuantTileK = 16;
 constexpr int kQuantTileN = 64;
 
@@ -169,20 +167,88 @@ inline int sm70_dense_auto_cta_n(int64_t size_n) {
   return 0;
 }
 
+inline int sm70_dense_auto_cta_m(int64_t size_m, int auto_cta_n) {
+  if (auto_cta_n == 64) {
+    if (size_m >= 256) {
+      return 256;
+    }
+    if (size_m >= 128) {
+      return 128;
+    }
+    return 64;
+  }
+  if (auto_cta_n == 128) {
+    if (size_m >= 256) {
+      return 256;
+    }
+    if (size_m >= 128) {
+      return 128;
+    }
+    if (size_m >= 64) {
+      return 64;
+    }
+    return 32;
+  }
+  if (auto_cta_n == 256) {
+    if (size_m >= 128) {
+      return 128;
+    }
+    if (size_m >= 64) {
+      return 64;
+    }
+    return 32;
+  }
+  TORCH_CHECK(false, "SM70 dense auto CTA_M requires CTA_N in {64, 128, 256}. "
+                     "Got CTA_N = ", auto_cta_n, ".");
+  return 0;
+}
+
+inline int sm70_dense_default_warps(int auto_cta_m, int auto_cta_n) {
+  if (auto_cta_n == 64) {
+    if (auto_cta_m == 64) {
+      return 4;
+    }
+    if (auto_cta_m == 128 || auto_cta_m == 256) {
+      return 8;
+    }
+  } else if (auto_cta_n == 128) {
+    if (auto_cta_m == 32) {
+      return 4;
+    }
+    if (auto_cta_m == 64 || auto_cta_m == 128 || auto_cta_m == 256) {
+      return 8;
+    }
+  } else if (auto_cta_n == 256) {
+    if (auto_cta_m == 32) {
+      return 4;
+    }
+    if (auto_cta_m == 64 || auto_cta_m == 128) {
+      return 8;
+    }
+  }
+  TORCH_CHECK(false, "SM70 dense auto CTA default warps has no supported "
+                     "geometry for CTA_M=", auto_cta_m,
+                     ", CTA_N=", auto_cta_n, ".");
+  return 0;
+}
+
 inline Sm70DenseCtaGeometry resolve_sm70_dense_cta_geometry(
-    char const* env_name, int64_t size_n) {
+    char const* env_name, int64_t size_m, int64_t size_n) {
   int const auto_cta_n = sm70_dense_auto_cta_n(size_n);
+  int const auto_cta_m = sm70_dense_auto_cta_m(size_m, auto_cta_n);
   char const* env = std::getenv(env_name);
   if (env == nullptr || env[0] == '\0') {
-    return {kDefaultCtaM, auto_cta_n, kDefaultWarps};
+    return {auto_cta_m, auto_cta_n,
+            sm70_dense_default_warps(auto_cta_m, auto_cta_n)};
   }
 
   Sm70DenseCtaGeometry geometry = parse_sm70_dense_cta_geometry(env_name);
-  TORCH_CHECK(geometry.cta_n == auto_cta_n, env_name,
-              " specifies CTA_N=", geometry.cta_n, " but size_n=", size_n,
-              " requires auto CTA_N=", auto_cta_n,
-              ". CTA_N is selected from 256, 128, and 64 and is not a free "
-              "SM70 dense tuning parameter.");
+  TORCH_CHECK(geometry.cta_m == auto_cta_m && geometry.cta_n == auto_cta_n,
+              env_name, " specifies CTA_M=", geometry.cta_m, ", CTA_N=",
+              geometry.cta_n, " but size_m=", size_m, ", size_n=", size_n,
+              " requires auto CTA_M=", auto_cta_m, ", auto CTA_N=",
+              auto_cta_n, ". CTA_M and CTA_N are selected automatically and "
+              "are not free SM70 dense tuning parameters.");
   return geometry;
 }
 

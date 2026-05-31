@@ -36,6 +36,7 @@ using marlin::sm70_dense::kQuantTileK;
 using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
 using marlin::sm70_dense::parse_sm70_dense_split_k;
+using marlin::sm70_dense::load_qword_vector;
 using marlin::sm70_dense::qword_from_vector;
 using marlin::sm70_dense::sm70_dense_active_split_k;
 using marlin::sm70_dense::sm70_dense_auto_cta_n;
@@ -324,6 +325,11 @@ class Sm70MoeU4ZpIteratorB {
   static_assert(ThreadMap::kElementsPerAccess == kU4ValuesPerWord,
                 "SM70 MoE U4 IteratorB expects one packed int4 word per "
                 "access.");
+  static_assert(ThreadMap::Iterations::kStrided == 1 ||
+                    ThreadMap::Iterations::kStrided == 2,
+                "SM70 U4-family IteratorB expects one or two strided iterations.");
+  static constexpr int kStridedQweightDeltaWords =
+      32 * (Shape::kN / kQuantTileN);
 
   struct Params {
     int size_k;
@@ -538,8 +544,8 @@ class Sm70MoeU4ZpIteratorB {
   void load_cta_n_aligned(Fragment& frag) const {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
-        uint4 const qwords =
-            *reinterpret_cast<uint4 const*>(qweight_ + qweight_base_offset_);
+        auto const qwords =
+            load_qword_vector<4>(qweight_ + qweight_base_offset_);
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -560,8 +566,8 @@ class Sm70MoeU4ZpIteratorB {
           frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
         }
       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
-        uint2 const qwords =
-            *reinterpret_cast<uint2 const*>(qweight_ + qweight_base_offset_);
+        auto const qwords =
+            load_qword_vector<2>(qweight_ + qweight_base_offset_);
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -584,7 +590,7 @@ class Sm70MoeU4ZpIteratorB {
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
                       "Unsupported SM70 MoE U4 contiguous iteration count.");
-        uint32_t const qword = qweight_[qweight_base_offset_];
+        uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_offset_);
         half2 const* scale_vec = cached_scales_;
         half2 const* zp_vec = cached_zp_;
 
@@ -600,11 +606,14 @@ class Sm70MoeU4ZpIteratorB {
         frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
       }
     } else {
+      int const qweight_base = qweight_offset(0, 0);
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+        int const qweight_base_s =
+            qweight_base + s * kStridedQweightDeltaWords;
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
-          uint4 const qwords =
-              *reinterpret_cast<uint4 const*>(qweight_ + qweight_offset(s, 0));
+          auto const qwords =
+              load_qword_vector<4>(qweight_ + qweight_base_s);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -626,8 +635,8 @@ class Sm70MoeU4ZpIteratorB {
             frag_vec[3] = __hmul2(__hsub2(deq[1], zp_vec[3]), scale_vec[3]);
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
-          uint2 const qwords =
-              *reinterpret_cast<uint2 const*>(qweight_ + qweight_offset(s, 0));
+          auto const qwords =
+              load_qword_vector<2>(qweight_ + qweight_base_s);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -651,7 +660,7 @@ class Sm70MoeU4ZpIteratorB {
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
                         "Unsupported SM70 MoE U4 contiguous iteration count.");
-          uint32_t const qword = qweight_[qweight_offset(s, 0)];
+          uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_s);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
           half2 const* scale_vec = cached_scales_;

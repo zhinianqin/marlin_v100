@@ -39,6 +39,7 @@ using marlin::sm70_dense::kQuantTileN;
 using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
 using marlin::sm70_dense::resolve_sm70_dense_cta_geometry;
 using marlin::sm70_dense::parse_sm70_dense_split_k;
+using marlin::sm70_dense::load_qword_vector;
 using marlin::sm70_dense::qword_from_vector;
 using marlin::sm70_dense::sm70_dense_active_split_k;
 using marlin::sm70_dense::sm70_dense_get_splitk_ctmp;
@@ -118,6 +119,11 @@ class Sm70Mxfp4IteratorB {
   static_assert(ThreadMap::kElementsPerAccess == kMxfp4ValuesPerWord,
                 "The SM70 MXFP4 IteratorB expects one packed FP4 word per "
                 "access.");
+  static_assert(ThreadMap::Iterations::kStrided == 1 ||
+                    ThreadMap::Iterations::kStrided == 2,
+                "SM70 U4-family IteratorB expects one or two strided iterations.");
+  static constexpr int kStridedQweightDeltaWords =
+      32 * (Shape::kN / kQuantTileN);
 
   struct Params {
     int size_n;
@@ -245,8 +251,8 @@ class Sm70Mxfp4IteratorB {
   void load_cta_n_aligned(Fragment& frag) const {
     if constexpr (ThreadMap::Iterations::kStrided == 1) {
       if constexpr (ThreadMap::Iterations::kContiguous == 4) {
-        uint4 const qwords =
-            *reinterpret_cast<uint4 const*>(qweight_ + qweight_base_offset_);
+        auto const qwords =
+            load_qword_vector<4>(qweight_ + qweight_base_offset_);
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -266,8 +272,8 @@ class Sm70Mxfp4IteratorB {
           frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
         }
       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
-        uint2 const qwords =
-            *reinterpret_cast<uint2 const*>(qweight_ + qweight_base_offset_);
+        auto const qwords =
+            load_qword_vector<2>(qweight_ + qweight_base_offset_);
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -289,7 +295,7 @@ class Sm70Mxfp4IteratorB {
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
                       "Unsupported SM70 MXFP4 contiguous iteration count.");
-        uint32_t const qword = qweight_[qweight_base_offset_];
+        uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_offset_);
         half2 const* scale_vec = cached_scales_;
 
         half2 deq[2];
@@ -304,11 +310,14 @@ class Sm70Mxfp4IteratorB {
         frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
       }
     } else {
+      int const qweight_base = qweight_offset(0, 0);
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+        int const qweight_base_s =
+            qweight_base + s * kStridedQweightDeltaWords;
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
-          uint4 const qwords =
-              *reinterpret_cast<uint4 const*>(qweight_ + qweight_offset(s, 0));
+          auto const qwords =
+              load_qword_vector<4>(qweight_ + qweight_base_s);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -329,8 +338,8 @@ class Sm70Mxfp4IteratorB {
             frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
-          uint2 const qwords =
-              *reinterpret_cast<uint2 const*>(qweight_ + qweight_offset(s, 0));
+          auto const qwords =
+              load_qword_vector<2>(qweight_ + qweight_base_s);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -353,7 +362,7 @@ class Sm70Mxfp4IteratorB {
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
                         "Unsupported SM70 MXFP4 contiguous iteration count.");
-          uint32_t const qword = qweight_[qweight_offset(s, 0)];
+          uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_s);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
           half2 const* scale_vec = cached_scales_;
@@ -657,7 +666,7 @@ torch::Tensor sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
 
   char const* env_name = "SM70_MARLIN_MXFP4_CTA";
   Sm70DenseCtaGeometry const geometry =
-      resolve_sm70_dense_cta_geometry(env_name, size_n);
+      resolve_sm70_dense_cta_geometry(env_name, size_m, size_n);
   check_sm70_dense_cta_geometry(env_name, geometry);
   check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
   int const split_k = parse_sm70_dense_split_k(kSm70MarlinMxfp4SplitKEnv);
