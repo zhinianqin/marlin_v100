@@ -15,16 +15,16 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/functional.h"
-#include "quantization/marlin/sm70_dense_common.cuh"
+#include "quantization/marlin/sm70_marlin_common.cuh"
 
-namespace marlin::sm70_dense {
+namespace marlin::sm70 {
 
-struct Sm70DenseSplitKPartition {
+struct Sm70SplitKPartition {
   int k_begin;
   int partition_k;
 };
 
-inline int parse_sm70_dense_split_k(char const* env_name) {
+inline int parse_sm70_split_k(char const* env_name) {
   char const* env = std::getenv(env_name);
   if (env == nullptr || env[0] == '\0') {
     return 1;
@@ -38,7 +38,7 @@ inline int parse_sm70_dense_split_k(char const* env_name) {
   return 1;
 }
 
-inline torch::Tensor sm70_dense_get_splitk_ctmp(
+inline torch::Tensor sm70_get_splitk_ctmp(
     std::optional<torch::Tensor> const& c_tmp_or_none, torch::Device device,
     int64_t required_numel) {
   if (!c_tmp_or_none.has_value()) {
@@ -59,21 +59,21 @@ inline torch::Tensor sm70_dense_get_splitk_ctmp(
 }
 
 CUTLASS_HOST_DEVICE
-int sm70_dense_ceil_div_int(int numerator, int denominator) {
+int sm70_splitk_ceil_div_int(int numerator, int denominator) {
   return (numerator + denominator - 1) / denominator;
 }
 
 CUTLASS_HOST_DEVICE
-int sm70_dense_min_int(int lhs, int rhs) {
+int sm70_splitk_min_int(int lhs, int rhs) {
   return lhs < rhs ? lhs : rhs;
 }
 
 template <int GroupSize>
-CUTLASS_HOST_DEVICE int sm70_dense_splitk_group_tiles() {
+CUTLASS_HOST_DEVICE int sm70_splitk_group_tiles() {
   if constexpr (GroupSize > 0) {
     if constexpr (GroupSize >= kCtaK) {
       static_assert(GroupSize % kCtaK == 0,
-                    "SM70 dense split-K group size must be CTA_K aligned.");
+                    "SM70 Marlin split-K group size must be CTA_K aligned.");
       return GroupSize / kCtaK;
     } else {
       return 1;
@@ -84,18 +84,18 @@ CUTLASS_HOST_DEVICE int sm70_dense_splitk_group_tiles() {
 }
 
 CUTLASS_HOST_DEVICE
-int sm70_dense_active_split_k(int k, int requested_split_k) {
+int sm70_active_split_k(int k, int requested_split_k) {
   int const total_tiles = k / kCtaK;
   if (total_tiles <= 0) {
     return 0;
   }
-  return sm70_dense_min_int(requested_split_k, total_tiles);
+  return sm70_splitk_min_int(requested_split_k, total_tiles);
 }
 
 CUTLASS_HOST_DEVICE
-int sm70_dense_partition_tile_count(int remaining_tiles,
-                                    int remaining_partitions,
-                                    int group_tiles) {
+int sm70_splitk_partition_tile_count(int remaining_tiles,
+                                     int remaining_partitions,
+                                     int group_tiles) {
   if (remaining_tiles <= 0 || remaining_partitions <= 0) {
     return 0;
   }
@@ -104,44 +104,44 @@ int sm70_dense_partition_tile_count(int remaining_tiles,
   }
 
   int const target_tiles =
-      sm70_dense_ceil_div_int(remaining_tiles, remaining_partitions);
+      sm70_splitk_ceil_div_int(remaining_tiles, remaining_partitions);
   int const max_current_tiles = remaining_tiles - (remaining_partitions - 1);
   int partition_tiles = target_tiles;
   if (group_tiles > 1) {
     int const rounded_tiles =
-        sm70_dense_ceil_div_int(partition_tiles, group_tiles) * group_tiles;
+        sm70_splitk_ceil_div_int(partition_tiles, group_tiles) * group_tiles;
     if (rounded_tiles <= max_current_tiles) {
       partition_tiles = rounded_tiles;
     }
   }
-  return sm70_dense_min_int(partition_tiles, max_current_tiles);
+  return sm70_splitk_min_int(partition_tiles, max_current_tiles);
 }
 
 template <int GroupSize>
-CUTLASS_HOST_DEVICE Sm70DenseSplitKPartition sm70_dense_splitk_partition(
+CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
     int k, int split_k, int partition_idx) {
-  int const active_split_k = sm70_dense_active_split_k(k, split_k);
+  int const active_split_k = sm70_active_split_k(k, split_k);
   if (partition_idx >= active_split_k) {
     return {0, 0};
   }
 
-  int const group_tiles = sm70_dense_splitk_group_tiles<GroupSize>();
+  int const group_tiles = sm70_splitk_group_tiles<GroupSize>();
   int remaining_tiles = k / kCtaK;
   int start_tiles = 0;
   for (int idx = 0; idx < partition_idx; ++idx) {
-    int const partition_tiles = sm70_dense_partition_tile_count(
+    int const partition_tiles = sm70_splitk_partition_tile_count(
         remaining_tiles, active_split_k - idx, group_tiles);
     start_tiles += partition_tiles;
     remaining_tiles -= partition_tiles;
   }
 
-  int const partition_tiles = sm70_dense_partition_tile_count(
+  int const partition_tiles = sm70_splitk_partition_tile_count(
       remaining_tiles, active_split_k - partition_idx, group_tiles);
   return {start_tiles * kCtaK, partition_tiles * kCtaK};
 }
 
 template <typename Traits>
-class Sm70DenseAtomicFp32Epilogue {
+class Sm70AtomicFp32Epilogue {
  public:
   using CutlassEpilogue = typename Traits::Epilogue;
   using SharedStorage = typename CutlassEpilogue::Base::SharedStorage;
@@ -207,7 +207,7 @@ class Sm70DenseAtomicFp32Epilogue {
 
  public:
   CUTLASS_DEVICE
-  Sm70DenseAtomicFp32Epilogue(SharedStorage& shared_storage, int thread_idx,
+  Sm70AtomicFp32Epilogue(SharedStorage& shared_storage, int thread_idx,
                               int warp_idx, int lane_idx)
       : warp_tile_iterator_(shared_storage.reference(), lane_idx),
         shared_load_iterator_(shared_storage.reference(), thread_idx) {
@@ -267,7 +267,7 @@ class Sm70DenseAtomicFp32Epilogue {
   }
 };
 
-static __global__ void sm70_dense_fp32_to_fp16_kernel(
+static __global__ void sm70_fp32_to_fp16_kernel(
     float const* __restrict__ c_tmp, cutlass::half_t* __restrict__ c,
     int64_t numel) {
   int64_t const base =
@@ -290,7 +290,7 @@ static __global__ void sm70_dense_fp32_to_fp16_kernel(
   }
 }
 
-inline void launch_sm70_dense_fp32_to_fp16(float const* c_tmp,
+inline void launch_sm70_fp32_to_fp16(float const* c_tmp,
                                            cutlass::half_t* c,
                                            int64_t numel,
                                            cudaStream_t stream) {
@@ -298,8 +298,8 @@ inline void launch_sm70_dense_fp32_to_fp16(float const* c_tmp,
   dim3 convert_grid(static_cast<unsigned>(
       (numel + int64_t(convert_block.x) * 4 - 1) /
       (int64_t(convert_block.x) * 4)));
-  sm70_dense_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream>>>(
+  sm70_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream>>>(
       c_tmp, c, numel);
 }
 
-}  // namespace marlin::sm70_dense
+}  // namespace marlin::sm70

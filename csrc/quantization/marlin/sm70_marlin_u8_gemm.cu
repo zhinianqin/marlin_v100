@@ -1,9 +1,9 @@
 #include "core/registration.h"
 #include "quantization/marlin/dequant.h"
-#include "quantization/marlin/sm70_dense_common.cuh"
-#include "quantization/marlin/sm70_dense_gemm.cuh"
-#include "quantization/marlin/sm70_dense_iterator_utils.cuh"
-#include "quantization/marlin/sm70_dense_splitk.cuh"
+#include "quantization/marlin/sm70_marlin_common.cuh"
+#include "quantization/marlin/sm70_marlin_gemm.cuh"
+#include "quantization/marlin/sm70_marlin_iterator_utils.cuh"
+#include "quantization/marlin/sm70_marlin_splitk.cuh"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -24,28 +24,28 @@
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 
-using marlin::sm70_dense::Sm70DenseCtaGeometry;
-using marlin::sm70_dense::Sm70DenseAtomicFp32Epilogue;
-using marlin::sm70_dense::Sm70DenseGemmTraits;
-using marlin::sm70_dense::Sm70DenseSplitKPartition;
-using marlin::sm70_dense::check_sm70_dense_cta_geometry;
-using marlin::sm70_dense::check_sm70_dense_n_tile_alignment;
-using marlin::sm70_dense::configure_dynamic_smem;
-using marlin::sm70_dense::cta_grid;
-using marlin::sm70_dense::dispatch_geometry;
-using marlin::sm70_dense::kCtaK;
-using marlin::sm70_dense::kQuantTileK;
-using marlin::sm70_dense::kQuantTileN;
-using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
-using marlin::sm70_dense::resolve_sm70_dense_cta_geometry;
-using marlin::sm70_dense::parse_sm70_dense_split_k;
-using marlin::sm70_dense::load_qword_vector;
-using marlin::sm70_dense::qword_from_vector;
-using marlin::sm70_dense::sm70_dense_active_split_k;
-using marlin::sm70_dense::sm70_dense_get_splitk_ctmp;
-using marlin::sm70_dense::sm70_dense_splitk_partition;
-using marlin::sm70_dense::u8_cta_n_qweight_offset_from_logical;
-using marlin::sm70_dense::u8_cta_n_qweight_word_stride_from_logical;
+using marlin::sm70::Sm70CtaGeometry;
+using marlin::sm70::Sm70AtomicFp32Epilogue;
+using marlin::sm70::Sm70MarlinGemmTraits;
+using marlin::sm70::Sm70SplitKPartition;
+using marlin::sm70::check_sm70_marlin_cta_geometry;
+using marlin::sm70::check_sm70_marlin_n_tile_alignment;
+using marlin::sm70::configure_sm70_dynamic_smem;
+using marlin::sm70::dispatch_sm70_marlin_geometry;
+using marlin::sm70::kCtaK;
+using marlin::sm70::kQuantTileK;
+using marlin::sm70::kQuantTileN;
+using marlin::sm70::launch_sm70_fp32_to_fp16;
+using marlin::sm70::resolve_sm70_marlin_cta_geometry;
+using marlin::sm70::parse_sm70_split_k;
+using marlin::sm70::load_qword_vector;
+using marlin::sm70::qword_from_vector;
+using marlin::sm70::sm70_marlin_cta_grid;
+using marlin::sm70::sm70_active_split_k;
+using marlin::sm70::sm70_get_splitk_ctmp;
+using marlin::sm70::sm70_splitk_partition;
+using marlin::sm70::u8_cta_n_qweight_offset_from_logical;
+using marlin::sm70::u8_cta_n_qweight_word_stride_from_logical;
 
 namespace {
 
@@ -187,7 +187,7 @@ class Sm70U8ZpIteratorB {
     } else {
       static_assert(kGroupSize == 32 || kGroupSize == 64 ||
                         kGroupSize == 128,
-                    "SM70 kU8 prototype only specializes group sizes "
+                    "SM70 Marlin U8 supports only group sizes "
                     "-1, 32, 64, and 128.");
       return logical_k / kGroupSize;
     }
@@ -449,7 +449,7 @@ struct Sm70U8ZpGemmSpec {
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 using Sm70U8ZpGemmTraits =
-    Sm70DenseGemmTraits<Sm70U8ZpGemmSpec, CtaM, CtaN, Warps, GroupSize>;
+    Sm70MarlinGemmTraits<Sm70U8ZpGemmSpec, CtaM, CtaN, Warps, GroupSize>;
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 __global__ __launch_bounds__(Warps * 32, 1)
@@ -518,7 +518,7 @@ void sm70_marlin_u8_gemm_splitk_kernel(
     float* __restrict__ c_tmp, int m, int n, int k, int lda, int split_k) {
   using Traits = Sm70U8ZpGemmTraits<CtaM, CtaN, Warps, GroupSize>;
   using Mma = typename Traits::Mma;
-  using AtomicEpilogue = Sm70DenseAtomicFp32Epilogue<Traits>;
+  using AtomicEpilogue = Sm70AtomicFp32Epilogue<Traits>;
 
   extern __shared__ char smem[];
   auto& shared_storage =
@@ -527,8 +527,8 @@ void sm70_marlin_u8_gemm_splitk_kernel(
   int const thread_idx = threadIdx.x;
   int const warp_idx = cutlass::canonical_warp_idx_sync();
   int const lane_idx = threadIdx.x % 32;
-  Sm70DenseSplitKPartition const partition =
-      sm70_dense_splitk_partition<GroupSize>(k, split_k, int(blockIdx.z));
+  Sm70SplitKPartition const partition =
+      sm70_splitk_partition<GroupSize>(k, split_k, int(blockIdx.z));
   if (partition.partition_k == 0) {
     return;
   }
@@ -581,13 +581,13 @@ torch::Tensor launch_sm70_marlin_u8_gemm(
       sm70_marlin_u8_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
   using SharedStorage = typename Sm70U8ZpGemmTraits<
       CtaM, CtaN, Warps, GroupSize>::SharedStorage;
-  size_t smem_bytes = configure_dynamic_smem<SharedStorage>(kernel);
+  size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
 
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
   if (split_k == 1) {
-    dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
+    dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
     kernel<<<grid, block, smem_bytes, stream>>>(
         reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
         reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
@@ -606,18 +606,18 @@ torch::Tensor launch_sm70_marlin_u8_gemm(
 
   auto split_kernel =
       sm70_marlin_u8_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
-  smem_bytes = configure_dynamic_smem<SharedStorage>(split_kernel);
+  smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * size_n;
   auto c_tmp =
-      sm70_dense_get_splitk_ctmp(c_tmp_or_none, a.device(), numel);
+      sm70_get_splitk_ctmp(c_tmp_or_none, a.device(), numel);
   C10_CUDA_CHECK(cudaMemsetAsync(
       c_tmp.data_ptr<float>(), 0,
       static_cast<size_t>(numel) * sizeof(float), stream));
 
-  dim3 grid = cta_grid(size_m, size_n, CtaM, CtaN);
+  dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
-      sm70_dense_active_split_k(static_cast<int>(size_k), split_k);
+      sm70_active_split_k(static_cast<int>(size_k), split_k);
   grid.z = static_cast<unsigned>(active_split_k);
   split_kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
@@ -629,7 +629,7 @@ torch::Tensor launch_sm70_marlin_u8_gemm(
       static_cast<int>(size_k), static_cast<int>(a.stride(0)), split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  launch_sm70_dense_fp32_to_fp16(
+  launch_sm70_fp32_to_fp16(
       c_tmp.data_ptr<float>(),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()), numel,
       stream);
@@ -668,14 +668,14 @@ torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
   c10::cuda::CUDAGuard device_guard(a.device());
 
   char const* env_name = "SM70_MARLIN_U8_CTA";
-  Sm70DenseCtaGeometry const geometry =
-      resolve_sm70_dense_cta_geometry(env_name, size_m, size_n);
-  check_sm70_dense_cta_geometry(env_name, geometry);
-  check_sm70_dense_n_tile_alignment(env_name, geometry, size_n);
-  int const split_k = parse_sm70_dense_split_k(kSm70MarlinU8SplitKEnv);
+  Sm70CtaGeometry const geometry =
+      resolve_sm70_marlin_cta_geometry(env_name, size_m, size_n);
+  check_sm70_marlin_cta_geometry(env_name, geometry);
+  check_sm70_marlin_n_tile_alignment(env_name, geometry, size_n);
+  int const split_k = parse_sm70_split_k(kSm70MarlinU8SplitKEnv);
   Sm70U8Launcher const launcher{
       a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, split_k,
       c_tmp_or_none};
-  return dispatch_geometry(launcher, geometry, size_n, size_k, group_size,
-                           "uint8");
+  return dispatch_sm70_marlin_geometry(launcher, geometry, size_n, size_k,
+                                       group_size, "uint8");
 }

@@ -5,9 +5,9 @@
 #include <cstdint>
 
 #include "cutlass/cutlass.h"
-#include "quantization/marlin/sm70_dense_common.cuh"
+#include "quantization/marlin/sm70_marlin_common.cuh"
 
-namespace marlin::sm70_dense {
+namespace marlin::sm70 {
 
 template <int ContiguousWords>
 struct QwordVector;
@@ -70,7 +70,7 @@ CUTLASS_DEVICE int u4_cta_n_qweight_offset_from_logical(int size_n,
                                                         int logical_k,
                                                         int logical_n) {
   static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 dense CTA_N must be 64, 128, or 256.");
+                "SM70 Marlin CTA_N must be 64, 128, or 256.");
   constexpr int kGroupTiles = CtaN / kQuantTileN;
   int const k_tile = logical_k / kQuantTileK;
   int const local_k = logical_k - k_tile * kQuantTileK;
@@ -91,7 +91,7 @@ CUTLASS_DEVICE int u8_cta_n_qweight_offset_from_logical(int size_n,
                                                         int logical_k,
                                                         int logical_n) {
   static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 dense CTA_N must be 64, 128, or 256.");
+                "SM70 Marlin CTA_N must be 64, 128, or 256.");
   constexpr int kGroupTiles = CtaN / kQuantTileN;
   int const k_tile = logical_k / kQuantTileK;
   int const local_k = logical_k - k_tile * kQuantTileK;
@@ -110,8 +110,8 @@ CUTLASS_DEVICE int u8_cta_n_qweight_offset_from_logical(int size_n,
 template <int CtaN>
 CUTLASS_DEVICE int u8_cta_n_qweight_word_stride_from_logical() {
   static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 dense CTA_N must be 64, 128, or 256.");
+                "SM70 Marlin CTA_N must be 64, 128, or 256.");
   return CtaN / kQuantTileN;
 }
 
-}  // namespace marlin::sm70_dense
+}  // namespace marlin::sm70

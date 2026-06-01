@@ -15,18 +15,18 @@
 #include "cutlass/gemm/threadblock/mma_pipelined.h"
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
-#include "quantization/marlin/sm70_dense_common.cuh"
+#include "quantization/marlin/sm70_marlin_common.cuh"
 
-namespace marlin::sm70_dense {
+namespace marlin::sm70 {
 
 template <typename Spec, int CtaM, int CtaN, int Warps, int GroupSize>
-struct Sm70DenseGemmTraits {
+struct Sm70MarlinGemmTraits {
   static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
-                "SM70 dense supports CTA_M in {32, 64, 128, 256}.");
+                "SM70 Marlin supports CTA_M in {32, 64, 128, 256}.");
   static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 dense supports CTA_N in {64, 128, 256}.");
+                "SM70 Marlin supports CTA_N in {64, 128, 256}.");
   static_assert(Warps == 4 || Warps == 8,
-                "SM70 dense supports 4 or 8 warps.");
+                "SM70 Marlin supports 4 or 8 warps.");
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
@@ -35,16 +35,16 @@ struct Sm70DenseGemmTraits {
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
   using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, kCtaK>;
-  using WarpShape = typename Sm70DenseWarpShape<CtaM, CtaN, Warps>::Type;
+  using WarpShape = typename Sm70WarpShape<CtaM, CtaN, Warps>::Type;
   static_assert(WarpShape::kM <= 64 && WarpShape::kN <= 64,
-                "SM70 dense keeps per-warp M/N no larger than 64.");
+                "SM70 Marlin keeps per-warp M/N no larger than 64.");
   using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
   using MmaCore = cutlass::gemm::threadblock::DefaultMmaCore<
       ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
       ElementB, LayoutB, ElementAccumulator, LayoutC,
       cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
   static_assert(MmaCore::kThreads == Warps * 32,
-                "SM70 dense launch threads must match CUTLASS warp count.");
+                "SM70 Marlin launch threads must match CUTLASS warp count.");
   using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
       cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
       ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
@@ -63,7 +63,7 @@ struct Sm70DenseGemmTraits {
           cutlass::sizeof_bits<ElementB>::value>;
   using ActualSmemLayoutB = typename Mma::SmemIteratorB::Layout;
   static_assert(std::is_same<ActualSmemLayoutB, ExpectedSmemLayoutB>::value,
-                "SM70 dense B operand must use CUTLASS' predefined Volta "
+                "SM70 Marlin B operand must use CUTLASS' predefined Volta "
                 "B-congruous shared-memory layout.");
   static int const kPartitionsK = ThreadblockShape::kK / WarpShape::kK;
   using Epilogue =
@@ -78,7 +78,7 @@ struct Sm70DenseGemmTraits {
 };
 
 template <typename SharedStorage, typename Kernel>
-inline size_t configure_dynamic_smem(Kernel kernel) {
+inline size_t configure_sm70_dynamic_smem(Kernel kernel) {
   size_t smem_bytes = sizeof(SharedStorage);
   if (smem_bytes >= (48u << 10)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -88,15 +88,16 @@ inline size_t configure_dynamic_smem(Kernel kernel) {
   return smem_bytes;
 }
 
-inline dim3 cta_grid(int64_t size_m, int64_t size_n, int cta_m, int cta_n) {
+inline dim3 sm70_marlin_cta_grid(int64_t size_m, int64_t size_n, int cta_m,
+                                 int cta_n) {
   return dim3(static_cast<unsigned>((size_m + cta_m - 1) / cta_m),
               static_cast<unsigned>(size_n / cta_n));
 }
 
 template <int CtaM, int CtaN, int Warps, typename Launcher>
-torch::Tensor dispatch_group_size(Launcher const& launcher,
-                                  int64_t group_size,
-                                  char const* quant_name) {
+torch::Tensor dispatch_sm70_marlin_group_size(Launcher const& launcher,
+                                              int64_t group_size,
+                                              char const* quant_name) {
   switch (group_size) {
     case -1:
       return launcher.template operator()<CtaM, CtaN, Warps, -1>();
@@ -108,46 +109,47 @@ torch::Tensor dispatch_group_size(Launcher const& launcher,
       return launcher.template operator()<CtaM, CtaN, Warps, 128>();
     default:
       TORCH_CHECK(false, "SM70 CUTLASS ", quant_name,
-                  " prototype supports only group_size -1, 32, 64, or 128. "
-                  "Got ",
+                  " supports only group_size -1, 32, 64, or 128. Got ",
                   group_size);
   }
   return torch::Tensor();
 }
 
 template <typename Launcher>
-torch::Tensor dispatch_geometry(Launcher const& launcher,
-                                Sm70DenseCtaGeometry geometry,
-                                int64_t /*size_n*/, int64_t /*size_k*/,
-                                int64_t group_size,
-                                char const* quant_name) {
-#define DISPATCH_SM70_DENSE_CTA(CM, CN, W)                               \
+torch::Tensor dispatch_sm70_marlin_geometry(Launcher const& launcher,
+                                            Sm70CtaGeometry geometry,
+                                            int64_t /*size_n*/,
+                                            int64_t /*size_k*/,
+                                            int64_t group_size,
+                                            char const* quant_name) {
+#define DISPATCH_SM70_MARLIN_CTA(CM, CN, W)                              \
   if (geometry.cta_m == CM && geometry.cta_n == CN &&                     \
       geometry.warps == W) {                                              \
-    return dispatch_group_size<CM, CN, W>(launcher, group_size,            \
-                                          quant_name);                     \
+    return dispatch_sm70_marlin_group_size<CM, CN, W>(launcher,            \
+                                                       group_size,         \
+                                                       quant_name);        \
   }
 
-  DISPATCH_SM70_DENSE_CTA(32, 128, 4)
-  DISPATCH_SM70_DENSE_CTA(32, 256, 4)
-  DISPATCH_SM70_DENSE_CTA(64, 64, 4)
-  DISPATCH_SM70_DENSE_CTA(64, 128, 4)
-  DISPATCH_SM70_DENSE_CTA(64, 128, 8)
-  DISPATCH_SM70_DENSE_CTA(64, 256, 4)
-  DISPATCH_SM70_DENSE_CTA(64, 256, 8)
-  DISPATCH_SM70_DENSE_CTA(128, 64, 4)
-  DISPATCH_SM70_DENSE_CTA(128, 64, 8)
-  DISPATCH_SM70_DENSE_CTA(128, 128, 4)
-  DISPATCH_SM70_DENSE_CTA(128, 128, 8)
-  DISPATCH_SM70_DENSE_CTA(128, 256, 8)
-  DISPATCH_SM70_DENSE_CTA(256, 64, 4)
-  DISPATCH_SM70_DENSE_CTA(256, 64, 8)
-  DISPATCH_SM70_DENSE_CTA(256, 128, 8)
+  DISPATCH_SM70_MARLIN_CTA(32, 128, 4)
+  DISPATCH_SM70_MARLIN_CTA(32, 256, 4)
+  DISPATCH_SM70_MARLIN_CTA(64, 64, 4)
+  DISPATCH_SM70_MARLIN_CTA(64, 128, 4)
+  DISPATCH_SM70_MARLIN_CTA(64, 128, 8)
+  DISPATCH_SM70_MARLIN_CTA(64, 256, 4)
+  DISPATCH_SM70_MARLIN_CTA(64, 256, 8)
+  DISPATCH_SM70_MARLIN_CTA(128, 64, 4)
+  DISPATCH_SM70_MARLIN_CTA(128, 64, 8)
+  DISPATCH_SM70_MARLIN_CTA(128, 128, 4)
+  DISPATCH_SM70_MARLIN_CTA(128, 128, 8)
+  DISPATCH_SM70_MARLIN_CTA(128, 256, 8)
+  DISPATCH_SM70_MARLIN_CTA(256, 64, 4)
+  DISPATCH_SM70_MARLIN_CTA(256, 64, 8)
+  DISPATCH_SM70_MARLIN_CTA(256, 128, 8)
 
-#undef DISPATCH_SM70_DENSE_CTA
+#undef DISPATCH_SM70_MARLIN_CTA
 
   TORCH_CHECK(false, "Unreachable SM70 ", quant_name,
               " CTA geometry dispatch.");
 }
 
-}  // namespace marlin::sm70_dense
+}  // namespace marlin::sm70

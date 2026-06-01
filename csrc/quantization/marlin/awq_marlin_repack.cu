@@ -1,7 +1,7 @@
 #include "marlin.cuh"
 
 #include "core/registration.h"
-#include "quantization/marlin/sm70_dense_common.cuh"
+#include "quantization/marlin/sm70_marlin_common.cuh"
 
 namespace marlin {
 
@@ -367,7 +367,7 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(max_shared_mem > 0);
 
-  int const cta_n = marlin::sm70_dense::sm70_dense_auto_cta_n(size_n);
+  int const cta_n = marlin::sm70::sm70_marlin_auto_cta_n(size_n);
   if (cta_n == 64) {
     CALL_FOR_CTA(64);
   } else if (cta_n == 128) {

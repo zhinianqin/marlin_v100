@@ -1,9 +1,9 @@
 #include "core/registration.h"
 #include "quantization/marlin/dequant.h"
-#include "quantization/marlin/sm70_dense_common.cuh"
-#include "quantization/marlin/sm70_dense_gemm.cuh"
-#include "quantization/marlin/sm70_dense_iterator_utils.cuh"
-#include "quantization/marlin/sm70_dense_splitk.cuh"
+#include "quantization/marlin/sm70_marlin_common.cuh"
+#include "quantization/marlin/sm70_marlin_gemm.cuh"
+#include "quantization/marlin/sm70_marlin_iterator_utils.cuh"
+#include "quantization/marlin/sm70_marlin_splitk.cuh"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -26,22 +26,22 @@
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 
-using marlin::sm70_dense::Sm70DenseCtaGeometry;
-using marlin::sm70_dense::Sm70DenseSplitKPartition;
-using marlin::sm70_dense::Sm70DenseWarpShape;
-using marlin::sm70_dense::configure_dynamic_smem;
-using marlin::sm70_dense::kCtaK;
-using marlin::sm70_dense::kQuantTileK;
-using marlin::sm70_dense::kQuantTileN;
-using marlin::sm70_dense::launch_sm70_dense_fp32_to_fp16;
-using marlin::sm70_dense::parse_sm70_dense_split_k;
-using marlin::sm70_dense::load_qword_vector;
-using marlin::sm70_dense::qword_from_vector;
-using marlin::sm70_dense::sm70_dense_active_split_k;
-using marlin::sm70_dense::sm70_dense_auto_cta_n;
-using marlin::sm70_dense::sm70_dense_get_splitk_ctmp;
-using marlin::sm70_dense::sm70_dense_splitk_partition;
-using marlin::sm70_dense::u4_cta_n_qweight_offset_from_logical;
+using marlin::sm70::Sm70CtaGeometry;
+using marlin::sm70::Sm70SplitKPartition;
+using marlin::sm70::Sm70WarpShape;
+using marlin::sm70::configure_sm70_dynamic_smem;
+using marlin::sm70::kCtaK;
+using marlin::sm70::kQuantTileK;
+using marlin::sm70::kQuantTileN;
+using marlin::sm70::launch_sm70_fp32_to_fp16;
+using marlin::sm70::parse_sm70_split_k;
+using marlin::sm70::load_qword_vector;
+using marlin::sm70::qword_from_vector;
+using marlin::sm70::sm70_active_split_k;
+using marlin::sm70::sm70_marlin_auto_cta_n;
+using marlin::sm70::sm70_get_splitk_ctmp;
+using marlin::sm70::sm70_splitk_partition;
+using marlin::sm70::u4_cta_n_qweight_offset_from_logical;
 
 namespace marlin_moe_wna16 {
 namespace {
@@ -54,7 +54,7 @@ constexpr char const* kSupportedSm70MoeU4CtaGeometries =
     "32x128x4, 32x256x4, 64x64x4, 64x128x4, 64x128x8, "
     "64x256x4, and 64x256x8";
 
-Sm70DenseCtaGeometry parse_sm70_moe_cta_geometry(char const* env_name) {
+Sm70CtaGeometry parse_sm70_moe_cta_geometry(char const* env_name) {
   char const* env = std::getenv(env_name);
   TORCH_CHECK(env != nullptr && env[0] != '\0', env_name,
               " must use format CTA_MxCTA_NxWarps when explicitly parsed, "
@@ -80,7 +80,7 @@ Sm70DenseCtaGeometry parse_sm70_moe_cta_geometry(char const* env_name) {
   return {cta_m, cta_n, warps};
 }
 
-Sm70DenseCtaGeometry default_sm70_moe_cta_geometry(int auto_cta_n) {
+Sm70CtaGeometry sm70_moe_default_cta_geometry(int auto_cta_n) {
   switch (auto_cta_n) {
     case 64:
       return {64, 64, 4};
@@ -95,15 +95,15 @@ Sm70DenseCtaGeometry default_sm70_moe_cta_geometry(int auto_cta_n) {
   return {0, 0, 0};
 }
 
-Sm70DenseCtaGeometry resolve_sm70_moe_cta_geometry(char const* env_name,
+Sm70CtaGeometry resolve_sm70_moe_cta_geometry(char const* env_name,
                                                    int64_t size_n) {
-  int const auto_cta_n = sm70_dense_auto_cta_n(size_n);
+  int const auto_cta_n = sm70_marlin_auto_cta_n(size_n);
   char const* env = std::getenv(env_name);
   if (env == nullptr || env[0] == '\0') {
-    return default_sm70_moe_cta_geometry(auto_cta_n);
+    return sm70_moe_default_cta_geometry(auto_cta_n);
   }
 
-  Sm70DenseCtaGeometry geometry = parse_sm70_moe_cta_geometry(env_name);
+  Sm70CtaGeometry geometry = parse_sm70_moe_cta_geometry(env_name);
   TORCH_CHECK(geometry.cta_n == auto_cta_n, env_name,
               " specifies CTA_N=", geometry.cta_n, " but size_n=", size_n,
               " requires auto CTA_N=", auto_cta_n,
@@ -112,7 +112,7 @@ Sm70DenseCtaGeometry resolve_sm70_moe_cta_geometry(char const* env_name,
   return geometry;
 }
 
-bool sm70_moe_cta_geometry_supported(Sm70DenseCtaGeometry geometry) {
+bool sm70_moe_cta_geometry_is_supported(Sm70CtaGeometry geometry) {
   int const cta_m = geometry.cta_m;
   int const cta_n = geometry.cta_n;
   int const warps = geometry.warps;
@@ -126,16 +126,16 @@ bool sm70_moe_cta_geometry_supported(Sm70DenseCtaGeometry geometry) {
 }
 
 void check_sm70_moe_cta_geometry(char const* env_name,
-                                 Sm70DenseCtaGeometry geometry) {
-  TORCH_CHECK(sm70_moe_cta_geometry_supported(geometry), "Unsupported ",
+                                 Sm70CtaGeometry geometry) {
+  TORCH_CHECK(sm70_moe_cta_geometry_is_supported(geometry), "Unsupported ",
               env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
               geometry.warps, ". Supported geometries are ",
               kSupportedSm70MoeU4CtaGeometries, ".");
 }
 
-void check_sm70_moe_n_tile_alignment(char const* env_name,
-                                     Sm70DenseCtaGeometry geometry,
-                                     int64_t size_n) {
+void check_sm70_moe_cta_n_alignment(char const* env_name,
+                                    Sm70CtaGeometry geometry,
+                                    int64_t size_n) {
   TORCH_CHECK(
       size_n % geometry.cta_n == 0 && size_n % kQuantTileN == 0,
       "SM70 Marlin MoE uint4 CUTLASS path requires N alignment for ",
@@ -657,7 +657,13 @@ struct Sm70MoeU4ZpGemmSpec {
 };
 
 template <typename Spec, int CtaM, int CtaN, int Warps, int GroupSize>
-struct Sm70MoeGemmTraits {
+struct Sm70MarlinMoeGemmTraits {
+  static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
+                "SM70 MoE supports CTA_M in {32, 64, 128, 256}.");
+  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
+                "SM70 MoE supports CTA_N in {64, 128, 256}.");
+  static_assert(Warps == 4 || Warps == 8,
+                "SM70 MoE supports 4 or 8 warps.");
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
@@ -666,7 +672,9 @@ struct Sm70MoeGemmTraits {
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
   using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, kCtaK>;
-  using WarpShape = typename Sm70DenseWarpShape<CtaM, CtaN, Warps>::Type;
+  using WarpShape = typename Sm70WarpShape<CtaM, CtaN, Warps>::Type;
+  static_assert(WarpShape::kM <= 64 && WarpShape::kN <= 64,
+                "SM70 MoE keeps per-warp M/N no larger than 64.");
   using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
   using MmaCore = cutlass::gemm::threadblock::DefaultMmaCore<
       ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
@@ -706,7 +714,8 @@ struct Sm70MoeGemmTraits {
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
 using Sm70MoeU4ZpGemmTraits =
-    Sm70MoeGemmTraits<Sm70MoeU4ZpGemmSpec, CtaM, CtaN, Warps, GroupSize>;
+    Sm70MarlinMoeGemmTraits<Sm70MoeU4ZpGemmSpec, CtaM, CtaN, Warps,
+                            GroupSize>;
 
 template <typename Traits>
 class Sm70MoeScatterEpilogue {
@@ -904,8 +913,8 @@ __global__ __launch_bounds__(Warps * 32, 1) void sm70_marlin_u4_gemm_kernel(
   int k_begin = 0;
   int partition_k = k;
   if constexpr (SplitK) {
-    Sm70DenseSplitKPartition const partition =
-        sm70_dense_splitk_partition<GroupSize>(k, split_k, int(blockIdx.z));
+    Sm70SplitKPartition const partition =
+        sm70_splitk_partition<GroupSize>(k, split_k, int(blockIdx.z));
     if (partition.partition_k == 0) {
       return;
     }
@@ -960,7 +969,7 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
 
   auto kernel =
       sm70_marlin_u4_gemm_kernel<CtaM, CtaN, Warps, GroupSize, false>;
-  size_t smem_bytes = configure_dynamic_smem<SharedStorage>(kernel);
+  size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
@@ -992,16 +1001,16 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
 
   auto split_kernel =
       sm70_marlin_u4_gemm_kernel<CtaM, CtaN, Warps, GroupSize, true>;
-  smem_bytes = configure_dynamic_smem<SharedStorage>(split_kernel);
+  smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * top_k * size_n;
-  auto c_tmp = sm70_dense_get_splitk_ctmp(c_tmp_or_none, a.device(), numel);
+  auto c_tmp = sm70_get_splitk_ctmp(c_tmp_or_none, a.device(), numel);
   C10_CUDA_CHECK(cudaMemsetAsync(
       c_tmp.data_ptr<float>(), 0,
       static_cast<size_t>(numel) * sizeof(float), stream));
 
   int const active_split_k =
-      sm70_dense_active_split_k(static_cast<int>(size_k), split_k);
+      sm70_active_split_k(static_cast<int>(size_k), split_k);
   grid.z = static_cast<unsigned>(active_split_k);
   split_kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
@@ -1016,7 +1025,7 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       int(a.stride(0)), split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  launch_sm70_dense_fp32_to_fp16(
+  launch_sm70_fp32_to_fp16(
       c_tmp.data_ptr<float>(),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()), numel,
       stream);
@@ -1074,7 +1083,7 @@ torch::Tensor dispatch_sm70_marlin_u4_group_size(
 }
 
 torch::Tensor dispatch_sm70_marlin_u4_gemm(Sm70MoeU4Launcher const& launcher,
-                                           Sm70DenseCtaGeometry geometry,
+                                           Sm70CtaGeometry geometry,
                                            int64_t group_size) {
 #define DISPATCH_SM70_MOE_U4_CTA(CM, CN, W)                              \
   if (geometry.cta_m == CM && geometry.cta_n == CN &&                     \
@@ -1108,14 +1117,14 @@ torch::Tensor sm70_marlin_u4_gemm(
     std::optional<torch::Tensor> const& c_tmp_or_none) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  Sm70DenseCtaGeometry const geometry =
+  Sm70CtaGeometry const geometry =
       resolve_sm70_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv, size_n);
   check_sm70_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv, geometry);
-  check_sm70_moe_n_tile_alignment(kSm70MarlinMoeU4CtaEnv, geometry, size_n);
+  check_sm70_moe_cta_n_alignment(kSm70MarlinMoeU4CtaEnv, geometry, size_n);
   TORCH_CHECK(size_k % kCtaK == 0,
               "SM70 Marlin MoE uint4 CUTLASS path requires K divisible by 32.");
 
-  int const split_k = parse_sm70_dense_split_k(kSm70MarlinMoeU4SplitKEnv);
+  int const split_k = parse_sm70_split_k(kSm70MarlinMoeU4SplitKEnv);
   Sm70MoeU4Launcher const launcher{
       a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,
       num_tokens_past_padded, topk_weights, moe_block_size, top_k,
