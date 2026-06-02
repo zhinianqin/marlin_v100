@@ -159,7 +159,13 @@ list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM70_SRC})
 
 set(MARLIN_MOE_OTHER_SRC
   "csrc/moe/marlin_moe_wna16/ops.cu"
-  "csrc/moe/marlin_moe_wna16/sm70_marlin_u4_gemm.cu")
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_u4_gemm.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_u4b8_gemm.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_u8_gemm.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_u8b128_gemm.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_nvfp4_gemm.cu"
+  "csrc/moe/marlin_moe_wna16/sm70_marlin_mxfp4_gemm.cu")
 set_gencode_flags_for_srcs(
   SRCS "${MARLIN_MOE_OTHER_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")

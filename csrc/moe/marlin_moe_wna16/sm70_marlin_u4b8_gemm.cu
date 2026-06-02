@@ -24,13 +24,13 @@ namespace marlin_moe_wna16 {
 namespace {
 
 constexpr int kU4ValuesPerWord = 8;
-constexpr char const* kSm70MarlinMoeU4CtaEnv =
-    "SM70_MARLIN_MOE_U4_CTA";
-constexpr char const* kSm70MarlinMoeU4SplitKEnv =
-    "SM70_MARLIN_MOE_U4_SPLIT_K";
+constexpr char const* kSm70MarlinMoeU4B8CtaEnv =
+    "SM70_MARLIN_MOE_U4B8_CTA";
+constexpr char const* kSm70MarlinMoeU4B8SplitKEnv =
+    "SM70_MARLIN_MOE_U4B8_SPLIT_K";
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
-class Sm70MoeU4ZpIteratorB {
+class Sm70MoeU4B8IteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
@@ -39,22 +39,22 @@ class Sm70MoeU4ZpIteratorB {
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
   static_assert(Shape::kK == kCtaK,
-                "SM70 Marlin MoE U4 IteratorB expects CTA_K=32.");
+                "SM70 Marlin MoE U4B8 IteratorB expects CTA_K=32.");
   static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
-                "SM70 Marlin MoE U4 IteratorB expects CTA_N in {64, 128, 256}.");
+                "SM70 Marlin MoE U4B8 IteratorB expects CTA_N in {64, 128, 256}.");
   static_assert(ThreadMap::Iterations::kContiguous ==
                     Shape::kN / kQuantTileN,
-                "SM70 Marlin MoE U4 IteratorB expects one contiguous iteration per "
+                "SM70 Marlin MoE U4B8 IteratorB expects one contiguous iteration per "
                 "64-column quant tile.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
-                "SM70 Marlin MoE U4 IteratorB expects 64-column deltas.");
+                "SM70 Marlin MoE U4B8 IteratorB expects 64-column deltas.");
   static_assert(ThreadMap::kElementsPerAccess == kU4ValuesPerWord,
-                "SM70 Marlin MoE U4 IteratorB expects one packed int4 word per "
+                "SM70 Marlin MoE U4B8 IteratorB expects one packed int4 word per "
                 "access.");
   static_assert(ThreadMap::Iterations::kStrided == 1 ||
                     ThreadMap::Iterations::kStrided == 2,
-                "SM70 Marlin MoE U4-family IteratorB expects one or two "
-                "strided iterations.");
+                "SM70 Marlin MoE U4-family IteratorB expects one or two strided "
+                "iterations.");
   static constexpr int kStridedQweightDeltaWords =
       32 * (Shape::kN / kQuantTileN);
 
@@ -76,7 +76,6 @@ class Sm70MoeU4ZpIteratorB {
  private:
   uint32_t const* qweight_;
   half const* scales_expert_base_;
-  half const* zp_expert_base_;
   Params params_;
   cutlass::layout::PitchLinearCoord thread_offset_;
   int qweight_base_offset_;
@@ -85,19 +84,16 @@ class Sm70MoeU4ZpIteratorB {
   int n_offset_;
   bool mask_enabled_;
   mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
-  mutable half2 cached_zp_[ThreadMap::Iterations::kContiguous * 4];
 
  public:
   CUTLASS_DEVICE
-  Sm70MoeU4ZpIteratorB(Params const& params, uint32_t const* qweight,
-                       half const* scales, half const* zp, int thread_id,
+  Sm70MoeU4B8IteratorB(Params const& params, uint32_t const* qweight,
+                       half const* scales, half const*, int thread_id,
                        int expert, int k_offset, int n_offset)
       : qweight_(qweight),
         scales_expert_base_(scales +
                             (expert >= 0 ? expert : 0) *
                                 params.num_groups * params.size_n),
-        zp_expert_base_(zp + (expert >= 0 ? expert : 0) *
-                                 params.num_groups * params.size_n),
         params_(params),
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         expert_(expert),
@@ -115,7 +111,7 @@ class Sm70MoeU4ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  Sm70MoeU4ZpIteratorB& operator++() {
+  Sm70MoeU4B8IteratorB& operator++() {
     int const k_advance_qwords =
         (Shape::kK / kQuantTileK) * (params_.size_n * 2);
     k_offset_ += Shape::kK;
@@ -150,7 +146,7 @@ class Sm70MoeU4ZpIteratorB {
     } else {
       static_assert(kGroupSize == 32 || kGroupSize == 64 ||
                         kGroupSize == 128,
-                    "SM70 Marlin MoE U4 supports only group sizes -1, 32, 64, "
+                    "SM70 Marlin MoE U4B8 supports only group sizes -1, 32, 64, "
                     "and 128.");
       return logical_k / kGroupSize;
     }
@@ -173,14 +169,6 @@ class Sm70MoeU4ZpIteratorB {
     scale_cache[1] = scale_vec[1];
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
-
-    half2 const* zp_vec = reinterpret_cast<half2 const*>(
-        zp_expert_base_ + metadata_offset);
-    half2* zp_cache = cached_zp_ + c * 4;
-    zp_cache[0] = zp_vec[0];
-    zp_cache[1] = zp_vec[1];
-    zp_cache[2] = zp_vec[2];
-    zp_cache[3] = zp_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -194,15 +182,6 @@ class Sm70MoeU4ZpIteratorB {
     scale_cache[1] = scale_vec[1];
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
-
-    uint4 const zp_words = *reinterpret_cast<uint4 const*>(
-        zp_expert_base_ + metadata_offset);
-    half2 const* zp_vec = reinterpret_cast<half2 const*>(&zp_words);
-    half2* zp_cache = cached_zp_ + c * 4;
-    zp_cache[0] = zp_vec[0];
-    zp_cache[1] = zp_vec[1];
-    zp_cache[2] = zp_vec[2];
-    zp_cache[3] = zp_vec[3];
   }
 
   CUTLASS_DEVICE
@@ -232,18 +211,17 @@ class Sm70MoeU4ZpIteratorB {
           int const frag_base = c * kAccess;
           uint32_t const qword = qword_from_vector(qwords, c);
           half2 const* scale_vec = cached_scales_ + c * 4;
-          half2 const* zp_vec = cached_zp_ + c * 4;
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-          marlin::dequant<half2, vllm::kU4.id(), false>(
+          marlin::dequant<half2, vllm::kU4B8.id(), false>(
               static_cast<int>(qword), deq);
-          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-          marlin::dequant<half2, vllm::kU4.id(), false>(
+          frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+          marlin::dequant<half2, vllm::kU4B8.id(), false>(
               static_cast<int>(qword >> 8), deq);
-          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
         }
       } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
         auto const qwords =
@@ -254,36 +232,35 @@ class Sm70MoeU4ZpIteratorB {
           int const frag_base = c * kAccess;
           uint32_t const qword = qword_from_vector(qwords, c);
           half2 const* scale_vec = cached_scales_ + c * 4;
-          half2 const* zp_vec = cached_zp_ + c * 4;
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-          marlin::dequant<half2, vllm::kU4.id(), false>(
+          marlin::dequant<half2, vllm::kU4B8.id(), false>(
               static_cast<int>(qword), deq);
-          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-          marlin::dequant<half2, vllm::kU4.id(), false>(
+          frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+          marlin::dequant<half2, vllm::kU4B8.id(), false>(
               static_cast<int>(qword >> 8), deq);
-          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
         }
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
-                      "Unsupported SM70 Marlin MoE U4 contiguous iteration count.");
-        uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_offset_);
+                      "Unsupported SM70 Marlin MoE U4B8 contiguous iteration count.");
+        uint32_t const qword =
+            load_qword_vector<1>(qweight_ + qweight_base_offset_);
         half2 const* scale_vec = cached_scales_;
-        half2 const* zp_vec = cached_zp_;
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data());
-        marlin::dequant<half2, vllm::kU4.id(), false>(
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
             static_cast<int>(qword), deq);
-        frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-        frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-        marlin::dequant<half2, vllm::kU4.id(), false>(
+        frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+        frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+        marlin::dequant<half2, vllm::kU4B8.id(), false>(
             static_cast<int>(qword >> 8), deq);
-        frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-        frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+        frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+        frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
       }
     } else {
       int const qweight_base = qweight_base_offset_;
@@ -301,18 +278,17 @@ class Sm70MoeU4ZpIteratorB {
                 (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
             uint32_t const qword = qword_from_vector(qwords, c);
             half2 const* scale_vec = cached_scales_ + c * 4;
-            half2 const* zp_vec = cached_zp_ + c * 4;
 
             half2 deq[2];
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-            marlin::dequant<half2, vllm::kU4.id(), false>(
+            marlin::dequant<half2, vllm::kU4B8.id(), false>(
                 static_cast<int>(qword), deq);
-            frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-            frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-            marlin::dequant<half2, vllm::kU4.id(), false>(
+            frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+            frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+            marlin::dequant<half2, vllm::kU4B8.id(), false>(
                 static_cast<int>(qword >> 8), deq);
-            frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-            frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+            frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+            frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
           auto const qwords =
@@ -324,38 +300,37 @@ class Sm70MoeU4ZpIteratorB {
                 (c + s * ThreadMap::Iterations::kContiguous) * kAccess;
             uint32_t const qword = qword_from_vector(qwords, c);
             half2 const* scale_vec = cached_scales_ + c * 4;
-            half2 const* zp_vec = cached_zp_ + c * 4;
 
             half2 deq[2];
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-            marlin::dequant<half2, vllm::kU4.id(), false>(
+            marlin::dequant<half2, vllm::kU4B8.id(), false>(
                 static_cast<int>(qword), deq);
-            frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-            frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-            marlin::dequant<half2, vllm::kU4.id(), false>(
+            frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+            frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+            marlin::dequant<half2, vllm::kU4B8.id(), false>(
                 static_cast<int>(qword >> 8), deq);
-            frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-            frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+            frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+            frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
           }
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
-                        "Unsupported SM70 Marlin MoE U4 contiguous iteration count.");
-          uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_s);
+                        "Unsupported SM70 Marlin MoE U4B8 contiguous iteration count.");
+          uint32_t const qword =
+              load_qword_vector<1>(qweight_ + qweight_base_s);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
           half2 const* scale_vec = cached_scales_;
-          half2 const* zp_vec = cached_zp_;
 
           half2 deq[2];
           half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
-          marlin::dequant<half2, vllm::kU4.id(), false>(
+          marlin::dequant<half2, vllm::kU4B8.id(), false>(
               static_cast<int>(qword), deq);
-          frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-          frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-          marlin::dequant<half2, vllm::kU4.id(), false>(
+          frag_vec[0] = __hmul2(deq[0], scale_vec[0]);
+          frag_vec[1] = __hmul2(deq[1], scale_vec[1]);
+          marlin::dequant<half2, vllm::kU4B8.id(), false>(
               static_cast<int>(qword >> 8), deq);
-          frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-          frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+          frag_vec[2] = __hmul2(deq[0], scale_vec[2]);
+          frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
         }
       }
     }
@@ -376,7 +351,7 @@ class Sm70MoeU4ZpIteratorB {
   }
 };
 
-struct Sm70MoeU4ZpGemmSpec {
+struct Sm70MoeU4B8GemmSpec {
   using ScaleElement = half;
   using ZeroElement = half;
   static constexpr bool kUsesGlobalScale = false;
@@ -385,15 +360,15 @@ struct Sm70MoeU4ZpGemmSpec {
   using IteratorA = Sm70MoeGatherIteratorA<Shape, ThreadMap>;
 
   template <typename Shape, typename ThreadMap, int GroupSize>
-  using IteratorB = Sm70MoeU4ZpIteratorB<Shape, ThreadMap, GroupSize>;
+  using IteratorB = Sm70MoeU4B8IteratorB<Shape, ThreadMap, GroupSize>;
 };
 
 template <int CtaM, int CtaN, int Warps, int GroupSize>
-using Sm70MoeU4ZpGemmTraits =
-    Sm70MarlinMoeGemmTraits<Sm70MoeU4ZpGemmSpec, CtaM, CtaN, Warps,
+using Sm70MoeU4B8GemmTraits =
+    Sm70MarlinMoeGemmTraits<Sm70MoeU4B8GemmSpec, CtaM, CtaN, Warps,
                             GroupSize>;
 
-struct Sm70MoeU4Launcher {
+struct Sm70MoeU4B8Launcher {
   torch::Tensor& a;
   torch::Tensor& c;
   torch::Tensor& b_q_weight;
@@ -415,45 +390,45 @@ struct Sm70MoeU4Launcher {
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
-    using Traits = Sm70MoeU4ZpGemmTraits<CtaM, CtaN, Warps, GroupSize>;
+    using Traits = Sm70MoeU4B8GemmTraits<CtaM, CtaN, Warps, GroupSize>;
     return launch_sm70_marlin_moe_gemm<Traits>(
         a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
         expert_ids, num_tokens_past_padded, topk_weights,
-        kSm70MarlinMoeU4SplitKEnv, moe_block_size, top_k, mul_topk_weights,
+        kSm70MarlinMoeU4B8SplitKEnv, moe_block_size, top_k, mul_topk_weights,
         size_m, size_n, size_k, split_k, c_tmp_or_none);
   }
 };
 
 }  // namespace
 
-torch::Tensor sm70_marlin_u4_gemm(
+torch::Tensor sm70_marlin_u4b8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zeros,
-    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
-    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
-    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
-    std::optional<torch::Tensor> const& c_tmp_or_none) {
+    torch::Tensor& b_scales, torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
+    bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
+    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
   Sm70CtaGeometry const geometry =
-      resolve_sm70_marlin_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv, size_n);
-  check_sm70_marlin_moe_cta_geometry(kSm70MarlinMoeU4CtaEnv, geometry);
-  check_sm70_marlin_moe_cta_n_alignment(kSm70MarlinMoeU4CtaEnv, geometry,
+      resolve_sm70_marlin_moe_cta_geometry(kSm70MarlinMoeU4B8CtaEnv, size_n);
+  check_sm70_marlin_moe_cta_geometry(kSm70MarlinMoeU4B8CtaEnv, geometry);
+  check_sm70_marlin_moe_cta_n_alignment(kSm70MarlinMoeU4B8CtaEnv, geometry,
                                         size_n);
   TORCH_CHECK(size_k % kCtaK == 0,
-              "SM70 Marlin MoE U4 requires K divisible by 32. Got K=",
+              "SM70 Marlin MoE U4B8 requires K divisible by 32. Got K=",
               size_k, ".");
 
-  int const split_k = parse_sm70_split_k(kSm70MarlinMoeU4SplitKEnv);
+  int const split_k = parse_sm70_split_k(kSm70MarlinMoeU4B8SplitKEnv);
+  auto empty_half = torch::empty({0}, b_scales.options().dtype(at::kHalf));
   auto empty_float = torch::empty(
       {0}, torch::TensorOptions().dtype(at::kFloat).device(a.device()));
-  Sm70MoeU4Launcher const launcher{
-      a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
+  Sm70MoeU4B8Launcher const launcher{
+      a, c, b_q_weight, b_scales, empty_half, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
       mul_topk_weights, size_m, size_n, size_k, split_k, c_tmp_or_none};
   return dispatch_sm70_marlin_moe_geometry(launcher, geometry, group_size,
-                                           "U4");
+                                           "U4B8");
 }
 
 }  // namespace marlin_moe_wna16

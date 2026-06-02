@@ -6,6 +6,7 @@
 
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
+#include <torch/types.h>
 
 #include <type_traits>
 
@@ -77,17 +78,6 @@ struct Sm70MarlinGemmTraits {
   };
 };
 
-template <typename SharedStorage, typename Kernel>
-inline size_t configure_sm70_dynamic_smem(Kernel kernel) {
-  size_t smem_bytes = sizeof(SharedStorage);
-  if (smem_bytes >= (48u << 10)) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem_bytes)));
-  }
-  return smem_bytes;
-}
-
 inline dim3 sm70_marlin_cta_grid(int64_t size_m, int64_t size_n, int cta_m,
                                  int cta_n) {
   return dim3(static_cast<unsigned>((size_m + cta_m - 1) / cta_m),
@@ -108,9 +98,25 @@ torch::Tensor dispatch_sm70_marlin_group_size(Launcher const& launcher,
     case 128:
       return launcher.template operator()<CtaM, CtaN, Warps, 128>();
     default:
-      TORCH_CHECK(false, "SM70 CUTLASS ", quant_name,
+      TORCH_CHECK(false, "SM70 Marlin ", quant_name,
                   " supports only group_size -1, 32, 64, or 128. Got ",
-                  group_size);
+                  group_size, ".");
+  }
+  return torch::Tensor();
+}
+
+template <int CtaM, int CtaN, int Warps, typename Launcher>
+torch::Tensor dispatch_sm70_marlin_fp8_group_size(Launcher const& launcher,
+                                                  int64_t group_size) {
+  switch (group_size) {
+    case -1:
+      return launcher.template operator()<CtaM, CtaN, Warps, -1>();
+    case 128:
+      return launcher.template operator()<CtaM, CtaN, Warps, 128>();
+    default:
+      TORCH_CHECK(false,
+                  "SM70 Marlin FP8 supports only group_size -1 or 128. Got ",
+                  group_size, ".");
   }
   return torch::Tensor();
 }
@@ -118,8 +124,6 @@ torch::Tensor dispatch_sm70_marlin_group_size(Launcher const& launcher,
 template <typename Launcher>
 torch::Tensor dispatch_sm70_marlin_geometry(Launcher const& launcher,
                                             Sm70CtaGeometry geometry,
-                                            int64_t /*size_n*/,
-                                            int64_t /*size_k*/,
                                             int64_t group_size,
                                             char const* quant_name) {
 #define DISPATCH_SM70_MARLIN_CTA(CM, CN, W)                              \
@@ -148,7 +152,84 @@ torch::Tensor dispatch_sm70_marlin_geometry(Launcher const& launcher,
 
 #undef DISPATCH_SM70_MARLIN_CTA
 
-  TORCH_CHECK(false, "Unreachable SM70 ", quant_name,
+  TORCH_CHECK(false, "Unreachable SM70 Marlin ", quant_name,
+              " CTA geometry dispatch.");
+}
+
+template <typename Launcher>
+torch::Tensor dispatch_sm70_marlin_fp8_geometry(Launcher const& launcher,
+                                                Sm70CtaGeometry geometry,
+                                                int64_t group_size) {
+#define DISPATCH_SM70_MARLIN_FP8_CTA(CM, CN, W)                         \
+  if (geometry.cta_m == CM && geometry.cta_n == CN &&                    \
+      geometry.warps == W) {                                             \
+    return dispatch_sm70_marlin_fp8_group_size<CM, CN, W>(launcher,       \
+                                                          group_size);   \
+  }
+
+  DISPATCH_SM70_MARLIN_FP8_CTA(32, 128, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(32, 256, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(64, 64, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(64, 128, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(64, 128, 8)
+  DISPATCH_SM70_MARLIN_FP8_CTA(64, 256, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(64, 256, 8)
+  DISPATCH_SM70_MARLIN_FP8_CTA(128, 64, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(128, 64, 8)
+  DISPATCH_SM70_MARLIN_FP8_CTA(128, 128, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(128, 128, 8)
+  DISPATCH_SM70_MARLIN_FP8_CTA(128, 256, 8)
+  DISPATCH_SM70_MARLIN_FP8_CTA(256, 64, 4)
+  DISPATCH_SM70_MARLIN_FP8_CTA(256, 64, 8)
+  DISPATCH_SM70_MARLIN_FP8_CTA(256, 128, 8)
+
+#undef DISPATCH_SM70_MARLIN_FP8_CTA
+
+  TORCH_CHECK(false, "Unreachable SM70 Marlin FP8 CTA geometry dispatch.");
+}
+
+template <int CtaM, int CtaN, int Warps, int GroupSize, typename Launcher>
+torch::Tensor dispatch_sm70_marlin_fixed_group_size(Launcher const& launcher,
+                                                    int64_t group_size,
+                                                    char const* quant_name) {
+  if (group_size == GroupSize) {
+    return launcher.template operator()<CtaM, CtaN, Warps, GroupSize>();
+  }
+  TORCH_CHECK(false, "SM70 Marlin ", quant_name, " supports only group_size ",
+              GroupSize, ". Got ", group_size, ".");
+  return torch::Tensor();
+}
+
+template <int GroupSize, typename Launcher>
+torch::Tensor dispatch_sm70_marlin_fixed_group_geometry(
+    Launcher const& launcher, Sm70CtaGeometry geometry, int64_t group_size,
+    char const* quant_name) {
+#define DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(CM, CN, W)                    \
+  if (geometry.cta_m == CM && geometry.cta_n == CN &&                      \
+      geometry.warps == W) {                                               \
+    return dispatch_sm70_marlin_fixed_group_size<CM, CN, W, GroupSize>(     \
+        launcher, group_size, quant_name);                                  \
+  }
+
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(32, 128, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(32, 256, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(64, 64, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(64, 128, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(64, 128, 8)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(64, 256, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(64, 256, 8)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(128, 64, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(128, 64, 8)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(128, 128, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(128, 128, 8)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(128, 256, 8)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(256, 64, 4)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(256, 64, 8)
+  DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA(256, 128, 8)
+
+#undef DISPATCH_SM70_MARLIN_FIXED_GROUP_CTA
+
+  TORCH_CHECK(false, "Unreachable SM70 Marlin ", quant_name,
               " CTA geometry dispatch.");
 }
 

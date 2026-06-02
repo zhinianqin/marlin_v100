@@ -1,5 +1,8 @@
 #pragma once
 
+#include <c10/cuda/CUDAException.h>
+
+#include <cuda_runtime_api.h>
 #include <torch/library.h>
 
 #include <cstdlib>
@@ -14,6 +17,17 @@ namespace marlin::sm70 {
 constexpr int kCtaK = 32;
 constexpr int kQuantTileK = 16;
 constexpr int kQuantTileN = 64;
+
+template <typename SharedStorage, typename Kernel>
+inline size_t configure_sm70_dynamic_smem(Kernel kernel) {
+  size_t smem_bytes = sizeof(SharedStorage);
+  if (smem_bytes >= (48u << 10)) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)));
+  }
+  return smem_bytes;
+}
 
 template <int CtaM, int CtaN, int Warps>
 struct Sm70WarpShape;
@@ -104,7 +118,7 @@ inline constexpr char const* kSupportedSm70MarlinCtaGeometries =
     "64x256x4, 64x256x8, 128x64x4, 128x64x8, 128x128x4, "
     "128x128x8, 128x256x8, 256x64x4, 256x64x8, and 256x128x8";
 
-inline bool sm70_marlin_cta_geometry_supported(
+inline bool sm70_marlin_cta_geometry_is_supported(
     Sm70CtaGeometry geometry) {
   int const cta_m = geometry.cta_m;
   int const cta_n = geometry.cta_n;
@@ -145,10 +159,11 @@ inline Sm70CtaGeometry parse_sm70_marlin_cta_geometry(
   int warps = 0;
   std::string extra;
   std::istringstream stream(spec);
-  TORCH_CHECK(
-      (stream >> cta_m >> cta_n >> warps) && !(stream >> extra), env_name,
-      " must use format CTA_MxCTA_NxWarps, for example 128x256x8. Got: ",
-      env);
+  TORCH_CHECK((stream >> cta_m >> cta_n >> warps) && !(stream >> extra),
+              env_name,
+              " must use format CTA_MxCTA_NxWarps, for example 128x256x8. "
+              "Got: ",
+              env);
   return {cta_m, cta_n, warps};
 }
 
@@ -162,7 +177,7 @@ inline int sm70_marlin_auto_cta_n(int64_t size_n) {
   if (size_n % 64 == 0) {
     return 64;
   }
-  TORCH_CHECK(false, "SM70 CUTLASS Marlin requires size_n divisible "
+  TORCH_CHECK(false, "SM70 Marlin requires size_n divisible "
                      "by 64. Got size_n = ", size_n, ".");
   return 0;
 }
@@ -254,23 +269,20 @@ inline Sm70CtaGeometry resolve_sm70_marlin_cta_geometry(
 
 inline void check_sm70_marlin_cta_geometry(char const* env_name,
                                           Sm70CtaGeometry geometry) {
-  TORCH_CHECK(sm70_marlin_cta_geometry_supported(geometry), "Unsupported ",
+  TORCH_CHECK(sm70_marlin_cta_geometry_is_supported(geometry), "Unsupported ",
               env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
               geometry.warps, ". Supported geometries are ",
               kSupportedSm70MarlinCtaGeometries, ".");
 }
 
-inline void check_sm70_marlin_n_tile_alignment(char const* env_name,
-                                               Sm70CtaGeometry geometry,
-                                               int64_t size_n) {
-  TORCH_CHECK(size_n % kQuantTileN == 0,
-              "SM70 CUTLASS Marlin requires size_n divisible by ",
-              kQuantTileN, ". Got size_n = ", size_n, ".");
-  TORCH_CHECK(size_n % geometry.cta_n == 0,
-              "SM70 CUTLASS Marlin requires size_n divisible by "
-              "CTA_N for ",
-              env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
-              geometry.warps, ". Got size_n = ", size_n, ".");
+inline void check_sm70_marlin_cta_n_alignment(char const* env_name,
+                                              Sm70CtaGeometry geometry,
+                                              int64_t size_n) {
+  TORCH_CHECK(
+      size_n % geometry.cta_n == 0 && size_n % kQuantTileN == 0,
+      "SM70 Marlin requires size_n divisible by both CTA_N and 64 for ",
+      env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
+      geometry.warps, ". Got size_n = ", size_n, ".");
 }
 
 }  // namespace marlin::sm70

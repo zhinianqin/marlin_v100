@@ -42,6 +42,56 @@ torch::Tensor sm70_marlin_u4_gemm(
     int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
     std::optional<torch::Tensor> const& c_tmp_or_none);
 
+torch::Tensor sm70_marlin_u4b8_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
+    bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
+    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+
+torch::Tensor sm70_marlin_u8_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& b_zeros,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
+    std::optional<torch::Tensor> const& c_tmp_or_none);
+
+torch::Tensor sm70_marlin_u8b128_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
+    bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
+    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+
+torch::Tensor sm70_marlin_fp8_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
+    bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
+    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+
+torch::Tensor sm70_marlin_nvfp4_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& global_scale,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
+    std::optional<torch::Tensor> const& c_tmp_or_none);
+
+torch::Tensor sm70_marlin_mxfp4_gemm(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
+    bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
+    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
@@ -603,14 +653,22 @@ torch::Tensor moe_wna16_marlin_gemm(
   vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
 
   TORCH_CHECK(a_type == vllm::kFloat16,
-              "SM70 build only supports float16 activations.");
+              "SM70 Marlin MoE supports only float16 "
+              "activations.");
   TORCH_CHECK(c_type == vllm::kFloat16,
-              "SM70 build only supports float16 outputs.");
-  TORCH_CHECK(s_type == vllm::kFloat16,
-              "SM70 build only supports float16 scales.");
+              "SM70 Marlin MoE supports only float16 outputs.");
+  TORCH_CHECK(s_type == vllm::kFloat16 ||
+                  (b_type == vllm::kFE2M1f &&
+                   (s_type == vllm::kFE4M3fn ||
+                    s_type == vllm::kFE8M0fnu)),
+              "SM70 Marlin MoE supports only float16 scales, "
+              "except FP4 uses float8_e4m3fn scales for NVFP4 or "
+              "float8_e8m0fnu scales for MXFP4.");
   TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
-                  b_type == vllm::kU8B128,
-              "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
+                  b_type == vllm::kU8 || b_type == vllm::kU8B128 ||
+                  b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
+              "SM70 Marlin MoE supports uint4, uint4b8, uint8, "
+              "uint8b128, fp8_e4m3fn, nvfp4, and mxfp4 weights.");
   TORCH_CHECK(use_fp32_reduce,
               "SM70 Marlin MoE requires use_fp32_reduce=True.");
 
@@ -656,6 +714,15 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   TORCH_CHECK(b_scales.device().is_cuda(), "b_scales is not on GPU");
   TORCH_CHECK(b_scales.is_contiguous(), "b_scales is not contiguous");
+  TORCH_CHECK(b_scales.scalar_type() == at::ScalarType::Half ||
+                  (b_type == vllm::kFE2M1f &&
+                   (b_scales.scalar_type() ==
+                        at::ScalarType::Float8_e4m3fn ||
+                    b_scales.scalar_type() ==
+                        at::ScalarType::Float8_e8m0fnu)),
+              "SM70 Marlin MoE supports float16 scales, except FP4 uses "
+              "float8_e4m3fn scales for NVFP4 or float8_e8m0fnu scales for "
+              "MXFP4.");
 
   torch::Tensor a_scales;
   auto options = torch::TensorOptions().dtype(c_dtype).device(a.device());
@@ -753,9 +820,21 @@ torch::Tensor moe_wna16_marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(false, "SM70 build does not support nvfp4 global_scale.");
+    TORCH_CHECK(
+        b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
+        "SM70 Marlin MoE supports global_scale only for nvfp4 format.");
+    TORCH_CHECK(global_scale.device().is_cuda(), "global_scale is not on GPU");
+    TORCH_CHECK(global_scale.is_contiguous(), "global_scale is not contiguous");
+    TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
+                "SM70 Marlin MoE NVFP4 expects fp32 global_scale.");
+    TORCH_CHECK(global_scale.numel() == num_experts,
+                "SM70 Marlin MoE NVFP4 expects global_scale numel = "
+                "num_experts. Got global_scale.numel() = ",
+                global_scale.numel(), ", num_experts = ", num_experts);
   } else {
-    global_scale = torch::empty({0}, options);
+    global_scale = torch::empty({0}, options_fp32);
+    TORCH_CHECK(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
+                "the global_scale parameter must be passed for nvfp4 format.");
   }
 
   bool has_bias = b_bias_or_none.has_value();
@@ -780,25 +859,25 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
-    TORCH_CHECK(b_type == vllm::kU4,
-                "SM70 MoE build only supports uint4 weights when zero-points "
-                "are enabled. Got = ",
+    TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU8,
+                "SM70 Marlin MoE supports only uint4 or uint8 "
+                "weights when zero-points are enabled. Got = ",
                 b_type.str());
   } else {
-    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
-                "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
-                b_type.str());
+    TORCH_CHECK(!(b_type == vllm::kU4 || b_type == vllm::kU8),
+                "SM70 Marlin MoE uint4/uint8 paths require fp16 zero points "
+                "with is_zp_float=true.");
   }
 
   // Verify b_zeros
   if (has_zp) {
     TORCH_CHECK(is_zp_float,
-                "SM70 Marlin MoE uint4 path requires fp16 zero points "
+                "SM70 Marlin MoE uint4/uint8 paths require fp16 zero points "
                 "with is_zp_float=true.");
     int rank = b_zeros.sizes().size();
     TORCH_CHECK(rank == 3, "b_zeros rank = ", rank, " is not 3");
     TORCH_CHECK(b_zeros.scalar_type() == at::ScalarType::Half,
-                "SM70 Marlin MoE uint4 path expects fp16 zero points.");
+                "SM70 Marlin MoE uint4/uint8 paths expect fp16 zero points.");
     TORCH_CHECK(b_zeros.size(0) == num_experts,
                 "b_zeros dim 0 = ", b_zeros.size(0),
                 " is not num_experts = ", num_experts);
@@ -821,8 +900,8 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
-  TORCH_CHECK(global_scale.scalar_type() == c.scalar_type(),
-              "scalar type of global_scale must be the same with c");
+  TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
+              "scalar type of global_scale must be float");
   if (a_type.size_bits() == 16) {
     TORCH_CHECK(
         a.scalar_type() == c.scalar_type(),
@@ -833,6 +912,86 @@ torch::Tensor moe_wna16_marlin_gemm(
     TORCH_CHECK(!has_bias, "SM70 Marlin MoE uint4 path does not support bias.");
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
         a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+  }
+
+  TORCH_CHECK(!has_act_order,
+              "act_order is not supported for the SM70 Marlin MoE path.");
+  TORCH_CHECK(!has_bias,
+              "SM70 Marlin MoE does not support bias.");
+  TORCH_CHECK(!use_atomic_add,
+              "SM70 Marlin MoE does not support atomic-add "
+              "output.");
+  TORCH_CHECK(is_k_full,
+              "SM70 Marlin MoE requires full-K inputs.");
+
+  if (b_type == vllm::kU8) {
+    TORCH_CHECK(has_zp && is_zp_float,
+                "SM70 Marlin MoE uint8 path requires fp16 zero points.");
+    return MARLIN_NAMESPACE_NAME::sm70_marlin_u8_gemm(
+        a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+  }
+
+  if (b_type == vllm::kU4B8) {
+    TORCH_CHECK(!has_zp && !is_zp_float,
+                "SM70 Marlin MoE uint4b8 does not support zero-point "
+                "metadata.");
+    return MARLIN_NAMESPACE_NAME::sm70_marlin_u4b8_gemm(
+        a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+  }
+
+  if (b_type == vllm::kU8B128) {
+    TORCH_CHECK(!has_zp && !is_zp_float,
+                "SM70 Marlin MoE uint8b128 does not support zero-point "
+                "metadata.");
+    return MARLIN_NAMESPACE_NAME::sm70_marlin_u8b128_gemm(
+        a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+  }
+
+  if (b_type == vllm::kFE4M3fn) {
+    TORCH_CHECK(group_size == -1 || group_size == 128,
+                "SM70 Marlin MoE FP8 supports only group_size -1 or "
+                "128. Got ",
+                group_size);
+    TORCH_CHECK(!has_zp && !is_zp_float,
+                "SM70 Marlin MoE fp8 does not support zero-point metadata.");
+    return MARLIN_NAMESPACE_NAME::sm70_marlin_fp8_gemm(
+        a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+  }
+
+  if (b_type == vllm::kFE2M1f) {
+    TORCH_CHECK(!has_zp && !is_zp_float,
+                "SM70 Marlin MoE fp4 does not support zero-point metadata.");
+    if (s_type == vllm::kFE4M3fn) {
+      TORCH_CHECK(global_scale.numel() == num_experts,
+                  "the global_scale parameter must be passed for nvfp4 format.");
+      TORCH_CHECK(group_size == 16,
+                  "SM70 Marlin MoE NVFP4 supports only group_size 16. "
+                  "Got ",
+                  group_size);
+      return MARLIN_NAMESPACE_NAME::sm70_marlin_nvfp4_gemm(
+          a, c, b_q_weight, b_scales, global_scale, sorted_token_ids, expert_ids,
+          num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+          mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+    }
+
+    TORCH_CHECK(s_type == vllm::kFE8M0fnu,
+                "SM70 Marlin MoE MXFP4 expects float8_e8m0fnu scales.");
+    TORCH_CHECK(group_size == 32,
+                "SM70 Marlin MoE MXFP4 supports only group_size 32. "
+                "Got ",
+                group_size);
+    return MARLIN_NAMESPACE_NAME::sm70_marlin_mxfp4_gemm(
+        a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
         mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
   }

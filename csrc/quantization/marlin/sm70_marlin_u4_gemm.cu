@@ -11,12 +11,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_fp16.h>
-#include <cuda_runtime_api.h>
 #include <torch/library.h>
-#include <cstdlib>
-#include <sstream>
-#include <string>
-#include <type_traits>
 
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/threadblock/default_epilogue_volta_tensor_op.h"
@@ -27,10 +22,10 @@
 
 using marlin::sm70::Sm70CtaGeometry;
 using marlin::sm70::Sm70AtomicFp32Epilogue;
-using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::Sm70MarlinGemmTraits;
+using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::check_sm70_marlin_cta_geometry;
-using marlin::sm70::check_sm70_marlin_n_tile_alignment;
+using marlin::sm70::check_sm70_marlin_cta_n_alignment;
 using marlin::sm70::configure_sm70_dynamic_smem;
 using marlin::sm70::dispatch_sm70_marlin_geometry;
 using marlin::sm70::kCtaK;
@@ -50,7 +45,10 @@ using marlin::sm70::u4_cta_n_qweight_offset_from_logical;
 namespace {
 
 constexpr int kU4ValuesPerWord = 8;
-constexpr char const* kSm70MarlinU4SplitKEnv = "SM70_MARLIN_U4_SPLIT_K";
+constexpr char const* kSm70MarlinU4CtaEnv =
+    "SM70_MARLIN_U4_CTA";
+constexpr char const* kSm70MarlinU4SplitKEnv =
+    "SM70_MARLIN_U4_SPLIT_K";
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
 class Sm70U4ZpIteratorB {
@@ -62,21 +60,21 @@ class Sm70U4ZpIteratorB {
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
   static_assert(Shape::kK == kCtaK,
-                "The SM70 kU4 IteratorB expects CTA_K=32.");
+                "SM70 Marlin U4 IteratorB expects CTA_K=32.");
   static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
-                "The SM70 kU4 IteratorB expects CTA_N in {64, 128, 256}.");
+                "SM70 Marlin U4 IteratorB expects CTA_N in {64, 128, 256}.");
   static_assert(ThreadMap::Iterations::kContiguous ==
                     Shape::kN / kQuantTileN,
-                "The SM70 kU4 IteratorB expects one contiguous iteration per "
+                "SM70 Marlin U4 IteratorB expects one contiguous iteration per "
                 "64-column quant tile.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
-                "The SM70 kU4 IteratorB expects 64-column deltas.");
+                "SM70 Marlin U4 IteratorB expects 64-column deltas.");
   static_assert(ThreadMap::kElementsPerAccess == kU4ValuesPerWord,
-                "The SM70 kU4 IteratorB expects one packed int4 word per "
+                "SM70 Marlin U4 IteratorB expects one packed int4 word per "
                 "access.");
   static_assert(ThreadMap::Iterations::kStrided == 1 ||
                     ThreadMap::Iterations::kStrided == 2,
-                "SM70 U4-family IteratorB expects one or two strided iterations.");
+                "SM70 Marlin U4-family IteratorB expects one or two strided iterations.");
   static constexpr int kStridedQweightDeltaWords =
       32 * (Shape::kN / kQuantTileN);
 
@@ -302,7 +300,7 @@ class Sm70U4ZpIteratorB {
         }
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
-                      "Unsupported SM70 kU4 contiguous iteration count.");
+                      "Unsupported SM70 Marlin U4 contiguous iteration count.");
         uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_offset_);
         half2 const* scale_vec = cached_scales_;
         half2 const* zp_vec = cached_zp_;
@@ -380,7 +378,7 @@ class Sm70U4ZpIteratorB {
           }
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
-                        "Unsupported SM70 kU4 contiguous iteration count.");
+                        "Unsupported SM70 Marlin U4 contiguous iteration count.");
           uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_s);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
@@ -574,9 +572,10 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
     return c;
   }
 
-  TORCH_CHECK(size_k % int64_t(kCtaK) == 0, kSm70MarlinU4SplitKEnv,
-              " requires K divisible by 32 for split_k > 1. Got K=", size_k,
-              ", split_k=", split_k, ".");
+  TORCH_CHECK(size_k % int64_t(kCtaK) == 0,
+              "SM70 Marlin U4 requires K divisible by 32 for split_k > 1. "
+              "Got K=",
+              size_k, ", split_k=", split_k, ".");
 
   auto split_kernel =
       sm70_marlin_u4_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
@@ -638,15 +637,13 @@ torch::Tensor sm70_marlin_u4_gemm(
     std::optional<torch::Tensor> const& c_tmp_or_none) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  char const* env_name = "SM70_MARLIN_U4_CTA";
   Sm70CtaGeometry const geometry =
-      resolve_sm70_marlin_cta_geometry(env_name, size_m, size_n);
-  check_sm70_marlin_cta_geometry(env_name, geometry);
-  check_sm70_marlin_n_tile_alignment(env_name, geometry, size_n);
+      resolve_sm70_marlin_cta_geometry(kSm70MarlinU4CtaEnv, size_m, size_n);
+  check_sm70_marlin_cta_geometry(kSm70MarlinU4CtaEnv, geometry);
+  check_sm70_marlin_cta_n_alignment(kSm70MarlinU4CtaEnv, geometry, size_n);
   int const split_k = parse_sm70_split_k(kSm70MarlinU4SplitKEnv);
   Sm70U4Launcher const launcher{
       a, c, b_q_weight, b_scales, b_zeros, size_m, size_n,
       size_k, split_k, c_tmp_or_none};
-  return dispatch_sm70_marlin_geometry(launcher, geometry, size_n, size_k,
-                                       group_size, "uint4");
+  return dispatch_sm70_marlin_geometry(launcher, geometry, group_size, "U4");
 }

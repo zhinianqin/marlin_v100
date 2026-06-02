@@ -37,23 +37,23 @@ class ArchitectureSupport:
 QUANT_TYPE_SUPPORT: dict[str, QuantTypeSupport] = {
     "uint4": QuantTypeSupport(name="uint4", dense_supported=True, moe_supported=True),
     "uint4b8": QuantTypeSupport(name="uint4b8", dense_supported=True, moe_supported=True),
-    "uint8": QuantTypeSupport(name="uint8", dense_supported=True, moe_supported=False),
-    "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=True, moe_supported=False),
+    "uint8": QuantTypeSupport(name="uint8", dense_supported=True, moe_supported=True),
+    "uint8b128": QuantTypeSupport(name="uint8b128", dense_supported=True, moe_supported=True),
     "fp8": QuantTypeSupport(
         name="fp8",
         dense_supported=True,
-        moe_supported=False,
+        moe_supported=True,
     ),
     "nvfp4": QuantTypeSupport(
         name="nvfp4",
         dense_supported=True,
-        moe_supported=False,
+        moe_supported=True,
         requires_nvfp4_global_scale=True,
     ),
     "mxfp4": QuantTypeSupport(
         name="mxfp4",
         dense_supported=True,
-        moe_supported=False,
+        moe_supported=True,
         requires_mxfp4=True,
     ),
 }
@@ -109,6 +109,7 @@ _QUANT_TYPE_IDS = {
     "uint8b128": _encode_scalar_type_id(0, 8, False, 128),
     "fp8": _encode_scalar_type_id(4, 3, True, 0, True, 2),
     "nvfp4": _encode_scalar_type_id(2, 1, True, 0, True, 0),
+    "mxfp4": _encode_scalar_type_id(2, 1, True, 0, True, 0),
 }
 
 

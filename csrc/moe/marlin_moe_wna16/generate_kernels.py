@@ -200,7 +200,7 @@ def generate_new_kernels():
             "else if (a_type == vllm::kFE4M3fn || b_type == vllm::kFE4M3fn || "
             "b_type == vllm::kFE2M1f || s_type == vllm::kFE4M3fn || "
             "s_type == vllm::kFE8M0fnu)\n"
-            '  { TORCH_CHECK(false, "marlin moe fp8 kernels are not built for SM70."); }'
+            '  { TORCH_CHECK(false, "SM70 Marlin MoE legacy kernel selector does not support FP8/FP4; use the CUTLASS fast path."); }'
         )
 
     with open(os.path.join(os.path.dirname(__file__), "kernel_selector.h"), "w") as f:

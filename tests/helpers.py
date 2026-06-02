@@ -1328,6 +1328,114 @@ def marlin_quantize_experts_uint4_zp_with_metadata(
     )
 
 
+def marlin_quantize_experts_uint8_zp_with_metadata(
+    weights: torch.Tensor,
+    group_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    q_weights = []
+    scales = []
+    zero_points = []
+    dequantized = []
+    g_indices = []
+    perms = []
+    for expert in range(weights.shape[0]):
+        _, q_weight, scale, zero_point, expert_dequantized = marlin_quantize_uint8_zp(
+            weights[expert],
+            group_size,
+        )
+        q_weights.append(q_weight)
+        scales.append(scale)
+        zero_points.append(zero_point)
+        dequantized.append(expert_dequantized)
+        g_indices.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+        perms.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+    return (
+        torch.stack(q_weights),
+        torch.stack(scales),
+        torch.stack(zero_points),
+        torch.stack(dequantized),
+        torch.stack(g_indices),
+        torch.stack(perms),
+    )
+
+
+def marlin_quantize_experts_nvfp4_with_metadata(
+    weights: torch.Tensor,
+    group_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    q_weights = []
+    scales = []
+    global_scales = []
+    dequantized = []
+    g_indices = []
+    perms = []
+    for expert in range(weights.shape[0]):
+        (
+            expert_dequantized,
+            q_weight,
+            scale,
+            global_scale,
+            _g_idx,
+            _sort_indices,
+            _rand_perm,
+        ) = marlin_quantize_nvfp4(weights[expert], group_size)
+        q_weights.append(q_weight)
+        scales.append(scale)
+        global_scales.append(global_scale.reshape(-1)[0])
+        dequantized.append(expert_dequantized)
+        g_indices.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+        perms.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+    return (
+        torch.stack(q_weights),
+        torch.stack(scales),
+        torch.stack(global_scales).contiguous(),
+        torch.stack(dequantized),
+        torch.stack(g_indices),
+        torch.stack(perms),
+    )
+
+
+def marlin_quantize_experts_mxfp4_with_metadata(
+    weights: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_weights = []
+    scales = []
+    dequantized = []
+    g_indices = []
+    perms = []
+    for expert in range(weights.shape[0]):
+        expert_dequantized, q_weight, scale, _g_idx, _sort_indices, _rand_perm = (
+            marlin_quantize_mxfp4(weights[expert], group_size)
+        )
+        q_weights.append(q_weight)
+        scales.append(scale)
+        dequantized.append(expert_dequantized)
+        g_indices.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+        perms.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+    return (
+        torch.stack(q_weights),
+        torch.stack(scales),
+        torch.stack(dequantized),
+        torch.stack(g_indices),
+        torch.stack(perms),
+    )
+
+
 def make_moe_model_like_inputs(
     tokens: int,
     hidden: int,

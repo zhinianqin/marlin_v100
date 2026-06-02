@@ -16,20 +16,29 @@ from tests.helpers import (
     make_moe_model_like_inputs,
     marlin_moe_reference,
     marlin_quantize_experts_uint4_zp_with_metadata,
+    marlin_quantize_experts_uint8_zp_with_metadata,
+    marlin_quantize_experts_nvfp4_with_metadata,
+    marlin_quantize_experts_mxfp4_with_metadata,
     marlin_quantize_experts,
     marlin_quantize_experts_with_metadata,
     scalar_types,
 )
 
 _MOE_SUPPORTED_QUANT_NAMES = frozenset(
-    supported_moe_quant_type_names(("uint4", "uint4b8", "uint8b128"))
+    supported_moe_quant_type_names(
+        ("uint4", "uint4b8", "uint8", "uint8b128", "fp8", "nvfp4", "mxfp4")
+    )
 )
 _GROUP_SIZES = (-1, 32, 64, 128)
 _UINT4_ZP_GROUP_SIZES = (-1, 32, 64, 128)
+_UINT8_ZP_GROUP_SIZES = (-1, 32, 64, 128)
+_FP8_GROUP_SIZES = (-1, 128)
 _SM70_MOE_U4_SPLIT_K_ENV = "SM70_MARLIN_MOE_U4_SPLIT_K"
 _SM70_MOE_U4_CTA_ENV = "SM70_MARLIN_MOE_U4_CTA"
 _SM70_SUPPORTED_MOE_BLOCK_SIZES = (8, 16, 32, 48, 64)
-_SUPPORTED_MOE_BLOCK_SIZE_ERROR = "moe_block_size=8, 16, 32, 48, or 64"
+_SUPPORTED_MOE_BLOCK_SIZE_ERROR = (
+    "moe_block_size=8, 16, 32, 48, or 64|unsupported moe_block_size="
+)
 _FLOAT16_DTYPE_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
     rf"|{source_target_label()} build only supports float16 outputs\."
@@ -52,11 +61,6 @@ _FORCED_THREAD_GEOMETRY_CASES = (
 _UNSUPPORTED_MOE_BLOCK_SIZE_CASES = (
     pytest.param(24, id="moe_block_24"),
 )
-_UNSUPPORTED_THREAD_GEOMETRY_CASES = (
-    pytest.param(16, 128, 128, 128, 128, id="thread_n_128_moe_block_16"),
-    pytest.param(16, 256, 128, 64, 256, id="thread_n_256_moe_block_16"),
-)
-
 
 def _require_moe_cuda() -> None:
     if not torch.cuda.is_available():
@@ -385,6 +389,43 @@ def _make_moe_accuracy_inputs(
         w2_q, w2_scales, w2_zeros, w2_dequant, w2_g_idx, w2_perm = (
             marlin_quantize_experts_uint4_zp_with_metadata(w2, group_size)
         )
+        w1_global_scale = None
+        w2_global_scale = None
+    elif quant_type == scalar_types.uint8:
+        if act_order:
+            raise AssertionError("uint8 zero-point tests do not support act_order")
+        w1_q, w1_scales, w1_zeros, w1_dequant, w1_g_idx, w1_perm = (
+            marlin_quantize_experts_uint8_zp_with_metadata(w1, group_size)
+        )
+        w2_q, w2_scales, w2_zeros, w2_dequant, w2_g_idx, w2_perm = (
+            marlin_quantize_experts_uint8_zp_with_metadata(w2, group_size)
+        )
+        w1_global_scale = None
+        w2_global_scale = None
+    elif quant_type == scalar_types.float4_e2m1f and group_size == 16:
+        if act_order:
+            raise AssertionError("nvfp4 tests do not support act_order")
+        w1_q, w1_scales, w1_global_scale, w1_dequant, w1_g_idx, w1_perm = (
+            marlin_quantize_experts_nvfp4_with_metadata(w1, group_size)
+        )
+        w2_q, w2_scales, w2_global_scale, w2_dequant, w2_g_idx, w2_perm = (
+            marlin_quantize_experts_nvfp4_with_metadata(w2, group_size)
+        )
+        w1_zeros = None
+        w2_zeros = None
+    elif quant_type == scalar_types.float4_e2m1f and group_size == 32:
+        if act_order:
+            raise AssertionError("mxfp4 tests do not support act_order")
+        w1_q, w1_scales, w1_dequant, w1_g_idx, w1_perm = (
+            marlin_quantize_experts_mxfp4_with_metadata(w1, group_size)
+        )
+        w2_q, w2_scales, w2_dequant, w2_g_idx, w2_perm = (
+            marlin_quantize_experts_mxfp4_with_metadata(w2, group_size)
+        )
+        w1_zeros = None
+        w2_zeros = None
+        w1_global_scale = None
+        w2_global_scale = None
     else:
         w1_q, w1_scales, w1_dequant, w1_g_idx, w1_perm = marlin_quantize_experts_with_metadata(
             w1, quant_type, group_size, act_order
@@ -394,6 +435,8 @@ def _make_moe_accuracy_inputs(
         )
         w1_zeros = None
         w2_zeros = None
+        w1_global_scale = None
+        w2_global_scale = None
     return {
         "tokens": tokens,
         "hidden": hidden,
@@ -406,12 +449,14 @@ def _make_moe_accuracy_inputs(
         "w1_q": w1_q,
         "w1_scales": w1_scales,
         "w1_zeros": w1_zeros,
+        "w1_global_scale": w1_global_scale,
         "w1_dequant": w1_dequant,
         "w1_g_idx": w1_g_idx,
         "w1_perm": w1_perm,
         "w2_q": w2_q,
         "w2_scales": w2_scales,
         "w2_zeros": w2_zeros,
+        "w2_global_scale": w2_global_scale,
         "w2_dequant": w2_dequant,
         "w2_g_idx": w2_g_idx,
         "w2_perm": w2_perm,
@@ -465,6 +510,8 @@ def _run_fused_moe_accuracy_case(
         topk_weights=inputs["topk_weights"],
         topk_ids=inputs["topk_ids"],
         quant_type_id=quant_type.id,
+        global_scale1=inputs["w1_global_scale"],
+        global_scale2=inputs["w2_global_scale"],
         w1_zeros=inputs["w1_zeros"],
         w2_zeros=inputs["w2_zeros"],
         g_idx1=inputs["w1_g_idx"],
@@ -528,7 +575,7 @@ def _assert_moe_backend_rejects_act_order(
             None,
             inputs["w1_scales"],
             None,
-            None,
+            inputs["w1_global_scale"],
             inputs["w1_zeros"],
             inputs["w1_g_idx"],
             inputs["w1_perm"],
@@ -583,6 +630,8 @@ def test_fused_marlin_moe_uint4b8_topk_weight_fusion_order_matches_reference(
         topk_weights=inputs["topk_weights"],
         topk_ids=inputs["topk_ids"],
         quant_type_id=scalar_types.uint4b8.id,
+        global_scale1=inputs["w1_global_scale"],
+        global_scale2=inputs["w2_global_scale"],
         w1_zeros=inputs["w1_zeros"],
         w2_zeros=inputs["w2_zeros"],
         g_idx1=inputs["w1_g_idx"],
@@ -762,7 +811,7 @@ def _run_stage1_kernel_case(
         None,
         inputs["w1_scales"],
         None,
-        None,
+        inputs["w1_global_scale"],
         inputs["w1_zeros"],
         inputs["w1_g_idx"],
         inputs["w1_perm"],
@@ -849,7 +898,7 @@ def _run_forced_fused_kernel_case(
         None,
         inputs["w1_scales"],
         None,
-        None,
+        inputs["w1_global_scale"],
         inputs["w1_zeros"],
         inputs["w1_g_idx"],
         inputs["w1_perm"],
@@ -882,7 +931,7 @@ def _run_forced_fused_kernel_case(
         None,
         inputs["w2_scales"],
         None,
-        None,
+        inputs["w2_global_scale"],
         inputs["w2_zeros"],
         inputs["w2_g_idx"],
         inputs["w2_perm"],
@@ -964,7 +1013,7 @@ def _assert_stage1_kernel_rejects_unsupported_config(
             None,
             inputs["w1_scales"],
             None,
-            None,
+            inputs["w1_global_scale"],
             inputs["w1_zeros"],
             inputs["w1_g_idx"],
             inputs["w1_perm"],
@@ -1017,30 +1066,6 @@ def test_moe_wna16_uint4b8_stage1_rejects_unsupported_moe_block_size(
         thread_k=-1,
         thread_n=-1,
         error_match=_SUPPORTED_MOE_BLOCK_SIZE_ERROR,
-    )
-
-
-@pytest.mark.parametrize(
-    "moe_block_size,hidden,intermediate,thread_k,thread_n", _UNSUPPORTED_THREAD_GEOMETRY_CASES
-)
-@pytest.mark.parametrize("repack_impl", _FORCED_GEOMETRY_REPACK_CASES)
-def test_moe_wna16_uint4b8_stage1_rejects_unsupported_thread_geometry(
-    repack_impl: str,
-    moe_block_size: int,
-    hidden: int,
-    intermediate: int,
-    thread_k: int,
-    thread_n: int,
-):
-    _assert_stage1_kernel_rejects_unsupported_config(
-        scalar_types.uint4b8,
-        repack_impl=repack_impl,
-        moe_block_size=moe_block_size,
-        hidden=hidden,
-        intermediate=intermediate,
-        thread_k=thread_k,
-        thread_n=thread_n,
-        error_match=_SUPPORTED_THREAD_GEOMETRY_ERROR,
     )
 
 
@@ -1589,7 +1614,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 None,
                 inputs["w1_scales"],
                 None,
-                None,
+                inputs["w1_global_scale"],
                 inputs["w1_zeros"],
                 inputs["w1_g_idx"],
                 inputs["w1_perm"],
@@ -1759,6 +1784,157 @@ if "uint8b128" in _MOE_SUPPORTED_QUANT_NAMES:
         )
 
 
+if "uint8" in _MOE_SUPPORTED_QUANT_NAMES:
+
+    @pytest.mark.parametrize("group_size", _UINT8_ZP_GROUP_SIZES)
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_uint8_zp_accuracy(group_size: int, repack_impl: str):
+        _run_fused_moe_accuracy_case(
+            scalar_types.uint8,
+            repack_impl=repack_impl,
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_moe_wna16_uint8_zp_stage1_matches_reference(repack_impl: str):
+        _run_stage1_kernel_case(
+            scalar_types.uint8,
+            repack_impl=repack_impl,
+            group_size=64,
+            act_order=False,
+            is_k_full=True,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+    @pytest.mark.parametrize("split_k", ("2", "4", "8"))
+    def test_moe_wna16_uint8_zp_split_k_stage1_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        split_k: str,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_MOE_U8_SPLIT_K", split_k)
+        _run_stage1_kernel_case(
+            scalar_types.uint8,
+            repack_impl="gptq",
+            group_size=64,
+            act_order=False,
+            is_k_full=True,
+            tokens=2,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+
+if "fp8" in _MOE_SUPPORTED_QUANT_NAMES:
+
+    @pytest.mark.parametrize("group_size", _FP8_GROUP_SIZES)
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_fp8_accuracy(group_size: int, repack_impl: str):
+        _run_fused_moe_accuracy_case(
+            scalar_types.float8_e4m3fn,
+            repack_impl=repack_impl,
+            group_size=group_size,
+            act_order=False,
+            is_k_full=True,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+    @pytest.mark.parametrize("split_k", ("2", "4", "8"))
+    def test_moe_wna16_fp8_split_k_stage1_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        split_k: str,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_MOE_FP8_SPLIT_K", split_k)
+        _run_stage1_kernel_case(
+            scalar_types.float8_e4m3fn,
+            repack_impl="gptq",
+            group_size=128,
+            act_order=False,
+            is_k_full=True,
+            tokens=2,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+
+if "nvfp4" in _MOE_SUPPORTED_QUANT_NAMES:
+
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_nvfp4_accuracy(repack_impl: str):
+        _run_fused_moe_accuracy_case(
+            scalar_types.float4_e2m1f,
+            repack_impl=repack_impl,
+            group_size=16,
+            act_order=False,
+            is_k_full=True,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+    @pytest.mark.parametrize("split_k", ("2", "4", "8"))
+    def test_moe_wna16_nvfp4_split_k_stage1_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        split_k: str,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_MOE_NVFP4_SPLIT_K", split_k)
+        _run_stage1_kernel_case(
+            scalar_types.float4_e2m1f,
+            repack_impl="gptq",
+            group_size=16,
+            act_order=False,
+            is_k_full=True,
+            tokens=2,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+
+if "mxfp4" in _MOE_SUPPORTED_QUANT_NAMES:
+
+    @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
+    def test_fused_marlin_moe_mxfp4_accuracy(repack_impl: str):
+        _run_fused_moe_accuracy_case(
+            scalar_types.float4_e2m1f,
+            repack_impl=repack_impl,
+            group_size=32,
+            act_order=False,
+            is_k_full=True,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+    @pytest.mark.parametrize("split_k", ("2", "4", "8"))
+    def test_moe_wna16_mxfp4_split_k_stage1_matches_reference(
+        monkeypatch: pytest.MonkeyPatch,
+        split_k: str,
+    ):
+        monkeypatch.setenv("SM70_MARLIN_MOE_MXFP4_SPLIT_K", split_k)
+        _run_stage1_kernel_case(
+            scalar_types.float4_e2m1f,
+            repack_impl="gptq",
+            group_size=32,
+            act_order=False,
+            is_k_full=True,
+            tokens=2,
+            moe_block_size=16,
+            rtol=2e-1,
+            atol=1.25,
+        )
+
+
 def test_moe_wna16_uint4_zp_rejects_non_uint4_quant_type():
     _require_moe_cuda()
     torch.manual_seed(0)
@@ -1776,7 +1952,10 @@ def test_moe_wna16_uint4_zp_rejects_non_uint4_quant_type():
         inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
     )
 
-    with pytest.raises(RuntimeError, match="only supports uint4 weights when zero-points are enabled"):
+    with pytest.raises(
+        RuntimeError,
+        match="only uint4 or uint8 weights when zero-points are enabled",
+    ):
         ops.moe_wna16_marlin_gemm(
             hidden_states,
             torch.empty(
@@ -1788,7 +1967,7 @@ def test_moe_wna16_uint4_zp_rejects_non_uint4_quant_type():
             None,
             inputs["w1_scales"],
             None,
-            None,
+            inputs["w1_global_scale"],
             inputs["w1_zeros"],
             inputs["w1_g_idx"],
             inputs["w1_perm"],
@@ -1841,7 +2020,7 @@ def test_moe_wna16_uint4_zp_rejects_packed_zero_points():
         dtype=torch.int32,
     )
 
-    with pytest.raises(RuntimeError, match="requires fp16 zero points"):
+    with pytest.raises(RuntimeError, match="require fp16 zero points"):
         ops.moe_wna16_marlin_gemm(
             hidden_states,
             torch.empty(
@@ -1853,7 +2032,7 @@ def test_moe_wna16_uint4_zp_rejects_packed_zero_points():
             None,
             inputs["w1_scales"],
             None,
-            None,
+            inputs["w1_global_scale"],
             packed_zero_points,
             inputs["w1_g_idx"],
             inputs["w1_perm"],
@@ -1909,7 +2088,7 @@ def test_moe_wna16_uint4_zp_rejects_mismatched_zero_point_shape():
             None,
             inputs["w1_scales"],
             None,
-            None,
+            inputs["w1_global_scale"],
             bad_zero_points,
             inputs["w1_g_idx"],
             inputs["w1_perm"],

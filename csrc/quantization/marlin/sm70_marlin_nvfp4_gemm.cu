@@ -13,10 +13,6 @@
 #include <cuda_fp16.h>
 #include <torch/library.h>
 #include <cstdint>
-#include <cstdlib>
-#include <sstream>
-#include <string>
-#include <type_traits>
 
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/threadblock/default_epilogue_volta_tensor_op.h"
@@ -30,8 +26,9 @@ using marlin::sm70::Sm70AtomicFp32Epilogue;
 using marlin::sm70::Sm70MarlinGemmTraits;
 using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::check_sm70_marlin_cta_geometry;
-using marlin::sm70::check_sm70_marlin_n_tile_alignment;
+using marlin::sm70::check_sm70_marlin_cta_n_alignment;
 using marlin::sm70::configure_sm70_dynamic_smem;
+using marlin::sm70::dispatch_sm70_marlin_fixed_group_geometry;
 using marlin::sm70::kCtaK;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
@@ -49,6 +46,8 @@ using marlin::sm70::u4_cta_n_qweight_offset_from_logical;
 namespace {
 
 constexpr int kNvfp4ValuesPerWord = 8;
+constexpr char const* kSm70MarlinNvfp4CtaEnv =
+    "SM70_MARLIN_NVFP4_CTA";
 constexpr char const* kSm70MarlinNvfp4SplitKEnv =
     "SM70_MARLIN_NVFP4_SPLIT_K";
 
@@ -62,21 +61,21 @@ class Sm70Nvfp4IteratorB {
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
   static_assert(Shape::kK == kCtaK,
-                "The SM70 NVFP4 IteratorB expects CTA_K=32.");
+                "SM70 Marlin NVFP4 IteratorB expects CTA_K=32.");
   static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
-                "The SM70 NVFP4 IteratorB expects CTA_N in {64, 128, 256}.");
+                "SM70 Marlin NVFP4 IteratorB expects CTA_N in {64, 128, 256}.");
   static_assert(ThreadMap::Iterations::kContiguous ==
                     Shape::kN / kQuantTileN,
-                "The SM70 NVFP4 IteratorB expects one contiguous iteration "
+                "SM70 Marlin NVFP4 IteratorB expects one contiguous iteration "
                 "per 64-column quant tile.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
-                "The SM70 NVFP4 IteratorB expects 64-column deltas.");
+                "SM70 Marlin NVFP4 IteratorB expects 64-column deltas.");
   static_assert(ThreadMap::kElementsPerAccess == kNvfp4ValuesPerWord,
-                "The SM70 NVFP4 IteratorB expects one packed FP4 word per "
+                "SM70 Marlin NVFP4 IteratorB expects one packed FP4 word per "
                 "access.");
   static_assert(ThreadMap::Iterations::kStrided == 1 ||
                     ThreadMap::Iterations::kStrided == 2,
-                "SM70 U4-family IteratorB expects one or two strided iterations.");
+                "SM70 Marlin U4-family IteratorB expects one or two strided iterations.");
   static constexpr int kStridedQweightDeltaWords =
       32 * (Shape::kN / kQuantTileN);
 
@@ -243,7 +242,7 @@ class Sm70Nvfp4IteratorB {
         }
       } else {
         static_assert(ThreadMap::Iterations::kContiguous == 1,
-                      "Unsupported SM70 NVFP4 contiguous iteration count.");
+                      "Unsupported SM70 Marlin NVFP4 contiguous iteration count.");
         uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_offset_);
         half2 const* scale_vec = cached_scales_;
 
@@ -314,7 +313,7 @@ class Sm70Nvfp4IteratorB {
           }
         } else {
           static_assert(ThreadMap::Iterations::kContiguous == 1,
-                        "Unsupported SM70 NVFP4 contiguous iteration count.");
+                        "Unsupported SM70 Marlin NVFP4 contiguous iteration count.");
           uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_s);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
@@ -507,9 +506,10 @@ torch::Tensor launch_sm70_marlin_nvfp4_gemm(
     return c;
   }
 
-  TORCH_CHECK(size_k % int64_t(kCtaK) == 0, kSm70MarlinNvfp4SplitKEnv,
-              " requires K divisible by 32 for split_k > 1. Got K=", size_k,
-              ", split_k=", split_k, ".");
+  TORCH_CHECK(size_k % int64_t(kCtaK) == 0,
+              "SM70 Marlin NVFP4 requires K divisible by 32 for split_k > 1. "
+              "Got K=",
+              size_k, ", split_k=", split_k, ".");
 
   auto split_kernel =
       sm70_marlin_nvfp4_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
@@ -564,56 +564,6 @@ struct Sm70Nvfp4Launcher {
   }
 };
 
-template <int CtaM, int CtaN, int Warps, typename Launcher>
-torch::Tensor dispatch_nvfp4_group_size(Launcher const& launcher,
-                                        int64_t group_size,
-                                        char const* quant_name) {
-  switch (group_size) {
-    case 16:
-      return launcher.template operator()<CtaM, CtaN, Warps, 16>();
-    default:
-      TORCH_CHECK(false, "SM70 CUTLASS ", quant_name,
-                  " supports only group_size 16. Got ",
-                  group_size);
-  }
-  return torch::Tensor();
-}
-
-template <typename Launcher>
-torch::Tensor dispatch_nvfp4_geometry(Launcher const& launcher,
-                                      Sm70CtaGeometry geometry,
-                                      int64_t /*size_n*/, int64_t /*size_k*/,
-                                      int64_t group_size,
-                                      char const* quant_name) {
-#define DISPATCH_SM70_NVFP4_CTA(CM, CN, W)                              \
-  if (geometry.cta_m == CM && geometry.cta_n == CN &&                    \
-      geometry.warps == W) {                                             \
-    return dispatch_nvfp4_group_size<CM, CN, W>(launcher, group_size,      \
-                                               quant_name);               \
-  }
-
-  DISPATCH_SM70_NVFP4_CTA(32, 128, 4)
-  DISPATCH_SM70_NVFP4_CTA(32, 256, 4)
-  DISPATCH_SM70_NVFP4_CTA(64, 64, 4)
-  DISPATCH_SM70_NVFP4_CTA(64, 128, 4)
-  DISPATCH_SM70_NVFP4_CTA(64, 128, 8)
-  DISPATCH_SM70_NVFP4_CTA(64, 256, 4)
-  DISPATCH_SM70_NVFP4_CTA(64, 256, 8)
-  DISPATCH_SM70_NVFP4_CTA(128, 64, 4)
-  DISPATCH_SM70_NVFP4_CTA(128, 64, 8)
-  DISPATCH_SM70_NVFP4_CTA(128, 128, 4)
-  DISPATCH_SM70_NVFP4_CTA(128, 128, 8)
-  DISPATCH_SM70_NVFP4_CTA(128, 256, 8)
-  DISPATCH_SM70_NVFP4_CTA(256, 64, 4)
-  DISPATCH_SM70_NVFP4_CTA(256, 64, 8)
-  DISPATCH_SM70_NVFP4_CTA(256, 128, 8)
-
-#undef DISPATCH_SM70_NVFP4_CTA
-
-  TORCH_CHECK(false, "Unreachable SM70 ", quant_name,
-              " CTA geometry dispatch.");
-}
-
 torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      torch::Tensor& b_q_weight,
                                      torch::Tensor& b_scales,
@@ -624,15 +574,14 @@ torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                          c_tmp_or_none) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  char const* env_name = "SM70_MARLIN_NVFP4_CTA";
   Sm70CtaGeometry const geometry =
-      resolve_sm70_marlin_cta_geometry(env_name, size_m, size_n);
-  check_sm70_marlin_cta_geometry(env_name, geometry);
-  check_sm70_marlin_n_tile_alignment(env_name, geometry, size_n);
+      resolve_sm70_marlin_cta_geometry(kSm70MarlinNvfp4CtaEnv, size_m, size_n);
+  check_sm70_marlin_cta_geometry(kSm70MarlinNvfp4CtaEnv, geometry);
+  check_sm70_marlin_cta_n_alignment(kSm70MarlinNvfp4CtaEnv, geometry, size_n);
   int const split_k = parse_sm70_split_k(kSm70MarlinNvfp4SplitKEnv);
   Sm70Nvfp4Launcher const launcher{
       a, c, b_q_weight, b_scales, global_scale, size_m, size_n, size_k,
       split_k, c_tmp_or_none};
-  return dispatch_nvfp4_geometry(launcher, geometry, size_n, size_k,
-                                 group_size, "nvfp4");
+  return dispatch_sm70_marlin_fixed_group_geometry<16>(
+      launcher, geometry, group_size, "NVFP4");
 }
