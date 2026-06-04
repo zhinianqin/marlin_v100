@@ -63,7 +63,17 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 */
 
-#include "marlin_dtypes.cuh"
+#ifndef MARLIN_NAMESPACE_NAME
+  #define MARLIN_NAMESPACE_NAME marlin
+#endif
+
+#include "core/scalar_type.hpp"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
+#include <cstdint>
 
 namespace MARLIN_NAMESPACE_NAME {
 

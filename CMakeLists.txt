@@ -78,30 +78,6 @@ set_gencode_flags_for_srcs(
   SRCS "${MARLIN_V100_DENSE_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
 
-set(MARLIN_GEN_SCRIPT
-  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/marlin/generate_kernels.py)
-execute_process(
-  COMMAND ${CMAKE_COMMAND} -E env
-  PYTHONPATH=$ENV{PYTHONPATH}
-    ${Python_EXECUTABLE} ${MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
-  RESULT_VARIABLE marlin_generation_result
-  OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/marlin_generation.log
-  ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/marlin_generation.log
-)
-if (NOT marlin_generation_result EQUAL 0)
-  message(FATAL_ERROR "marlin_v100 dense kernel generation failed")
-endif()
-
-file(GLOB MARLIN_TEMPLATE_SM70_KERNEL_SRC "csrc/quantization/marlin/sm70_kernel_*.cu")
-set_gencode_flags_for_srcs(
-  SRCS "${MARLIN_TEMPLATE_SM70_KERNEL_SRC}"
-  CUDA_ARCHS "${CUDA_ARCHS}")
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-  set_source_files_properties(${MARLIN_TEMPLATE_SM70_KERNEL_SRC}
-    PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
-endif()
-list(APPEND MARLIN_V100_DENSE_SRC ${MARLIN_TEMPLATE_SM70_KERNEL_SRC})
-
 set(MARLIN_SRCS
    "csrc/quantization/marlin/marlin.cu"
    "csrc/quantization/marlin/sm70_cutlass_matmul_probe.cu"
@@ -132,30 +108,6 @@ set(MARLIN_V100_MOE_SRC
 set_gencode_flags_for_srcs(
   SRCS "${MARLIN_V100_MOE_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
-
-set(MOE_MARLIN_GEN_SCRIPT
-  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/marlin_moe_wna16/generate_kernels.py)
-execute_process(
-  COMMAND ${CMAKE_COMMAND} -E env
-  PYTHONPATH=$ENV{PYTHONPATH}
-    ${Python_EXECUTABLE} ${MOE_MARLIN_GEN_SCRIPT} ${CUDA_ARCHS_STR}
-  RESULT_VARIABLE moe_marlin_generation_result
-  OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/moe_marlin_generation.log
-  ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/moe_marlin_generation.log
-)
-if (NOT moe_marlin_generation_result EQUAL 0)
-  message(FATAL_ERROR "marlin_v100 moe kernel generation failed")
-endif()
-
-file(GLOB MARLIN_MOE_SM70_SRC "csrc/moe/marlin_moe_wna16/sm70_kernel_*.cu")
-set_gencode_flags_for_srcs(
-  SRCS "${MARLIN_MOE_SM70_SRC}"
-  CUDA_ARCHS "${CUDA_ARCHS}")
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-  set_source_files_properties(${MARLIN_MOE_SM70_SRC}
-    PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
-endif()
-list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM70_SRC})
 
 set(MARLIN_MOE_OTHER_SRC
   "csrc/moe/marlin_moe_wna16/ops.cu"
