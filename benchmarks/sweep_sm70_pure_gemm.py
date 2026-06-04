@@ -16,7 +16,7 @@ from typing import Any
 import torch
 
 from benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
-from common import check_cuda_ready, timestamp
+from common import require_matching_cuda_benchmark_runtime, timestamp
 from marlin_v100 import ops
 
 
@@ -895,7 +895,7 @@ def main() -> None:
     resources = parse_resource_usage(resource_text)
     spills = parse_ptxas_spills(build_text)
 
-    check_cuda_ready()
+    require_matching_cuda_benchmark_runtime()
     ops._load_dense()
 
     torch.manual_seed(args.seed)

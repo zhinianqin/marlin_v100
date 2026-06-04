@@ -24,10 +24,6 @@ namespace marlin_moe_wna16 {
 namespace {
 
 constexpr int kU4ValuesPerWord = 8;
-constexpr char const* kSm70MarlinMoeU4B8CtaEnv =
-    "SM70_MARLIN_MOE_U4B8_CTA";
-constexpr char const* kSm70MarlinMoeU4B8SplitKEnv =
-    "SM70_MARLIN_MOE_U4B8_SPLIT_K";
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
 class Sm70MoeU4B8IteratorB {
@@ -55,9 +51,6 @@ class Sm70MoeU4B8IteratorB {
                     ThreadMap::Iterations::kStrided == 2,
                 "SM70 Marlin MoE U4-family IteratorB expects one or two strided "
                 "iterations.");
-  static constexpr int kStridedQweightDeltaWords =
-      32 * (Shape::kN / kQuantTileN);
-
   struct Params {
     int size_k;
     int size_n;
@@ -264,6 +257,8 @@ class Sm70MoeU4B8IteratorB {
       }
     } else {
       int const qweight_base = qweight_base_offset_;
+      constexpr int kStridedQweightDeltaWords =
+          32 * (Shape::kN / kQuantTileN);
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
         int const qweight_base_s =
@@ -385,7 +380,7 @@ struct Sm70MoeU4B8Launcher {
   int64_t size_m;
   int64_t size_n;
   int64_t size_k;
-  int split_k;
+  int requested_split_k;
   std::optional<torch::Tensor> const& c_tmp_or_none;
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
@@ -393,9 +388,9 @@ struct Sm70MoeU4B8Launcher {
     using Traits = Sm70MoeU4B8GemmTraits<CtaM, CtaN, Warps, GroupSize>;
     return launch_sm70_marlin_moe_gemm<Traits>(
         a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
-        expert_ids, num_tokens_past_padded, topk_weights,
-        kSm70MarlinMoeU4B8SplitKEnv, moe_block_size, top_k, mul_topk_weights,
-        size_m, size_n, size_k, split_k, c_tmp_or_none);
+        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
+        top_k, mul_topk_weights, size_m, size_n, size_k, requested_split_k,
+        c_tmp_or_none);
   }
 };
 
@@ -411,22 +406,23 @@ torch::Tensor sm70_marlin_u4b8_gemm(
   c10::cuda::CUDAGuard device_guard(a.device());
 
   Sm70CtaGeometry const geometry =
-      resolve_sm70_marlin_moe_cta_geometry(kSm70MarlinMoeU4B8CtaEnv, size_n);
-  check_sm70_marlin_moe_cta_geometry(kSm70MarlinMoeU4B8CtaEnv, geometry);
-  check_sm70_marlin_moe_cta_n_alignment(kSm70MarlinMoeU4B8CtaEnv, geometry,
+      sm70_marlin_moe_auto_stage_cta_geometry(size_m, size_n);
+  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE U4B8", geometry);
+  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE U4B8", geometry,
                                         size_n);
   TORCH_CHECK(size_k % kCtaK == 0,
               "SM70 Marlin MoE U4B8 requires K divisible by 32. Got K=",
               size_k, ".");
 
-  int const split_k = parse_sm70_split_k(kSm70MarlinMoeU4B8SplitKEnv);
+  int const requested_split_k = sm70_marlin_moe_auto_stage_requested_split_k(
+      size_m, size_n, size_k, top_k, geometry);
   auto empty_half = torch::empty({0}, b_scales.options().dtype(at::kHalf));
   auto empty_float = torch::empty(
       {0}, torch::TensorOptions().dtype(at::kFloat).device(a.device()));
   Sm70MoeU4B8Launcher const launcher{
       a, c, b_q_weight, b_scales, empty_half, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-      mul_topk_weights, size_m, size_n, size_k, split_k, c_tmp_or_none};
+      mul_topk_weights, size_m, size_n, size_k, requested_split_k, c_tmp_or_none};
   return dispatch_sm70_marlin_moe_geometry(launcher, geometry, group_size,
                                            "U4B8");
 }

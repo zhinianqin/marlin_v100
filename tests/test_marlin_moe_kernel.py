@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections import Counter, OrderedDict
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,8 +34,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.scalar_type import scalar_types
 from tests.writeback_marlin_cases import (
-    MOE_CTA_ENV_BY_QUANT,
-    MOE_SPLIT_K_ENV_BY_QUANT,
     MOE_WRITEBACK_CLASS_CASES,
     MOE_WRITEBACK_CLASS_CASE_BY_NAME,
     MoeWritebackMatrixCase,
@@ -45,7 +41,6 @@ from tests.writeback_marlin_cases import (
 )
 
 
-_MOE_METHOD_SPLIT_K_VALUES = ("unset", "1", "2", "4", "8")
 _MOE_METHOD_CLASS_TEST_COVERAGE = {
     "gptq_moe",
     "awq_moe",
@@ -438,37 +433,6 @@ def _install_fused_marlin_cpu_mocks(monkeypatch: pytest.MonkeyPatch) -> list[_Re
     return records
 
 
-def _set_moe_split_k_env(
-    monkeypatch: pytest.MonkeyPatch,
-    quant_name: str,
-    split_k: str,
-) -> None:
-    env_name = MOE_SPLIT_K_ENV_BY_QUANT[quant_name]
-    if split_k == "unset":
-        monkeypatch.delenv(env_name, raising=False)
-    else:
-        monkeypatch.setenv(env_name, split_k)
-
-
-def _set_moe_matrix_env(
-    monkeypatch: pytest.MonkeyPatch,
-    case: MoeWritebackMatrixCase,
-) -> None:
-    split_env = MOE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name)
-    if split_env is not None:
-        if case.split_k == "unset":
-            monkeypatch.delenv(split_env, raising=False)
-        else:
-            monkeypatch.setenv(split_env, case.split_k)
-
-    cta_env = MOE_CTA_ENV_BY_QUANT.get(case.quant_name)
-    if cta_env is not None:
-        if case.cta.value is None:
-            monkeypatch.delenv(cta_env, raising=False)
-        else:
-            monkeypatch.setenv(cta_env, case.cta.value)
-
-
 def _gptq_config_for_quant_name(quant_name: str) -> GPTQMarlinConfig:
     if quant_name == "uint4b8":
         weight_bits = 4
@@ -763,33 +727,6 @@ def _prepare_moe_matrix_case(case: MoeWritebackMatrixCase) -> tuple[
     return result
 
 
-@contextmanager
-def _moe_matrix_env(case: MoeWritebackMatrixCase):
-    changes: list[tuple[str, str | None]] = []
-    for env_name, value in (
-        (
-            MOE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name),
-            None if case.split_k == "unset" else case.split_k,
-        ),
-        (MOE_CTA_ENV_BY_QUANT.get(case.quant_name), case.cta.value),
-    ):
-        if env_name is None:
-            continue
-        changes.append((env_name, os.environ.get(env_name)))
-        if value is None:
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = value
-    try:
-        yield
-    finally:
-        for env_name, old_value in reversed(changes):
-            if old_value is None:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = old_value
-
-
 def _moe_matrix_row(
     case: MoeWritebackMatrixCase,
     *,
@@ -810,8 +747,6 @@ def _moe_matrix_row(
         "experts": case.shape.experts,
         "topk": case.shape.topk,
         "routing_profile": case.shape.routing_profile,
-        "split_k": case.split_k,
-        "cta": case.cta.name,
         "status": status,
         "is_zp_float": expected_is_zp_float,
         "c_tmp_numel": c_tmp_numel,
@@ -908,8 +843,6 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
         "experts": Counter(),
         "topk": Counter(),
         "routing_profile": Counter(),
-        "split_k": Counter(),
-        "cta": Counter(),
     }
     ok_coverage: dict[str, Counter[Any]] = {
         key: Counter() for key in coverage
@@ -930,8 +863,6 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
             coverage["experts"][matrix_case.shape.experts] += 1
             coverage["topk"][matrix_case.shape.topk] += 1
             coverage["routing_profile"][matrix_case.shape.routing_profile] += 1
-            coverage["split_k"][matrix_case.split_k] += 1
-            coverage["cta"][matrix_case.cta.name] += 1
 
             if not matrix_case.supported:
                 status_counts["SKIP"] += 1
@@ -942,29 +873,28 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
             c_tmp_numel: int | None = None
             try:
                 records.clear()
-                with _moe_matrix_env(matrix_case):
-                    method, layer, expected_zp_float = _prepare_moe_matrix_case(
-                        matrix_case
-                    )
-                    hidden_states = torch.zeros(
-                        matrix_case.shape.tokens,
-                        matrix_case.shape.hidden,
-                        dtype=torch.float16,
-                    )
-                    topk_weights, topk_ids = make_moe_routing_tensors(
-                        tokens=matrix_case.shape.tokens,
-                        experts=matrix_case.shape.experts,
-                        topk=matrix_case.shape.topk,
-                        device=torch.device("cpu"),
-                        routing_profile=matrix_case.shape.routing_profile,
-                    )
-                    output = method.apply(
-                        layer,
-                        hidden_states,
-                        topk_weights,
-                        topk_ids,
-                        None,
-                    )
+                method, layer, expected_zp_float = _prepare_moe_matrix_case(
+                    matrix_case
+                )
+                hidden_states = torch.zeros(
+                    matrix_case.shape.tokens,
+                    matrix_case.shape.hidden,
+                    dtype=torch.float16,
+                )
+                topk_weights, topk_ids = make_moe_routing_tensors(
+                    tokens=matrix_case.shape.tokens,
+                    experts=matrix_case.shape.experts,
+                    topk=matrix_case.shape.topk,
+                    device=torch.device("cpu"),
+                    routing_profile=matrix_case.shape.routing_profile,
+                )
+                output = method.apply(
+                    layer,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    None,
+                )
 
                 assert output.shape == hidden_states.shape
                 assert len(records) == 2
@@ -1021,8 +951,6 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                 ok_coverage["routing_profile"][
                     matrix_case.shape.routing_profile
                 ] += 1
-                ok_coverage["split_k"][matrix_case.split_k] += 1
-                ok_coverage["cta"][matrix_case.cta.name] += 1
             except Exception as exc:
                 status = "ERR"
                 reason = str(exc).splitlines()[0]
@@ -1055,7 +983,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
 
     elapsed = time.time() - started
     summary = {
-        "matrix": "class x quant x group x shape x split-K x CTA",
+        "matrix": "class x quant x group x shape",
         "total": status_counts["total"],
         "OK": status_counts["OK"],
         "SKIP": status_counts["SKIP"],
@@ -1161,15 +1089,12 @@ def test_gptq_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
     "quant_name",
     MOE_WRITEBACK_CLASS_CASE_BY_NAME["gptq"].quant_names,
 )
-@pytest.mark.parametrize("split_k", _MOE_METHOD_SPLIT_K_VALUES)
-def test_gptq_marlin_moe_method_class_split_k_matrix_uses_owner(
+def test_gptq_marlin_moe_method_class_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
-    split_k: str,
 ):
     import vllm.model_executor.layers.quantization.gptq_marlin as gptq_mod
 
-    _set_moe_split_k_env(monkeypatch, quant_name, split_k)
     monkeypatch.setattr(
         gptq_mod.ops,
         "gptq_marlin_moe_repack",
@@ -1254,15 +1179,12 @@ def test_awq_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
     "quant_name",
     MOE_WRITEBACK_CLASS_CASE_BY_NAME["awq_moe"].quant_names,
 )
-@pytest.mark.parametrize("split_k", _MOE_METHOD_SPLIT_K_VALUES)
-def test_awq_marlin_moe_method_class_split_k_matrix_uses_owner(
+def test_awq_marlin_moe_method_class_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
-    split_k: str,
 ):
     import vllm.model_executor.layers.quantization.awq_marlin as awq_mod
 
-    _set_moe_split_k_env(monkeypatch, quant_name, split_k)
     monkeypatch.setattr(
         awq_mod.ops,
         "awq_marlin_moe_repack",
@@ -1343,15 +1265,12 @@ def test_compressed_tensors_wna16_marlin_moe_method_persists_c_tmp_and_apply_use
     "quant_name",
     MOE_WRITEBACK_CLASS_CASE_BY_NAME["compressed_tensors_wna16_moe"].quant_names,
 )
-@pytest.mark.parametrize("split_k", _MOE_METHOD_SPLIT_K_VALUES)
-def test_compressed_tensors_wna16_marlin_moe_method_class_split_k_matrix_uses_owner(
+def test_compressed_tensors_wna16_marlin_moe_method_class_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
-    split_k: str,
 ):
     import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe as ct_mod
 
-    _set_moe_split_k_env(monkeypatch, quant_name, split_k)
     monkeypatch.setattr(
         ct_mod.ops,
         "gptq_marlin_moe_repack",

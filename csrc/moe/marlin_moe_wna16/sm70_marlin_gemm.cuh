@@ -9,10 +9,7 @@
 #include <torch/library.h>
 #include <torch/types.h>
 
-#include <cstdlib>
 #include <cstdint>
-#include <sstream>
-#include <string>
 #include <type_traits>
 
 #include "quantization/marlin/sm70_marlin_common.cuh"
@@ -35,7 +32,7 @@ using marlin::sm70::kCtaK;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
 using marlin::sm70::launch_sm70_fp32_to_fp16;
-using marlin::sm70::parse_sm70_split_k;
+using marlin::sm70::sm70_marlin_moe_auto_stage_requested_split_k;
 using marlin::sm70::sm70_active_split_k;
 using marlin::sm70::sm70_get_splitk_ctmp;
 using marlin::sm70::sm70_splitk_partition;
@@ -59,41 +56,17 @@ inline int sm70_marlin_moe_auto_cta_n(int64_t size_n) {
   return 0;
 }
 
-inline Sm70CtaGeometry parse_sm70_marlin_moe_cta_geometry(
-    char const* env_name) {
-  char const* env = std::getenv(env_name);
-  TORCH_CHECK(env != nullptr && env[0] != '\0', env_name,
-              " must use format CTA_MxCTA_NxWarps when explicitly parsed, "
-              "for example 32x128x4.");
-
-  std::string spec(env);
-  for (char& ch : spec) {
-    if (ch == 'x' || ch == 'X' || ch == '*' || ch == ',') {
-      ch = ' ';
-    }
-  }
-
-  int cta_m = 0;
-  int cta_n = 0;
-  int warps = 0;
-  std::string extra;
-  std::istringstream stream(spec);
-  TORCH_CHECK((stream >> cta_m >> cta_n >> warps) && !(stream >> extra),
-              env_name,
-              " must use format CTA_MxCTA_NxWarps, for example 32x128x4. "
-              "Got: ",
-              env);
-  return {cta_m, cta_n, warps};
-}
-
-inline Sm70CtaGeometry sm70_marlin_moe_default_cta_geometry(int auto_cta_n) {
+inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(int64_t tokens,
+                                                            int auto_cta_n) {
   switch (auto_cta_n) {
     case 64:
       return {64, 64, 4};
     case 128:
-      return {32, 128, 4};
+      return tokens >= 4096 ? Sm70CtaGeometry{64, 128, 8}
+                            : Sm70CtaGeometry{32, 128, 4};
     case 256:
-      return {32, 256, 4};
+      return tokens >= 1024 ? Sm70CtaGeometry{64, 256, 4}
+                            : Sm70CtaGeometry{32, 256, 4};
     default:
       TORCH_CHECK(false, "Unsupported SM70 Marlin MoE auto CTA_N=",
                   auto_cta_n, ".");
@@ -101,21 +74,10 @@ inline Sm70CtaGeometry sm70_marlin_moe_default_cta_geometry(int auto_cta_n) {
   return {0, 0, 0};
 }
 
-inline Sm70CtaGeometry resolve_sm70_marlin_moe_cta_geometry(
-    char const* env_name, int64_t size_n) {
+inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry(
+    int64_t tokens, int64_t size_n) {
   int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
-  char const* env = std::getenv(env_name);
-  if (env == nullptr || env[0] == '\0') {
-    return sm70_marlin_moe_default_cta_geometry(auto_cta_n);
-  }
-
-  Sm70CtaGeometry geometry = parse_sm70_marlin_moe_cta_geometry(env_name);
-  TORCH_CHECK(geometry.cta_n == auto_cta_n, env_name,
-              " specifies CTA_N=", geometry.cta_n, " but size_n=", size_n,
-              " requires auto CTA_N=", auto_cta_n,
-              ". CTA_N is selected from 256, 128, and 64 and is not a free "
-              "SM70 Marlin MoE tuning parameter.");
-  return geometry;
+  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
 }
 
 inline bool sm70_marlin_moe_cta_geometry_is_supported(
@@ -132,23 +94,23 @@ inline bool sm70_marlin_moe_cta_geometry_is_supported(
          (cta_m == 64 && cta_n == 256 && warps == 8);
 }
 
-inline void check_sm70_marlin_moe_cta_geometry(char const* env_name,
-                                               Sm70CtaGeometry geometry) {
+inline void validate_sm70_marlin_moe_stage_cta_geometry_supported(char const* op_name,
+                                                                  Sm70CtaGeometry geometry) {
   TORCH_CHECK(sm70_marlin_moe_cta_geometry_is_supported(geometry),
-              "Unsupported ", env_name, "=", geometry.cta_m, "x",
-              geometry.cta_n, "x", geometry.warps,
+              "Unsupported SM70 Marlin MoE CTA geometry for ", op_name, ": ",
+              geometry.cta_m, "x", geometry.cta_n, "x", geometry.warps,
               ". Supported geometries are ",
               kSupportedSm70MarlinMoeCtaGeometries, ".");
 }
 
-inline void check_sm70_marlin_moe_cta_n_alignment(char const* env_name,
-                                                  Sm70CtaGeometry geometry,
-                                                  int64_t size_n) {
+inline void validate_sm70_marlin_moe_stage_cta_n_alignment(char const* op_name,
+                                                           Sm70CtaGeometry geometry,
+                                                           int64_t size_n) {
   TORCH_CHECK(
       size_n % geometry.cta_n == 0 && size_n % kQuantTileN == 0,
       "SM70 Marlin MoE requires size_n divisible by both CTA_N and 64 for ",
-      env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
-      geometry.warps, ". Got size_n = ", size_n, ".");
+      op_name, " with CTA geometry ", geometry.cta_m, "x", geometry.cta_n,
+      "x", geometry.warps, ". Got size_n = ", size_n, ".");
 }
 
 template <int CtaM, int CtaN, int Warps, typename Launcher>
@@ -234,21 +196,21 @@ template <typename Launcher, typename Dispatch>
 torch::Tensor dispatch_sm70_marlin_moe_cta_geometry(
     Launcher const& launcher, Sm70CtaGeometry geometry, int64_t group_size,
     Dispatch dispatch) {
-#define DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(CM, CN, W)                      \
+#define DISPATCH_SM70_MOE_SHARED_GEOMETRY(CM, CN, W)                      \
   if (geometry.cta_m == CM && geometry.cta_n == CN &&                       \
       geometry.warps == W) {                                                \
     return dispatch.template operator()<CM, CN, W>(launcher, group_size);    \
   }
 
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(32, 128, 4)
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(32, 256, 4)
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(64, 64, 4)
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(64, 128, 4)
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(64, 128, 8)
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(64, 256, 4)
-  DISPATCH_SM70_MARLIN_MOE_SHARED_CTA(64, 256, 8)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(32, 128, 4)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(32, 256, 4)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(64, 64, 4)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(64, 128, 4)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(64, 128, 8)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(64, 256, 4)
+  DISPATCH_SM70_MOE_SHARED_GEOMETRY(64, 256, 8)
 
-#undef DISPATCH_SM70_MARLIN_MOE_SHARED_CTA
+#undef DISPATCH_SM70_MOE_SHARED_GEOMETRY
 
   TORCH_CHECK(false, "Unreachable SM70 Marlin MoE CTA dispatch.");
 }
@@ -669,7 +631,7 @@ void sm70_marlin_moe_gemm_kernel(
     int32_t const* __restrict__ expert_ids,
     int32_t const* __restrict__ num_tokens_past_padded,
     float const* __restrict__ topk_weights, int moe_block_size, int top_k,
-    bool mul_topk_weights, int m, int n, int k, int lda, int split_k) {
+    bool mul_topk_weights, int m, int n, int k, int lda, int requested_split_k) {
   using Mma = typename Traits::Mma;
   using Epilogue = Sm70MoeScatterEpilogue<Traits>;
   constexpr int CtaM = Traits::ThreadblockShape::kM;
@@ -702,7 +664,7 @@ void sm70_marlin_moe_gemm_kernel(
   int partition_k = k;
   if constexpr (SplitK) {
     Sm70SplitKPartition const partition =
-        sm70_splitk_partition<Traits::kGroupSize>(k, split_k, int(blockIdx.z));
+        sm70_splitk_partition<Traits::kGroupSize>(k, requested_split_k, int(blockIdx.z));
     if (partition.partition_k == 0) {
       return;
     }
@@ -751,10 +713,9 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
     torch::Tensor& b_scales, torch::Tensor& b_zeros,
     torch::Tensor& global_scale, torch::Tensor& sorted_token_ids,
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
-    torch::Tensor& topk_weights, char const* split_k_env,
-    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-    int64_t size_m, int64_t size_n, int64_t size_k, int split_k,
-    std::optional<torch::Tensor> const& c_tmp_or_none) {
+    torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
+    bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
+    int requested_split_k, std::optional<torch::Tensor> const& c_tmp_or_none) {
   using Spec = typename Traits::GemmSpec;
   using SharedStorage = typename Traits::SharedStorage;
   constexpr int Warps = Traits::MmaCore::kThreads / 32;
@@ -778,7 +739,7 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
   float const* global_scale_ptr =
       global_scale.numel() == 0 ? nullptr : global_scale.data_ptr<float>();
 
-  if (split_k == 1) {
+  if (requested_split_k == 1) {
     kernel<<<grid, block, smem_bytes, stream>>>(
         reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
         reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
@@ -788,15 +749,15 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
         num_tokens_past_padded.data_ptr<int32_t>(),
         topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
         mul_topk_weights, int(size_m), int(size_n), int(size_k),
-        int(a.stride(0)), split_k);
+        int(a.stride(0)), requested_split_k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return c;
   }
 
   TORCH_CHECK(size_k % int64_t(kCtaK) == 0,
-              "SM70 Marlin MoE requires K divisible by 32 for split_k > 1. "
+              "SM70 Marlin MoE requires K divisible by 32 for requested_split_k > 1. "
               "Got K=",
-              size_k, ", split_k=", split_k, ".");
+              size_k, ", requested_split_k=", requested_split_k, ".");
 
   auto split_kernel = sm70_marlin_moe_gemm_kernel<Traits, true>;
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
@@ -808,7 +769,7 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
       static_cast<size_t>(numel) * sizeof(float), stream));
 
   int const active_split_k =
-      sm70_active_split_k(static_cast<int>(size_k), split_k);
+      sm70_active_split_k(static_cast<int>(size_k), requested_split_k);
   grid.z = static_cast<unsigned>(active_split_k);
   split_kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
@@ -819,7 +780,7 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
       expert_ids.data_ptr<int32_t>(), num_tokens_past_padded.data_ptr<int32_t>(),
       topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
       mul_topk_weights, int(size_m), int(size_n), int(size_k),
-      int(a.stride(0)), split_k);
+      int(a.stride(0)), requested_split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   launch_sm70_fp32_to_fp16(

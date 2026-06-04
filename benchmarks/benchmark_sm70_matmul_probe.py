@@ -7,7 +7,7 @@ import torch
 
 from common import (
     banner,
-    check_cuda_ready,
+    require_matching_cuda_benchmark_runtime,
     format_float,
     print_table,
     time_cuda_callable,
@@ -187,7 +187,7 @@ def run_probe_case(
 
 def main() -> None:
     args = parse_args()
-    check_cuda_ready()
+    require_matching_cuda_benchmark_runtime()
     ops._load_dense()
 
     torch.manual_seed(0)

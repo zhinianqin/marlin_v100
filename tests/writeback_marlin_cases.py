@@ -25,16 +25,10 @@ class MoeShapeCase:
 
 
 @dataclass(frozen=True)
-class CtaCase:
-    name: str
-    value: str | None
-    cta_m: int | None = None
-    cta_n: int | None = None
-    warps: int | None = None
-
-    @property
-    def is_auto(self) -> bool:
-        return self.value is None
+class ResolvedCta:
+    cta_m: int
+    cta_n: int
+    warps: int
 
 
 @dataclass(frozen=True)
@@ -44,7 +38,6 @@ class DenseWritebackClassCase:
     quant_names: tuple[str, ...]
     scalar_type_names: tuple[str, ...]
     zp_quant_names: tuple[str, ...]
-    split_k_quant_names: tuple[str, ...]
     default_group_sizes: tuple[int, ...]
     benchmark_mode: str
     production_scope: str
@@ -58,7 +51,6 @@ class MoeWritebackClassCase:
     quant_names: tuple[str, ...]
     scalar_type_names: tuple[str, ...]
     zp_quant_names: tuple[str, ...]
-    split_k_quant_names: tuple[str, ...]
     default_group_sizes: tuple[int, ...]
     benchmark_mode: str
     production_scope: str
@@ -71,8 +63,6 @@ class DenseWritebackMatrixCase:
     quant_name: str
     group_size: int
     shape: DenseShapeCase
-    split_k: str
-    cta: CtaCase
     supported: bool
     reason: str = ""
 
@@ -80,7 +70,7 @@ class DenseWritebackMatrixCase:
     def id(self) -> str:
         return (
             f"{self.class_case.name}_{self.quant_name}_g{self.group_size}_"
-            f"{self.shape.name}_sk{self.split_k}_cta{self.cta.name}"
+            f"{self.shape.name}"
         )
 
 
@@ -90,8 +80,6 @@ class MoeWritebackMatrixCase:
     quant_name: str
     group_size: int
     shape: MoeShapeCase
-    split_k: str
-    cta: CtaCase
     supported: bool
     reason: str = ""
 
@@ -99,7 +87,7 @@ class MoeWritebackMatrixCase:
     def id(self) -> str:
         return (
             f"{self.class_case.name}_{self.quant_name}_g{self.group_size}_"
-            f"{self.shape.name}_sk{self.split_k}_cta{self.cta.name}"
+            f"{self.shape.name}"
         )
 
 
@@ -212,7 +200,6 @@ MOE_BENCHMARK_SHAPE_CASES = MOE_REGULAR_SHAPE_CASES + MOE_IRREGULAR_SHAPE_CASES
 
 
 WRITEBACK_GROUP_SIZE_VALUES = (-1, 16, 32, 64, 128)
-WRITEBACK_SPLIT_K_VALUES = ("unset", "1", "2", "4", "8")
 
 DENSE_ALL_QUANT_NAMES = (
     "uint4",
@@ -235,79 +222,6 @@ MOE_ALL_QUANT_NAMES = (
     "mxfp4",
 )
 
-DENSE_SPLIT_K_ENV_BY_QUANT = {
-    "uint4": "SM70_MARLIN_U4_SPLIT_K",
-    "uint4b8": "SM70_MARLIN_U4B8_SPLIT_K",
-    "uint8": "SM70_MARLIN_U8_SPLIT_K",
-    "uint8b128": "SM70_MARLIN_U8B128_SPLIT_K",
-    "fp8": "SM70_MARLIN_FP8_SPLIT_K",
-    "nvfp4": "SM70_MARLIN_NVFP4_SPLIT_K",
-    "mxfp4": "SM70_MARLIN_MXFP4_SPLIT_K",
-    "float4_e2m1f": "SM70_MARLIN_MXFP4_SPLIT_K",
-}
-
-MOE_SPLIT_K_ENV_BY_QUANT = {
-    "uint4": "SM70_MARLIN_MOE_U4_SPLIT_K",
-    "uint4b8": "SM70_MARLIN_MOE_U4B8_SPLIT_K",
-    "uint8": "SM70_MARLIN_MOE_U8_SPLIT_K",
-    "uint8b128": "SM70_MARLIN_MOE_U8B128_SPLIT_K",
-    "fp8": "SM70_MARLIN_MOE_FP8_SPLIT_K",
-    "nvfp4": "SM70_MARLIN_MOE_NVFP4_SPLIT_K",
-    "mxfp4": "SM70_MARLIN_MOE_MXFP4_SPLIT_K",
-}
-
-DENSE_CTA_ENV_BY_QUANT = {
-    "uint4": "SM70_MARLIN_U4_CTA",
-    "uint4b8": "SM70_MARLIN_U4B8_CTA",
-    "uint8": "SM70_MARLIN_U8_CTA",
-    "uint8b128": "SM70_MARLIN_U8B128_CTA",
-    "fp8": "SM70_MARLIN_FP8_CTA",
-    "nvfp4": "SM70_MARLIN_NVFP4_CTA",
-    "mxfp4": "SM70_MARLIN_MXFP4_CTA",
-    "float4_e2m1f": "SM70_MARLIN_MXFP4_CTA",
-}
-
-MOE_CTA_ENV_BY_QUANT = {
-    "uint4": "SM70_MARLIN_MOE_U4_CTA",
-    "uint4b8": "SM70_MARLIN_MOE_U4B8_CTA",
-    "uint8": "SM70_MARLIN_MOE_U8_CTA",
-    "uint8b128": "SM70_MARLIN_MOE_U8B128_CTA",
-    "fp8": "SM70_MARLIN_MOE_FP8_CTA",
-    "nvfp4": "SM70_MARLIN_MOE_NVFP4_CTA",
-    "mxfp4": "SM70_MARLIN_MOE_MXFP4_CTA",
-}
-
-DENSE_CTA_CASES = (
-    CtaCase("auto", None),
-    CtaCase("32x128x4", "32x128x4", 32, 128, 4),
-    CtaCase("32x256x4", "32x256x4", 32, 256, 4),
-    CtaCase("64x64x4", "64x64x4", 64, 64, 4),
-    CtaCase("64x128x4", "64x128x4", 64, 128, 4),
-    CtaCase("64x128x8", "64x128x8", 64, 128, 8),
-    CtaCase("64x256x4", "64x256x4", 64, 256, 4),
-    CtaCase("64x256x8", "64x256x8", 64, 256, 8),
-    CtaCase("128x64x4", "128x64x4", 128, 64, 4),
-    CtaCase("128x64x8", "128x64x8", 128, 64, 8),
-    CtaCase("128x128x4", "128x128x4", 128, 128, 4),
-    CtaCase("128x128x8", "128x128x8", 128, 128, 8),
-    CtaCase("128x256x8", "128x256x8", 128, 256, 8),
-    CtaCase("256x64x4", "256x64x4", 256, 64, 4),
-    CtaCase("256x64x8", "256x64x8", 256, 64, 8),
-    CtaCase("256x128x8", "256x128x8", 256, 128, 8),
-)
-
-MOE_CTA_CASES = (
-    CtaCase("auto", None),
-    CtaCase("32x128x4", "32x128x4", 32, 128, 4),
-    CtaCase("32x256x4", "32x256x4", 32, 256, 4),
-    CtaCase("64x64x4", "64x64x4", 64, 64, 4),
-    CtaCase("64x128x4", "64x128x4", 64, 128, 4),
-    CtaCase("64x128x8", "64x128x8", 64, 128, 8),
-    CtaCase("64x256x4", "64x256x4", 64, 256, 4),
-    CtaCase("64x256x8", "64x256x8", 64, 256, 8),
-)
-
-
 DENSE_WRITEBACK_CLASS_CASES = (
     DenseWritebackClassCase(
         name="marlin_linear_kernel",
@@ -329,14 +243,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
             "float4_e2m1f",
         ),
         zp_quant_names=("uint4", "uint8"),
-        split_k_quant_names=(
-            "uint4",
-            "uint8",
-            "uint4b8",
-            "uint8b128",
-            "fp8",
-            "float4_e2m1f",
-        ),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="dense_mixed_precision_kernel",
@@ -353,7 +259,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("uint4b8", "uint8b128"),
         scalar_type_names=("uint4b8", "uint8b128"),
         zp_quant_names=(),
-        split_k_quant_names=("uint4b8", "uint8b128"),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="dense_gptq_symmetric_method",
@@ -364,7 +269,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("uint4", "uint8"),
         scalar_type_names=("uint4", "uint8"),
         zp_quant_names=("uint4", "uint8"),
-        split_k_quant_names=("uint4", "uint8"),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="dense_awq_asymmetric_zp_method",
@@ -375,7 +279,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("uint4", "uint4b8", "uint8", "uint8b128"),
         scalar_type_names=("uint4", "uint4b8", "uint8", "uint8b128"),
         zp_quant_names=("uint4", "uint8"),
-        split_k_quant_names=("uint4", "uint4b8", "uint8", "uint8b128"),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="dense_wna16_compressed_tensors_scheme",
@@ -386,7 +289,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("fp8",),
         scalar_type_names=("float8_e4m3fn",),
         zp_quant_names=(),
-        split_k_quant_names=("fp8",),
         default_group_sizes=(-1, 128),
         benchmark_mode="timed",
         production_scope="dense_fp8_scaled_mm_kernel",
@@ -397,7 +299,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("fp8",),
         scalar_type_names=("float8_e4m3fn",),
         zp_quant_names=(),
-        split_k_quant_names=("fp8",),
         default_group_sizes=(-1, 128),
         benchmark_mode="timed",
         production_scope="dense_fp8_compressed_tensors_scheme",
@@ -408,7 +309,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("nvfp4",),
         scalar_type_names=("float4_e2m1f",),
         zp_quant_names=(),
-        split_k_quant_names=("nvfp4",),
         default_group_sizes=(16,),
         benchmark_mode="timed",
         production_scope="dense_nvfp4_compressed_tensors_scheme",
@@ -419,7 +319,6 @@ DENSE_WRITEBACK_CLASS_CASES = (
         quant_names=("mxfp4",),
         scalar_type_names=("float4_e2m1f",),
         zp_quant_names=(),
-        split_k_quant_names=("mxfp4",),
         default_group_sizes=(32,),
         benchmark_mode="timed",
         production_scope="dense_mxfp4_compressed_tensors_scheme",
@@ -434,7 +333,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("uint4b8", "uint8b128"),
         scalar_type_names=("uint4b8", "uint8b128"),
         zp_quant_names=(),
-        split_k_quant_names=("uint4b8", "uint8b128"),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="moe_gptq_symmetric_method",
@@ -445,7 +343,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("uint4", "uint8"),
         scalar_type_names=("uint4", "uint8"),
         zp_quant_names=("uint4", "uint8"),
-        split_k_quant_names=("uint4", "uint8"),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="moe_awq_asymmetric_zp_method",
@@ -456,7 +353,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("uint4b8", "uint8b128"),
         scalar_type_names=("uint4b8", "uint8b128"),
         zp_quant_names=(),
-        split_k_quant_names=("uint4b8", "uint8b128"),
         default_group_sizes=(-1, 32, 64, 128),
         benchmark_mode="timed",
         production_scope="moe_compressed_tensors_wna16_symmetric_method",
@@ -467,7 +363,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("fp8",),
         scalar_type_names=("float8_e4m3fn",),
         zp_quant_names=(),
-        split_k_quant_names=(),
         default_group_sizes=(-1, 128),
         benchmark_mode="smoke_only",
         production_scope="moe_quark_fp8_marlin_method",
@@ -478,7 +373,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("fp8",),
         scalar_type_names=("float8_e4m3fn",),
         zp_quant_names=(),
-        split_k_quant_names=("fp8",),
         default_group_sizes=(-1, 128),
         benchmark_mode="pytest_only",
         production_scope="moe_compressed_tensors_fp8_method",
@@ -489,7 +383,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("nvfp4",),
         scalar_type_names=("float4_e2m1f",),
         zp_quant_names=(),
-        split_k_quant_names=("nvfp4",),
         default_group_sizes=(16,),
         benchmark_mode="pytest_only",
         production_scope="moe_compressed_tensors_nvfp4_method",
@@ -500,7 +393,6 @@ MOE_WRITEBACK_CLASS_CASES = (
         quant_names=("mxfp4",),
         scalar_type_names=("float4_e2m1f",),
         zp_quant_names=(),
-        split_k_quant_names=("mxfp4",),
         default_group_sizes=(32,),
         benchmark_mode="pytest_only",
         production_scope="moe_compressed_tensors_mxfp4_method",
@@ -618,7 +510,7 @@ def is_moe_group_size_supported(
     )
 
 
-def dense_auto_cta(size_m: int, size_n: int) -> CtaCase | None:
+def dense_auto_cta(size_m: int, size_n: int) -> ResolvedCta | None:
     if size_n % 256 == 0:
         cta_n = 256
     elif size_n % 128 == 0:
@@ -648,65 +540,135 @@ def dense_auto_cta(size_m: int, size_n: int) -> CtaCase | None:
         warps = 4 if cta_m == 32 else 8
     else:
         warps = 4 if cta_m == 32 else 8
-    value = f"{cta_m}x{cta_n}x{warps}"
-    return CtaCase(value, value, cta_m, cta_n, warps)
+    return ResolvedCta(cta_m, cta_n, warps)
 
 
-def moe_auto_cta(size_n: int) -> CtaCase | None:
+def moe_auto_cta(size_n: int, tokens: int = 0) -> ResolvedCta | None:
     if size_n % 256 == 0:
         cta_n = 256
-        value = "32x256x4"
+        cta_m = 64 if tokens >= 1024 else 32
+        warps = 4
     elif size_n % 128 == 0:
         cta_n = 128
-        value = "32x128x4"
+        if tokens >= 4096:
+            cta_m = 64
+            warps = 8
+        else:
+            cta_m = 32
+            warps = 4
     elif size_n % 64 == 0:
         cta_n = 64
-        value = "64x64x4"
+        cta_m = 64
+        warps = 4
     else:
         return None
-    cta_m, _cta_n, warps = (int(part) for part in value.split("x"))
-    assert _cta_n == cta_n
-    return CtaCase(value, value, cta_m, cta_n, warps)
+    return ResolvedCta(cta_m, cta_n, warps)
 
 
-def dense_cta_case_supported(cta: CtaCase, shape: DenseShapeCase) -> tuple[bool, str]:
-    auto = dense_auto_cta(shape.size_m, shape.size_n)
-    if auto is None:
-        return False, "shape size_n is not divisible by 64"
-    if cta.is_auto:
-        return True, ""
-    if cta.cta_m == auto.cta_m and cta.cta_n == auto.cta_n:
-        return True, ""
-    return (
-        False,
-        (
-            f"dense explicit CTA {cta.name} does not match auto "
-            f"CTA_M/CTA_N {auto.cta_m}x{auto.cta_n} for shape {shape.name}"
-        ),
+def _split_k_from_tiles(size_k: int, cta_tiles: int, *, k_pressure_path: bool) -> int:
+    if size_k < 4096 or size_k % 32 != 0:
+        return 1
+    if k_pressure_path:
+        if cta_tiles <= 64:
+            return 8
+        if cta_tiles <= 128:
+            return 4
+        if cta_tiles <= 256:
+            return 2
+        return 1
+    if cta_tiles <= 16:
+        return 8
+    if cta_tiles <= 32:
+        return 4
+    if cta_tiles <= 64:
+        return 2
+    return 1
+
+
+def dense_auto_cta_geometry(shape: DenseShapeCase) -> ResolvedCta | None:
+    return dense_auto_cta(shape.size_m, shape.size_n)
+
+
+def dense_auto_split_k(shape: DenseShapeCase) -> int:
+    cta = dense_auto_cta_geometry(shape)
+    if cta is None:
+        return 1
+    m_tiles = (shape.size_m + cta.cta_m - 1) // cta.cta_m
+    n_tiles = max(1, shape.size_n // cta.cta_n)
+    return _split_k_from_tiles(
+        shape.size_k,
+        m_tiles * n_tiles,
+        k_pressure_path=shape.size_k >= 8192 and shape.size_n <= 256,
     )
 
 
-def moe_cta_case_supported(cta: CtaCase, shape: MoeShapeCase) -> tuple[bool, str]:
-    stage1_n = 2 * shape.intermediate
-    stage2_n = shape.hidden
-    auto_stage1 = moe_auto_cta(stage1_n)
-    auto_stage2 = moe_auto_cta(stage2_n)
-    if auto_stage1 is None or auto_stage2 is None:
-        return False, "MoE stage N dimension is not divisible by 64"
-    if cta.is_auto:
-        return True, ""
-    assert cta.cta_n is not None
-    if cta.cta_n != auto_stage1.cta_n or cta.cta_n != auto_stage2.cta_n:
-        return (
-            False,
-            (
-                f"MoE explicit CTA_N={cta.cta_n} does not match both "
-                f"stage1 auto CTA_N={auto_stage1.cta_n} and stage2 "
-                f"auto CTA_N={auto_stage2.cta_n}; one CTA env is applied "
-                "to both Marlin MoE GEMMs"
-            ),
+def moe_auto_stage_cta_geometry(
+    shape: MoeShapeCase,
+) -> tuple[ResolvedCta | None, ResolvedCta | None]:
+    return (
+        moe_auto_cta(2 * shape.intermediate, shape.tokens),
+        moe_auto_cta(shape.hidden, shape.tokens * shape.topk),
+    )
+
+
+def moe_auto_cta_geometry(shape: MoeShapeCase) -> ResolvedCta | None:
+    stage1, stage2 = moe_auto_stage_cta_geometry(shape)
+    if stage1 is None or stage2 is None:
+        return None
+    if (stage1.cta_m, stage1.cta_n, stage1.warps) == (
+        stage2.cta_m,
+        stage2.cta_n,
+        stage2.warps,
+    ):
+        return stage1
+    return None
+
+
+def auto_cta_geometry_label(cta: ResolvedCta | None) -> str:
+    if cta is None:
+        return "n/a"
+    return f"{cta.cta_m}x{cta.cta_n}x{cta.warps}"
+
+
+def dense_auto_cta_geometry_label(shape: DenseShapeCase) -> str:
+    return auto_cta_geometry_label(dense_auto_cta_geometry(shape))
+
+
+def moe_auto_cta_geometry_label(shape: MoeShapeCase) -> str:
+    stage1, stage2 = moe_auto_stage_cta_geometry(shape)
+    stage1_label = auto_cta_geometry_label(stage1)
+    stage2_label = auto_cta_geometry_label(stage2)
+    if stage1_label == stage2_label:
+        return stage1_label
+    return f"stage1={stage1_label};stage2={stage2_label}"
+
+
+def moe_auto_stage_split_k(shape: MoeShapeCase) -> tuple[int, int]:
+    stage1, stage2 = moe_auto_stage_cta_geometry(shape)
+    if stage1 is None or stage2 is None:
+        return (1, 1)
+
+    def _stage_split(size_n: int, size_k: int, cta: ResolvedCta) -> int:
+        effective_m = shape.tokens * shape.topk
+        m_tiles = (effective_m + cta.cta_m - 1) // cta.cta_m
+        n_tiles = max(1, size_n // cta.cta_n)
+        return _split_k_from_tiles(
+            size_k,
+            m_tiles * n_tiles,
+            k_pressure_path=False,
         )
-    return True, ""
+
+    return (
+        _stage_split(2 * shape.intermediate, shape.hidden, stage1),
+        _stage_split(shape.hidden, shape.intermediate, stage2),
+    )
+
+
+def moe_auto_split_k_label(shape: MoeShapeCase) -> str:
+    stage1, stage2 = moe_auto_stage_split_k(shape)
+    if stage1 == stage2:
+        return str(stage1)
+    return f"stage1={stage1};stage2={stage2}"
 
 
 def dense_matrix_support_reason(
@@ -714,8 +676,6 @@ def dense_matrix_support_reason(
     quant_name: str,
     group_size: int,
     shape: DenseShapeCase,
-    split_k: str,
-    cta: CtaCase,
 ) -> tuple[bool, str]:
     if quant_name not in class_case.quant_names:
         return False, "unsupported dense writeback class/quant combination"
@@ -723,8 +683,8 @@ def dense_matrix_support_reason(
         return False, "group_size is not a supported default for this dense class"
     if not is_dense_group_size_supported(quant_name, group_size, shape.size_k):
         return False, "unsupported dense quant/group/shape alignment combination"
-    if split_k != "unset" and quant_name not in class_case.split_k_quant_names:
-        return False, "split-K is not supported for this dense class/quant"
+    if dense_auto_cta(shape.size_m, shape.size_n) is None:
+        return False, "shape size_n is not divisible by 64"
     if quant_name == "float4_e2m1f":
         return (
             False,
@@ -733,7 +693,7 @@ def dense_matrix_support_reason(
                 "production FP4 paths are NVFP4/MXFP4 schemes"
             ),
         )
-    return dense_cta_case_supported(cta, shape)
+    return True, ""
 
 
 def moe_matrix_support_reason(
@@ -741,8 +701,6 @@ def moe_matrix_support_reason(
     quant_name: str,
     group_size: int,
     shape: MoeShapeCase,
-    split_k: str,
-    cta: CtaCase,
 ) -> tuple[bool, str]:
     if quant_name not in class_case.quant_names:
         return False, "unsupported MoE writeback class/quant combination"
@@ -764,9 +722,10 @@ def moe_matrix_support_reason(
         shape.intermediate,
     ):
         return False, "unsupported MoE quant/group/shape alignment combination"
-    if split_k != "unset" and quant_name not in class_case.split_k_quant_names:
-        return False, "split-K is not supported for this MoE class/quant"
-    return moe_cta_case_supported(cta, shape)
+    stage1_cta, stage2_cta = moe_auto_stage_cta_geometry(shape)
+    if stage1_cta is None or stage2_cta is None:
+        return False, "MoE stage N dimension is not divisible by 64"
+    return True, ""
 
 
 def iter_dense_writeback_matrix(
@@ -775,33 +734,25 @@ def iter_dense_writeback_matrix(
     quant_names: tuple[str, ...] = DENSE_ALL_QUANT_NAMES,
     group_sizes: tuple[int, ...] = WRITEBACK_GROUP_SIZE_VALUES,
     shapes: tuple[DenseShapeCase, ...] = DENSE_BENCHMARK_SHAPE_CASES,
-    split_k_values: tuple[str, ...] = WRITEBACK_SPLIT_K_VALUES,
-    cta_cases: tuple[CtaCase, ...] = DENSE_CTA_CASES,
 ) -> Iterator[DenseWritebackMatrixCase]:
     for class_case in class_cases:
         for quant_name in quant_names:
             for group_size in group_sizes:
                 for shape in shapes:
-                    for split_k in split_k_values:
-                        for cta in cta_cases:
-                            supported, reason = dense_matrix_support_reason(
-                                class_case,
-                                quant_name,
-                                group_size,
-                                shape,
-                                split_k,
-                                cta,
-                            )
-                            yield DenseWritebackMatrixCase(
-                                class_case=class_case,
-                                quant_name=quant_name,
-                                group_size=group_size,
-                                shape=shape,
-                                split_k=split_k,
-                                cta=cta,
-                                supported=supported,
-                                reason=reason,
-                            )
+                    supported, reason = dense_matrix_support_reason(
+                        class_case,
+                        quant_name,
+                        group_size,
+                        shape,
+                    )
+                    yield DenseWritebackMatrixCase(
+                        class_case=class_case,
+                        quant_name=quant_name,
+                        group_size=group_size,
+                        shape=shape,
+                        supported=supported,
+                        reason=reason,
+                    )
 
 
 def iter_moe_writeback_matrix(
@@ -810,33 +761,25 @@ def iter_moe_writeback_matrix(
     quant_names: tuple[str, ...] = MOE_ALL_QUANT_NAMES,
     group_sizes: tuple[int, ...] = WRITEBACK_GROUP_SIZE_VALUES,
     shapes: tuple[MoeShapeCase, ...] = MOE_BENCHMARK_SHAPE_CASES,
-    split_k_values: tuple[str, ...] = WRITEBACK_SPLIT_K_VALUES,
-    cta_cases: tuple[CtaCase, ...] = MOE_CTA_CASES,
 ) -> Iterator[MoeWritebackMatrixCase]:
     for class_case in class_cases:
         for quant_name in quant_names:
             for group_size in group_sizes:
                 for shape in shapes:
-                    for split_k in split_k_values:
-                        for cta in cta_cases:
-                            supported, reason = moe_matrix_support_reason(
-                                class_case,
-                                quant_name,
-                                group_size,
-                                shape,
-                                split_k,
-                                cta,
-                            )
-                            yield MoeWritebackMatrixCase(
-                                class_case=class_case,
-                                quant_name=quant_name,
-                                group_size=group_size,
-                                shape=shape,
-                                split_k=split_k,
-                                cta=cta,
-                                supported=supported,
-                                reason=reason,
-                            )
+                    supported, reason = moe_matrix_support_reason(
+                        class_case,
+                        quant_name,
+                        group_size,
+                        shape,
+                    )
+                    yield MoeWritebackMatrixCase(
+                        class_case=class_case,
+                        quant_name=quant_name,
+                        group_size=group_size,
+                        shape=shape,
+                        supported=supported,
+                        reason=reason,
+                    )
 
 
 def dense_writeback_matrix_summary(
@@ -847,8 +790,8 @@ def dense_writeback_matrix_summary(
     quants = Counter()
     groups = Counter()
     shapes = Counter()
-    split_k = Counter()
-    ctas = Counter()
+    auto_cta_geometry = Counter()
+    auto_split_k = Counter()
     skip_reasons = Counter()
     for case in iter_dense_writeback_matrix(**kwargs):
         status["total"] += 1
@@ -856,8 +799,8 @@ def dense_writeback_matrix_summary(
         quants[case.quant_name] += 1
         groups[case.group_size] += 1
         shapes[case.shape.name] += 1
-        split_k[case.split_k] += 1
-        ctas[case.cta.name] += 1
+        auto_cta_geometry[dense_auto_cta_geometry_label(case.shape)] += 1
+        auto_split_k[str(dense_auto_split_k(case.shape))] += 1
         if case.supported:
             status["supported"] += 1
         else:
@@ -871,8 +814,8 @@ def dense_writeback_matrix_summary(
         "class": dict(sorted(classes.items())),
         "quant": dict(sorted(quants.items())),
         "group_size": dict(sorted(groups.items())),
-        "split_k": dict(sorted(split_k.items())),
-        "cta": dict(sorted(ctas.items())),
+        "auto_cta_geometry": dict(sorted(auto_cta_geometry.items())),
+        "auto_split_k": dict(sorted(auto_split_k.items())),
         "skip_reasons": dict(sorted(skip_reasons.items())),
     }
 
@@ -885,8 +828,8 @@ def moe_writeback_matrix_summary(
     quants = Counter()
     groups = Counter()
     shapes = Counter()
-    split_k = Counter()
-    ctas = Counter()
+    auto_cta_geometry = Counter()
+    auto_split_k = Counter()
     routing = Counter()
     skip_reasons = Counter()
     for case in iter_moe_writeback_matrix(**kwargs):
@@ -895,8 +838,8 @@ def moe_writeback_matrix_summary(
         quants[case.quant_name] += 1
         groups[case.group_size] += 1
         shapes[case.shape.name] += 1
-        split_k[case.split_k] += 1
-        ctas[case.cta.name] += 1
+        auto_cta_geometry[moe_auto_cta_geometry_label(case.shape)] += 1
+        auto_split_k[moe_auto_split_k_label(case.shape)] += 1
         routing[case.shape.routing_profile] += 1
         if case.supported:
             status["supported"] += 1
@@ -911,8 +854,8 @@ def moe_writeback_matrix_summary(
         "class": dict(sorted(classes.items())),
         "quant": dict(sorted(quants.items())),
         "group_size": dict(sorted(groups.items())),
-        "split_k": dict(sorted(split_k.items())),
-        "cta": dict(sorted(ctas.items())),
+        "auto_cta_geometry": dict(sorted(auto_cta_geometry.items())),
+        "auto_split_k": dict(sorted(auto_split_k.items())),
         "routing_profile": dict(sorted(routing.items())),
         "skip_reasons": dict(sorted(skip_reasons.items())),
     }

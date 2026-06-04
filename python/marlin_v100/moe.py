@@ -76,10 +76,11 @@ def fused_marlin_moe(
         topk_ids, moe_block_size, w1.shape[0]
     )
 
-    # Local quantized expert helpers preserve the logical output width in the
-    # scale tensors, which is the most reliable source for the dense width here.
-    n = w2_scale.shape[-1]
-    intermediate = torch.empty((m * topk, 2 * n), dtype=hidden_states.dtype, device=hidden_states.device)
+    gate_up_width = int(w1_scale.shape[-1])
+    if gate_up_width % 2 != 0:
+        raise ValueError(f"w1_scale output width must be even, got {gate_up_width}")
+    n = gate_up_width // 2
+    intermediate = torch.empty((m * topk, gate_up_width), dtype=hidden_states.dtype, device=hidden_states.device)
     intermediate = ops.moe_wna16_marlin_gemm(
         hidden_states,
         intermediate,
@@ -101,7 +102,7 @@ def fused_marlin_moe(
         False,
         quant_type_id,
         m,
-        2 * n,
+        gate_up_width,
         k,
         is_k_full,
         False,
@@ -111,7 +112,7 @@ def fused_marlin_moe(
         -1,
         -1,
     )
-    gate, up = intermediate.view(m * topk, 2 * n).chunk(2, dim=-1)
+    gate, up = intermediate.view(m * topk, gate_up_width).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
     output = torch.empty((m * topk, k), dtype=hidden_states.dtype, device=hidden_states.device)
     output = ops.moe_wna16_marlin_gemm(

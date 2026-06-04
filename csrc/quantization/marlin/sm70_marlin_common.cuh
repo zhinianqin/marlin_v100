@@ -5,10 +5,7 @@
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
 
-#include <cstdlib>
 #include <cstdint>
-#include <sstream>
-#include <string>
 
 #include "cutlass/gemm/gemm.h"
 
@@ -140,34 +137,7 @@ inline bool sm70_marlin_cta_geometry_is_supported(
          (cta_m == 256 && cta_n == 128 && warps == 8);
 }
 
-inline Sm70CtaGeometry parse_sm70_marlin_cta_geometry(
-    char const* env_name) {
-  char const* env = std::getenv(env_name);
-  TORCH_CHECK(env != nullptr && env[0] != '\0', env_name,
-              " must use format CTA_MxCTA_NxWarps when explicitly parsed, "
-              "for example 128x256x8.");
-
-  std::string spec(env);
-  for (char& ch : spec) {
-    if (ch == 'x' || ch == 'X' || ch == '*' || ch == ',') {
-      ch = ' ';
-    }
-  }
-
-  int cta_m = 0;
-  int cta_n = 0;
-  int warps = 0;
-  std::string extra;
-  std::istringstream stream(spec);
-  TORCH_CHECK((stream >> cta_m >> cta_n >> warps) && !(stream >> extra),
-              env_name,
-              " must use format CTA_MxCTA_NxWarps, for example 128x256x8. "
-              "Got: ",
-              env);
-  return {cta_m, cta_n, warps};
-}
-
-inline int sm70_marlin_auto_cta_n(int64_t size_n) {
+inline int sm70_marlin_dense_auto_cta_n(int64_t size_n) {
   if (size_n % 256 == 0) {
     return 256;
   }
@@ -182,7 +152,7 @@ inline int sm70_marlin_auto_cta_n(int64_t size_n) {
   return 0;
 }
 
-inline int sm70_marlin_auto_cta_m(int64_t size_m, int auto_cta_n) {
+inline int sm70_marlin_dense_auto_cta_m(int64_t size_m, int auto_cta_n) {
   if (auto_cta_n == 64) {
     if (size_m >= 256) {
       return 256;
@@ -218,7 +188,7 @@ inline int sm70_marlin_auto_cta_m(int64_t size_m, int auto_cta_n) {
   return 0;
 }
 
-inline int sm70_marlin_default_warps(int auto_cta_m, int auto_cta_n) {
+inline int sm70_marlin_dense_auto_warps_for_cta(int auto_cta_m, int auto_cta_n) {
   if (auto_cta_n == 64) {
     if (auto_cta_m == 64) {
       return 4;
@@ -247,42 +217,31 @@ inline int sm70_marlin_default_warps(int auto_cta_m, int auto_cta_n) {
   return 0;
 }
 
-inline Sm70CtaGeometry resolve_sm70_marlin_cta_geometry(
-    char const* env_name, int64_t size_m, int64_t size_n) {
-  int const auto_cta_n = sm70_marlin_auto_cta_n(size_n);
-  int const auto_cta_m = sm70_marlin_auto_cta_m(size_m, auto_cta_n);
-  char const* env = std::getenv(env_name);
-  if (env == nullptr || env[0] == '\0') {
-    return {auto_cta_m, auto_cta_n,
-            sm70_marlin_default_warps(auto_cta_m, auto_cta_n)};
-  }
-
-  Sm70CtaGeometry geometry = parse_sm70_marlin_cta_geometry(env_name);
-  TORCH_CHECK(geometry.cta_m == auto_cta_m && geometry.cta_n == auto_cta_n,
-              env_name, " specifies CTA_M=", geometry.cta_m, ", CTA_N=",
-              geometry.cta_n, " but size_m=", size_m, ", size_n=", size_n,
-              " requires auto CTA_M=", auto_cta_m, ", auto CTA_N=",
-              auto_cta_n, ". CTA_M and CTA_N are selected automatically and "
-              "are not free SM70 Marlin tuning parameters.");
-  return geometry;
+inline Sm70CtaGeometry sm70_marlin_dense_auto_cta_geometry(int64_t size_m,
+                                                        int64_t size_n) {
+  int const auto_cta_n = sm70_marlin_dense_auto_cta_n(size_n);
+  int const auto_cta_m = sm70_marlin_dense_auto_cta_m(size_m, auto_cta_n);
+  return {auto_cta_m, auto_cta_n,
+          sm70_marlin_dense_auto_warps_for_cta(auto_cta_m, auto_cta_n)};
 }
 
-inline void check_sm70_marlin_cta_geometry(char const* env_name,
-                                          Sm70CtaGeometry geometry) {
-  TORCH_CHECK(sm70_marlin_cta_geometry_is_supported(geometry), "Unsupported ",
-              env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
-              geometry.warps, ". Supported geometries are ",
+inline void validate_sm70_marlin_dense_cta_geometry_supported(char const* op_name,
+                                                              Sm70CtaGeometry geometry) {
+  TORCH_CHECK(sm70_marlin_cta_geometry_is_supported(geometry),
+              "Unsupported SM70 Marlin CTA geometry for ", op_name, ": ",
+              geometry.cta_m, "x", geometry.cta_n, "x", geometry.warps,
+              ". Supported geometries are ",
               kSupportedSm70MarlinCtaGeometries, ".");
 }
 
-inline void check_sm70_marlin_cta_n_alignment(char const* env_name,
-                                              Sm70CtaGeometry geometry,
-                                              int64_t size_n) {
+inline void validate_sm70_marlin_dense_cta_n_alignment(char const* op_name,
+                                                       Sm70CtaGeometry geometry,
+                                                       int64_t size_n) {
   TORCH_CHECK(
       size_n % geometry.cta_n == 0 && size_n % kQuantTileN == 0,
       "SM70 Marlin requires size_n divisible by both CTA_N and 64 for ",
-      env_name, "=", geometry.cta_m, "x", geometry.cta_n, "x",
-      geometry.warps, ". Got size_n = ", size_n, ".");
+      op_name, " with CTA geometry ", geometry.cta_m, "x", geometry.cta_n,
+      "x", geometry.warps, ". Got size_n = ", size_n, ".");
 }
 
 }  // namespace marlin::sm70

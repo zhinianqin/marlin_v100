@@ -25,16 +25,16 @@ using marlin::sm70::Sm70CtaGeometry;
 using marlin::sm70::Sm70AtomicFp32Epilogue;
 using marlin::sm70::Sm70MarlinGemmTraits;
 using marlin::sm70::Sm70SplitKPartition;
-using marlin::sm70::check_sm70_marlin_cta_geometry;
-using marlin::sm70::check_sm70_marlin_cta_n_alignment;
+using marlin::sm70::validate_sm70_marlin_dense_cta_geometry_supported;
+using marlin::sm70::validate_sm70_marlin_dense_cta_n_alignment;
 using marlin::sm70::configure_sm70_dynamic_smem;
 using marlin::sm70::dispatch_sm70_marlin_fixed_group_geometry;
 using marlin::sm70::kCtaK;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
 using marlin::sm70::launch_sm70_fp32_to_fp16;
-using marlin::sm70::resolve_sm70_marlin_cta_geometry;
-using marlin::sm70::parse_sm70_split_k;
+using marlin::sm70::sm70_marlin_dense_auto_cta_geometry;
+using marlin::sm70::sm70_marlin_dense_auto_requested_split_k;
 using marlin::sm70::load_qword_vector;
 using marlin::sm70::qword_from_vector;
 using marlin::sm70::sm70_marlin_cta_grid;
@@ -46,10 +46,6 @@ using marlin::sm70::u4_cta_n_qweight_offset_from_logical;
 namespace {
 
 constexpr int kNvfp4ValuesPerWord = 8;
-constexpr char const* kSm70MarlinNvfp4CtaEnv =
-    "SM70_MARLIN_NVFP4_CTA";
-constexpr char const* kSm70MarlinNvfp4SplitKEnv =
-    "SM70_MARLIN_NVFP4_SPLIT_K";
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_>
 class Sm70Nvfp4IteratorB {
@@ -76,9 +72,6 @@ class Sm70Nvfp4IteratorB {
   static_assert(ThreadMap::Iterations::kStrided == 1 ||
                     ThreadMap::Iterations::kStrided == 2,
                 "SM70 Marlin U4-family IteratorB expects one or two strided iterations.");
-  static constexpr int kStridedQweightDeltaWords =
-      32 * (Shape::kN / kQuantTileN);
-
   struct Params {
     int size_n;
     int aligned_initial_k_step;
@@ -259,6 +252,8 @@ class Sm70Nvfp4IteratorB {
       }
     } else {
       int const qweight_base = qweight_base_offset_;
+      constexpr int kStridedQweightDeltaWords =
+          32 * (Shape::kN / kQuantTileN);
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
         int const qweight_base_s =
@@ -420,7 +415,7 @@ void sm70_marlin_nvfp4_gemm_splitk_kernel(
     uint32_t const* __restrict__ b_q_weight,
     uint8_t const* __restrict__ b_scales,
     float const* __restrict__ global_scale,
-    float* __restrict__ c_tmp, int m, int n, int k, int lda, int split_k) {
+    float* __restrict__ c_tmp, int m, int n, int k, int lda, int requested_split_k) {
   using Traits = Sm70Nvfp4GemmTraits<CtaM, CtaN, Warps, GroupSize>;
   using Mma = typename Traits::Mma;
   using AtomicEpilogue = Sm70AtomicFp32Epilogue<Traits>;
@@ -433,7 +428,7 @@ void sm70_marlin_nvfp4_gemm_splitk_kernel(
   int const warp_idx = cutlass::canonical_warp_idx_sync();
   int const lane_idx = threadIdx.x % 32;
   Sm70SplitKPartition const partition =
-      sm70_splitk_partition<GroupSize>(k, split_k, int(blockIdx.z));
+      sm70_splitk_partition<GroupSize>(k, requested_split_k, int(blockIdx.z));
   if (partition.partition_k == 0) {
     return;
   }
@@ -481,7 +476,7 @@ template <int CtaM, int CtaN, int Warps, int GroupSize>
 torch::Tensor launch_sm70_marlin_nvfp4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, torch::Tensor& global_scale, int64_t size_m,
-    int64_t size_n, int64_t size_k, int split_k,
+    int64_t size_n, int64_t size_k, int requested_split_k,
     std::optional<torch::Tensor> const& c_tmp_or_none) {
   auto kernel =
       sm70_marlin_nvfp4_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
@@ -492,7 +487,7 @@ torch::Tensor launch_sm70_marlin_nvfp4_gemm(
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
-  if (split_k == 1) {
+  if (requested_split_k == 1) {
     dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
     kernel<<<grid, block, smem_bytes, stream>>>(
         reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
@@ -507,9 +502,9 @@ torch::Tensor launch_sm70_marlin_nvfp4_gemm(
   }
 
   TORCH_CHECK(size_k % int64_t(kCtaK) == 0,
-              "SM70 Marlin NVFP4 requires K divisible by 32 for split_k > 1. "
+              "SM70 Marlin NVFP4 requires K divisible by 32 for requested_split_k > 1. "
               "Got K=",
-              size_k, ", split_k=", split_k, ".");
+              size_k, ", requested_split_k=", requested_split_k, ".");
 
   auto split_kernel =
       sm70_marlin_nvfp4_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
@@ -524,7 +519,7 @@ torch::Tensor launch_sm70_marlin_nvfp4_gemm(
 
   dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
-      sm70_active_split_k(static_cast<int>(size_k), split_k);
+      sm70_active_split_k(static_cast<int>(size_k), requested_split_k);
   grid.z = static_cast<unsigned>(active_split_k);
   split_kernel<<<grid, block, smem_bytes, stream>>>(
       reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
@@ -533,7 +528,7 @@ torch::Tensor launch_sm70_marlin_nvfp4_gemm(
       reinterpret_cast<float const*>(global_scale.data_ptr<float>()),
       c_tmp.data_ptr<float>(),
       static_cast<int>(size_m), static_cast<int>(size_n),
-      static_cast<int>(size_k), static_cast<int>(a.stride(0)), split_k);
+      static_cast<int>(size_k), static_cast<int>(a.stride(0)), requested_split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   launch_sm70_fp32_to_fp16(
@@ -553,14 +548,14 @@ struct Sm70Nvfp4Launcher {
   int64_t size_m;
   int64_t size_n;
   int64_t size_k;
-  int split_k;
+  int requested_split_k;
   std::optional<torch::Tensor> const& c_tmp_or_none;
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
     return launch_sm70_marlin_nvfp4_gemm<CtaM, CtaN, Warps, GroupSize>(
         a, c, b_q_weight, b_scales, global_scale, size_m, size_n, size_k,
-        split_k, c_tmp_or_none);
+        requested_split_k, c_tmp_or_none);
   }
 };
 
@@ -575,13 +570,14 @@ torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
   c10::cuda::CUDAGuard device_guard(a.device());
 
   Sm70CtaGeometry const geometry =
-      resolve_sm70_marlin_cta_geometry(kSm70MarlinNvfp4CtaEnv, size_m, size_n);
-  check_sm70_marlin_cta_geometry(kSm70MarlinNvfp4CtaEnv, geometry);
-  check_sm70_marlin_cta_n_alignment(kSm70MarlinNvfp4CtaEnv, geometry, size_n);
-  int const split_k = parse_sm70_split_k(kSm70MarlinNvfp4SplitKEnv);
+      sm70_marlin_dense_auto_cta_geometry(size_m, size_n);
+  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin NVFP4", geometry);
+  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin NVFP4", geometry, size_n);
+  int const requested_split_k =
+      sm70_marlin_dense_auto_requested_split_k(size_m, size_n, size_k, geometry);
   Sm70Nvfp4Launcher const launcher{
       a, c, b_q_weight, b_scales, global_scale, size_m, size_n, size_k,
-      split_k, c_tmp_or_none};
+      requested_split_k, c_tmp_or_none};
   return dispatch_sm70_marlin_fixed_group_geometry<16>(
       launcher, geometry, group_size, "NVFP4");
 }

@@ -24,7 +24,7 @@ if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
 
 
-def check_cuda_ready() -> None:
+def require_matching_cuda_benchmark_runtime() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for Marlin benchmarks.")
     capability = runtime_capability()

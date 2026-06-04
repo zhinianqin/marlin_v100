@@ -9,9 +9,7 @@
 #include <torch/types.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
-#include <string>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/functional.h"
@@ -24,18 +22,56 @@ struct Sm70SplitKPartition {
   int partition_k;
 };
 
-inline int parse_sm70_split_k(char const* env_name) {
-  char const* env = std::getenv(env_name);
-  if (env == nullptr || env[0] == '\0') {
+inline int sm70_marlin_auto_requested_split_k_from_tiles(int64_t size_k,
+                                        int64_t cta_tiles,
+                                        bool k_pressure_path) {
+  if (size_k < 4096 || size_k % kCtaK != 0) {
     return 1;
   }
 
-  std::string value(env);
-  if (value == "1" || value == "2" || value == "4" || value == "8") {
-    return std::stoi(value);
+  if (k_pressure_path) {
+    if (cta_tiles <= 64) {
+      return 8;
+    }
+    if (cta_tiles <= 128) {
+      return 4;
+    }
+    if (cta_tiles <= 256) {
+      return 2;
+    }
+    return 1;
   }
-  TORCH_CHECK(false, env_name, " supports only 1, 2, 4, or 8. Got: ", env);
+
+  if (cta_tiles <= 16) {
+    return 8;
+  }
+  if (cta_tiles <= 32) {
+    return 4;
+  }
+  if (cta_tiles <= 64) {
+    return 2;
+  }
   return 1;
+}
+
+inline int sm70_marlin_dense_auto_requested_split_k(
+    int64_t size_m, int64_t size_n, int64_t size_k, Sm70CtaGeometry geometry) {
+  int64_t const m_tiles = (size_m + geometry.cta_m - 1) / geometry.cta_m;
+  int64_t const n_tiles = size_n / geometry.cta_n;
+  int64_t const cta_tiles = m_tiles * (n_tiles > 0 ? n_tiles : 1);
+  bool const k_pressure_path = size_k >= 8192 && size_n <= 256;
+  return sm70_marlin_auto_requested_split_k_from_tiles(size_k, cta_tiles, k_pressure_path);
+}
+
+inline int sm70_marlin_moe_auto_stage_requested_split_k(
+    int64_t tokens, int64_t size_n, int64_t size_k, int64_t top_k,
+    Sm70CtaGeometry geometry) {
+  int64_t const effective_m = tokens * top_k;
+  int64_t const m_tiles =
+      (effective_m + geometry.cta_m - 1) / geometry.cta_m;
+  int64_t const n_tiles = size_n / geometry.cta_n;
+  int64_t const cta_tiles = m_tiles * (n_tiles > 0 ? n_tiles : 1);
+  return sm70_marlin_auto_requested_split_k_from_tiles(size_k, cta_tiles, false);
 }
 
 inline torch::Tensor sm70_get_splitk_ctmp(
@@ -119,8 +155,8 @@ int sm70_splitk_partition_tile_count(int remaining_tiles,
 
 template <int GroupSize>
 CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
-    int k, int split_k, int partition_idx) {
-  int const active_split_k = sm70_active_split_k(k, split_k);
+    int k, int requested_split_k, int partition_idx) {
+  int const active_split_k = sm70_active_split_k(k, requested_split_k);
   if (partition_idx >= active_split_k) {
     return {0, 0};
   }

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +18,7 @@ from compressed_tensors.quantization import (
 try:
     from common import (
         banner,
-        check_cuda_ready,
+        require_matching_cuda_benchmark_runtime,
         format_float,
         time_cuda_callable,
         timestamp,
@@ -28,7 +26,7 @@ try:
 except ModuleNotFoundError:
     from benchmarks.common import (
         banner,
-        check_cuda_ready,
+        require_matching_cuda_benchmark_runtime,
         format_float,
         time_cuda_callable,
         timestamp,
@@ -52,23 +50,20 @@ from tests.helpers import (
 from tests.writeback_marlin_cases import (
     DENSE_ALL_QUANT_NAMES,
     DENSE_BENCHMARK_SHAPE_CASES,
-    DENSE_CTA_CASES,
-    DENSE_CTA_ENV_BY_QUANT,
     DENSE_IRREGULAR_SHAPE_CASES,
     DENSE_REGULAR_SHAPE_CASES,
-    DENSE_SPLIT_K_ENV_BY_QUANT,
     DENSE_WRITEBACK_CLASS_CASES,
     DenseShapeCase,
     DenseWritebackMatrixCase,
     WRITEBACK_GROUP_SIZE_VALUES,
-    WRITEBACK_SPLIT_K_VALUES,
+    dense_auto_cta_geometry_label,
+    dense_auto_split_k,
     iter_dense_writeback_matrix,
 )
 from vllm.scalar_type import scalar_types
 
 
 _DENSE_CLASS_CHOICES = tuple(case.name for case in DENSE_WRITEBACK_CLASS_CASES)
-_DENSE_CTA_CHOICES = tuple(case.name for case in DENSE_CTA_CASES)
 _SHAPE_SUITE_CASES = {
     "regular": DENSE_REGULAR_SHAPE_CASES,
     "irregular": DENSE_IRREGULAR_SHAPE_CASES,
@@ -82,8 +77,8 @@ _DENSE_CSV_FIELDNAMES = [
     "M",
     "K",
     "N",
-    "split_k",
-    "cta",
+    "auto_cta_geometry",
+    "auto_split_k",
     "status",
     "marlin_us",
     "flops",
@@ -91,30 +86,6 @@ _DENSE_CSV_FIELDNAMES = [
     "all_finite",
     "reason",
 ]
-
-
-@contextmanager
-def _matrix_env(case: DenseWritebackMatrixCase):
-    changes: list[tuple[str, str | None]] = []
-    for env_name, value in (
-        (DENSE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name), None if case.split_k == "unset" else case.split_k),
-        (DENSE_CTA_ENV_BY_QUANT.get(case.quant_name), case.cta.value),
-    ):
-        if env_name is None:
-            continue
-        changes.append((env_name, os.environ.get(env_name)))
-        if value is None:
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = value
-    try:
-        yield
-    finally:
-        for env_name, old_value in reversed(changes):
-            if old_value is None:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = old_value
 
 
 def _dense_flops(shape: DenseShapeCase) -> int:
@@ -587,15 +558,12 @@ def _iter_filtered_matrix(
             ),
         )
     )
-    cta_cases = tuple(case for case in DENSE_CTA_CASES if case.name in args.cta)
     yielded = 0
     for case in iter_dense_writeback_matrix(
         class_cases=class_cases,
         quant_names=tuple(args.quant_types),
         group_sizes=tuple(args.group_sizes),
         shapes=shapes,
-        split_k_values=tuple(args.split_k),
-        cta_cases=cta_cases,
     ):
         yield case
         yielded += 1
@@ -634,18 +602,6 @@ def parse_args() -> argparse.Namespace:
         choices=("regular", "irregular", "all"),
         default="all",
     )
-    parser.add_argument(
-        "--split-k",
-        nargs="+",
-        choices=list(WRITEBACK_SPLIT_K_VALUES),
-        default=list(WRITEBACK_SPLIT_K_VALUES),
-    )
-    parser.add_argument(
-        "--cta",
-        nargs="+",
-        choices=list(_DENSE_CTA_CHOICES),
-        default=list(_DENSE_CTA_CHOICES),
-    )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--check", action="store_true")
@@ -668,8 +624,8 @@ def _skip_row(case: DenseWritebackMatrixCase, reason: str) -> dict[str, str]:
         "M": str(case.shape.size_m),
         "K": str(case.shape.size_k),
         "N": str(case.shape.size_n),
-        "split_k": case.split_k,
-        "cta": case.cta.name,
+        "auto_cta_geometry": "n/a",
+        "auto_split_k": "n/a",
         "status": "SKIP",
         "marlin_us": "n/a",
         "flops": "n/a",
@@ -682,6 +638,8 @@ def _skip_row(case: DenseWritebackMatrixCase, reason: str) -> dict[str, str]:
 def _error_row(case: DenseWritebackMatrixCase, exc: BaseException) -> dict[str, str]:
     row = _skip_row(case, str(exc).splitlines()[0])
     row["status"] = "ERR"
+    row["auto_cta_geometry"] = dense_auto_cta_geometry_label(case.shape)
+    row["auto_split_k"] = str(dense_auto_split_k(case.shape))
     row["flops"] = "n/a"
     row["marlin_tflops"] = "n/a"
     return row
@@ -727,20 +685,19 @@ def _run_matrix_case(
         run_marlin = prepared_cache["run_marlin"]
 
         all_finite = "n/a"
-        with _matrix_env(case):
-            if check:
-                output = run_marlin(x)
-                all_finite = "yes" if torch.isfinite(output).all().item() else "no"
-                if output.shape != (case.shape.size_m, case.shape.size_n):
-                    raise AssertionError(
-                        f"output shape {tuple(output.shape)} != "
-                        f"{(case.shape.size_m, case.shape.size_n)}"
-                    )
-            stats = time_cuda_callable(
-                lambda: run_marlin(x),
-                warmup_iters=warmup_iters,
-                iters=iters,
-            )
+        if check:
+            output = run_marlin(x)
+            all_finite = "yes" if torch.isfinite(output).all().item() else "no"
+            if output.shape != (case.shape.size_m, case.shape.size_n):
+                raise AssertionError(
+                    f"output shape {tuple(output.shape)} != "
+                    f"{(case.shape.size_m, case.shape.size_n)}"
+                )
+        stats = time_cuda_callable(
+            lambda: run_marlin(x),
+            warmup_iters=warmup_iters,
+            iters=iters,
+        )
     except Exception as exc:
         return _error_row(case, exc)
 
@@ -753,8 +710,8 @@ def _run_matrix_case(
         "M": str(case.shape.size_m),
         "K": str(case.shape.size_k),
         "N": str(case.shape.size_n),
-        "split_k": case.split_k,
-        "cta": case.cta.name,
+        "auto_cta_geometry": dense_auto_cta_geometry_label(case.shape),
+        "auto_split_k": str(dense_auto_split_k(case.shape)),
         "status": "OK",
         "marlin_us": format_float(stats["median_us"]),
         "flops": str(flops),
@@ -766,7 +723,7 @@ def _run_matrix_case(
 
 def main() -> None:
     args = parse_args()
-    check_cuda_ready()
+    require_matching_cuda_benchmark_runtime()
     selected_cases = _count_filtered_matrix(args)
     csv_path = args.csv or Path("benchmarks/results") / (
         f"{timestamp().replace(' ', '_').replace(':', '')}_dense_writeback_matrix.csv"
@@ -777,14 +734,12 @@ def main() -> None:
     print(f"device={torch.cuda.get_device_name(0)}")
     print(f"capability={format_capability(runtime_capability(0))}")
     print(f"build_target={source_target_label()} ({source_target_cuda_arch_arg()})")
-    print("matrix=class x quant x group x shape x split-K x CTA")
+    print("matrix=class x quant x group x shape")
     print(f"preset={args.preset}")
     print(f"dense_classes={args.dense_classes}")
     print(f"quant_types={args.quant_types}")
     print(f"group_sizes={args.group_sizes}")
     print(f"shape_suite={args.shape_suite}")
-    print(f"split_k={args.split_k}")
-    print(f"cta={args.cta}")
     print(f"warmup_iters={args.warmup_iters}, iters={args.iters}, check={args.check}")
     print(f"omit_skip={args.omit_skip}")
     print(f"selected_cases={selected_cases}")

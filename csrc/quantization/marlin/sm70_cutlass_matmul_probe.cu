@@ -36,10 +36,10 @@ bool is_aligned_16(const void* ptr) {
   return (reinterpret_cast<std::uintptr_t>(ptr) & 0xfu) == 0;
 }
 
-void check_probe_inputs(const at::Tensor& a, const at::Tensor& b,
-                        int64_t cta_m, int64_t cta_n, int64_t cta_k,
-                        int64_t warps, int64_t stages, int64_t a_path,
-                        int64_t b_path) {
+void validate_sm70_cutlass_matmul_probe_inputs(
+    const at::Tensor& a, const at::Tensor& b, int64_t cta_m, int64_t cta_n,
+    int64_t cta_k, int64_t warps, int64_t stages, int64_t a_path,
+    int64_t b_path) {
   TORCH_CHECK(a.device().is_cuda(), "sm70_cutlass_matmul_probe: A must be CUDA");
   TORCH_CHECK(b.device().is_cuda(), "sm70_cutlass_matmul_probe: B must be CUDA");
   TORCH_CHECK(a.get_device() == b.get_device(),
@@ -991,7 +991,8 @@ at::Tensor sm70_cutlass_matmul_probe(const at::Tensor& a, const at::Tensor& b,
                                      int64_t cta_k, int64_t warps,
                                      int64_t stages, int64_t a_path,
                                      int64_t b_path) {
-  check_probe_inputs(a, b, cta_m, cta_n, cta_k, warps, stages, a_path, b_path);
+  validate_sm70_cutlass_matmul_probe_inputs(
+      a, b, cta_m, cta_n, cta_k, warps, stages, a_path, b_path);
   if (a_path == kAPathCutlassThreadblock) {
     return dispatch_sm70_cutlass_threadblock_gemm(a, b, cta_m, cta_n, cta_k,
                                                   warps, b_path);

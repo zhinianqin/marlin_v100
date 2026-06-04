@@ -36,6 +36,7 @@ message(STATUS "marlin_v100 CUDA target architectures: ${CUDA_ARCHS}")
 message(STATUS "marlin_v100 CMake CUDA architectures: ${VLLM_GPU_ARCHES}")
 
 get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
+list(APPEND VLLM_GPU_FLAGS "-Wno-deprecated-gpu-targets")
 if(NVCC_THREADS)
   list(APPEND VLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
 endif()

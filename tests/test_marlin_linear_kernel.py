@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections import Counter, OrderedDict
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,14 +31,11 @@ from tests.helpers import (
 from vllm.scalar_type import scalar_types
 from tests.writeback_marlin_cases import (
     DENSE_ALL_QUANT_NAMES,
-    DENSE_CTA_ENV_BY_QUANT,
     DENSE_IRREGULAR_SHAPE_CASES,
     DENSE_REGULAR_SHAPE_CASES,
-    DENSE_SPLIT_K_ENV_BY_QUANT,
     DENSE_WRITEBACK_CLASS_CASES,
     DENSE_WRITEBACK_CLASS_CASE_BY_NAME,
     DenseWritebackMatrixCase,
-    WRITEBACK_SPLIT_K_VALUES,
     iter_dense_writeback_matrix,
     is_dense_group_size_supported,
 )
@@ -1051,25 +1046,6 @@ _DENSE_MATRIX_CACHE: OrderedDict[
 ] = OrderedDict()
 
 
-def _set_dense_matrix_env(
-    monkeypatch: pytest.MonkeyPatch,
-    case: DenseWritebackMatrixCase,
-) -> None:
-    split_env = DENSE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name)
-    if split_env is not None:
-        if case.split_k == "unset":
-            monkeypatch.delenv(split_env, raising=False)
-        else:
-            monkeypatch.setenv(split_env, case.split_k)
-
-    cta_env = DENSE_CTA_ENV_BY_QUANT.get(case.quant_name)
-    if cta_env is not None:
-        if case.cta.value is None:
-            monkeypatch.delenv(cta_env, raising=False)
-        else:
-            monkeypatch.setenv(cta_env, case.cta.value)
-
-
 def _make_compressed_tensors_fp8_layer_case(
     *,
     group_size: int,
@@ -1281,33 +1257,6 @@ def _prepare_dense_matrix_case(
     return result
 
 
-@contextmanager
-def _dense_matrix_env(case: DenseWritebackMatrixCase):
-    changes: list[tuple[str, str | None]] = []
-    for env_name, value in (
-        (
-            DENSE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name),
-            None if case.split_k == "unset" else case.split_k,
-        ),
-        (DENSE_CTA_ENV_BY_QUANT.get(case.quant_name), case.cta.value),
-    ):
-        if env_name is None:
-            continue
-        changes.append((env_name, os.environ.get(env_name)))
-        if value is None:
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = value
-    try:
-        yield
-    finally:
-        for env_name, old_value in reversed(changes):
-            if old_value is None:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = old_value
-
-
 def _dense_matrix_row(
     case: DenseWritebackMatrixCase,
     *,
@@ -1325,8 +1274,6 @@ def _dense_matrix_row(
         "M": case.shape.size_m,
         "K": case.shape.size_k,
         "N": case.shape.size_n,
-        "split_k": case.split_k,
-        "cta": case.cta.name,
         "status": status,
         "is_zp_float": expected_is_zp_float,
         "c_tmp_numel": c_tmp_numel,
@@ -1348,16 +1295,12 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
         "quant": Counter(),
         "group_size": Counter(),
         "shape_id": Counter(),
-        "split_k": Counter(),
-        "cta": Counter(),
     }
     ok_coverage: dict[str, Counter[Any]] = {
         "dense_class": Counter(),
         "quant": Counter(),
         "group_size": Counter(),
         "shape_id": Counter(),
-        "split_k": Counter(),
-        "cta": Counter(),
     }
     first_failure: dict[str, object] | None = None
     max_c_tmp_numel = 0
@@ -1369,8 +1312,6 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
             coverage["quant"][matrix_case.quant_name] += 1
             coverage["group_size"][matrix_case.group_size] += 1
             coverage["shape_id"][matrix_case.shape.name] += 1
-            coverage["split_k"][matrix_case.split_k] += 1
-            coverage["cta"][matrix_case.cta.name] += 1
 
             if not matrix_case.supported:
                 status_counts["SKIP"] += 1
@@ -1381,16 +1322,15 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
             c_tmp_numel: int | None = None
             try:
                 records.clear()
-                with _dense_matrix_env(matrix_case):
-                    apply_fn, owner, expected_is_zp_float = _prepare_dense_matrix_case(
-                        matrix_case
-                    )
-                    x = torch.zeros(
-                        matrix_case.shape.size_m,
-                        matrix_case.shape.size_k,
-                        dtype=torch.float16,
-                    )
-                    output = apply_fn(x)
+                apply_fn, owner, expected_is_zp_float = _prepare_dense_matrix_case(
+                    matrix_case
+                )
+                x = torch.zeros(
+                    matrix_case.shape.size_m,
+                    matrix_case.shape.size_k,
+                    dtype=torch.float16,
+                )
+                output = apply_fn(x)
 
                 assert output.shape == (
                     matrix_case.shape.size_m,
@@ -1418,8 +1358,6 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
                 ok_coverage["quant"][matrix_case.quant_name] += 1
                 ok_coverage["group_size"][matrix_case.group_size] += 1
                 ok_coverage["shape_id"][matrix_case.shape.name] += 1
-                ok_coverage["split_k"][matrix_case.split_k] += 1
-                ok_coverage["cta"][matrix_case.cta.name] += 1
             except Exception as exc:
                 status = "ERR"
                 reason = str(exc).splitlines()[0]
@@ -1451,7 +1389,7 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
 
     elapsed = time.time() - started
     summary = {
-        "matrix": "class x quant x group x shape x split-K x CTA",
+        "matrix": "class x quant x group x shape",
         "total": status_counts["total"],
         "OK": status_counts["OK"],
         "SKIP": status_counts["SKIP"],

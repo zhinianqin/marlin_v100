@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
-from contextlib import contextmanager
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -14,7 +12,7 @@ import torch
 try:
     from common import (
         banner,
-        check_cuda_ready,
+        require_matching_cuda_benchmark_runtime,
         format_float,
         time_cuda_callable,
         timestamp,
@@ -22,7 +20,7 @@ try:
 except ModuleNotFoundError:
     from benchmarks.common import (
         banner,
-        check_cuda_ready,
+        require_matching_cuda_benchmark_runtime,
         format_float,
         time_cuda_callable,
         timestamp,
@@ -66,16 +64,14 @@ from compressed_tensors.quantization import (
 from tests.writeback_marlin_cases import (
     MOE_ALL_QUANT_NAMES,
     MOE_BENCHMARK_SHAPE_CASES,
-    MOE_CTA_CASES,
-    MOE_CTA_ENV_BY_QUANT,
     MOE_IRREGULAR_SHAPE_CASES,
     MOE_REGULAR_SHAPE_CASES,
-    MOE_SPLIT_K_ENV_BY_QUANT,
     MOE_WRITEBACK_CLASS_CASES,
     MoeWritebackMatrixCase,
     WRITEBACK_GROUP_SIZE_VALUES,
-    WRITEBACK_SPLIT_K_VALUES,
     iter_moe_writeback_matrix,
+    moe_auto_cta_geometry_label,
+    moe_auto_split_k_label,
 )
 
 _MOE_QUANT_TYPE_CANDIDATES = {
@@ -88,20 +84,7 @@ QUANT_TYPES = {
     name: _MOE_QUANT_TYPE_CANDIDATES[name]
     for name in supported_moe_quant_type_names(_MOE_QUANT_TYPE_CANDIDATES)
 }
-SM70_MOE_U4_SPLIT_K_ENV = "SM70_MARLIN_MOE_U4_SPLIT_K"
-SM70_MOE_U8_SPLIT_K_ENV = "SM70_MARLIN_MOE_U8_SPLIT_K"
-SM70_MOE_U4B8_SPLIT_K_ENV = "SM70_MARLIN_MOE_U4B8_SPLIT_K"
-SM70_MOE_U8B128_SPLIT_K_ENV = "SM70_MARLIN_MOE_U8B128_SPLIT_K"
-
-
-_SPLIT_K_ENV_BY_QUANT = {
-    "uint4": SM70_MOE_U4_SPLIT_K_ENV,
-    "uint4b8": SM70_MOE_U4B8_SPLIT_K_ENV,
-    "uint8": SM70_MOE_U8_SPLIT_K_ENV,
-    "uint8b128": SM70_MOE_U8B128_SPLIT_K_ENV,
-}
 METHOD_CLASS_CHOICES = tuple(case.name for case in MOE_WRITEBACK_CLASS_CASES)
-_MOE_CTA_CHOICES = tuple(case.name for case in MOE_CTA_CASES)
 _SHAPE_SUITE_CASES = {
     "regular": MOE_REGULAR_SHAPE_CASES,
     "irregular": MOE_IRREGULAR_SHAPE_CASES,
@@ -118,8 +101,8 @@ _MOE_CSV_FIELDNAMES = [
     "experts",
     "topk",
     "routing_profile",
-    "split_k",
-    "cta",
+    "auto_cta_geometry",
+    "auto_split_k",
     "status",
     "marlin_us",
     "flops",
@@ -251,27 +234,6 @@ def _dequant_zero_point(
     )
 
 
-@contextmanager
-def sm70_moe_split_k_env(quant_name: str, split_k: str):
-    env_name = _SPLIT_K_ENV_BY_QUANT.get(quant_name)
-    if env_name is None:
-        yield
-        return
-
-    old_value = os.environ.get(env_name)
-    try:
-        if split_k == "unset":
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = split_k
-        yield
-    finally:
-        if old_value is None:
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = old_value
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark MoE Marlin writeback class matrix."
@@ -303,20 +265,6 @@ def parse_args() -> argparse.Namespace:
         help="Shape suite to include in the matrix.",
     )
     parser.add_argument(
-        "--split-k",
-        nargs="+",
-        choices=list(WRITEBACK_SPLIT_K_VALUES),
-        default=list(WRITEBACK_SPLIT_K_VALUES),
-        help="Split-K settings to include in the matrix.",
-    )
-    parser.add_argument(
-        "--cta",
-        nargs="+",
-        choices=list(_MOE_CTA_CHOICES),
-        default=list(_MOE_CTA_CHOICES),
-        help="CTA settings to include in the matrix.",
-    )
-    parser.add_argument(
         "--method-classes",
         nargs="+",
         choices=METHOD_CLASS_CHOICES,
@@ -343,33 +291,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-@contextmanager
-def _matrix_env(case: MoeWritebackMatrixCase):
-    changes: list[tuple[str, str | None]] = []
-    for env_name, value in (
-        (
-            MOE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name),
-            None if case.split_k == "unset" else case.split_k,
-        ),
-        (MOE_CTA_ENV_BY_QUANT.get(case.quant_name), case.cta.value),
-    ):
-        if env_name is None:
-            continue
-        changes.append((env_name, os.environ.get(env_name)))
-        if value is None:
-            os.environ.pop(env_name, None)
-        else:
-            os.environ[env_name] = value
-    try:
-        yield
-    finally:
-        for env_name, old_value in reversed(changes):
-            if old_value is None:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = old_value
-
-
 def _iter_filtered_matrix(args: argparse.Namespace) -> Iterator[MoeWritebackMatrixCase]:
     allowed_shapes = {shape.name for shape in _SHAPE_SUITE_CASES[args.shape_suite]}
     class_cases = tuple(
@@ -393,15 +314,12 @@ def _iter_filtered_matrix(args: argparse.Namespace) -> Iterator[MoeWritebackMatr
             ),
         )
     )
-    cta_cases = tuple(case for case in MOE_CTA_CASES if case.name in args.cta)
     yielded = 0
     for case in iter_moe_writeback_matrix(
         class_cases=class_cases,
         quant_names=tuple(args.quant_types),
         group_sizes=tuple(args.group_sizes),
         shapes=shapes,
-        split_k_values=tuple(args.split_k),
-        cta_cases=cta_cases,
     ):
         yield case
         yielded += 1
@@ -451,7 +369,6 @@ def _prepare_gptq_method_case(
     group_size: int,
     act_order: bool,
     is_k_full: bool,
-    split_k: str,
     prepare_reference: bool,
 ) -> _PreparedMoeCase:
     quant_type = QUANT_TYPES[quant_name]
@@ -552,7 +469,6 @@ def _prepare_awq_method_case(
     intermediate: int,
     quant_name: str,
     group_size: int,
-    split_k: str,
     prepare_reference: bool,
 ) -> _PreparedMoeCase:
     if quant_name == "uint4":
@@ -646,7 +562,6 @@ def _prepare_compressed_tensors_wna16_method_case(
     group_size: int,
     act_order: bool,
     is_k_full: bool,
-    split_k: str,
     prepare_reference: bool,
 ) -> _PreparedMoeCase:
     quant_type = QUANT_TYPES[quant_name]
@@ -770,7 +685,6 @@ def _prepare_method_case(
     group_size: int,
     act_order: bool,
     is_k_full: bool,
-    split_k: str,
     method_class: str,
     prepare_reference: bool,
 ) -> _PreparedMoeCase:
@@ -786,7 +700,6 @@ def _prepare_method_case(
             intermediate=intermediate,
             quant_name=quant_name,
             group_size=group_size,
-            split_k=split_k,
             prepare_reference=prepare_reference,
         )
     if method_class == "gptq_moe":
@@ -803,7 +716,6 @@ def _prepare_method_case(
             group_size=group_size,
             act_order=act_order,
             is_k_full=is_k_full,
-            split_k=split_k,
             prepare_reference=prepare_reference,
         )
     if method_class == "compressed_tensors_wna16_moe":
@@ -820,7 +732,6 @@ def _prepare_method_case(
             group_size=group_size,
             act_order=act_order,
             is_k_full=is_k_full,
-            split_k=split_k,
             prepare_reference=prepare_reference,
         )
     raise ValueError(f"Unsupported method_class={method_class!r}")
@@ -1039,8 +950,8 @@ def _base_row(case: MoeWritebackMatrixCase) -> dict[str, str]:
         "experts": str(case.shape.experts),
         "topk": str(case.shape.topk),
         "routing_profile": case.shape.routing_profile,
-        "split_k": case.split_k,
-        "cta": case.cta.name,
+        "auto_cta_geometry": "n/a",
+        "auto_split_k": "n/a",
         "status": "",
         "marlin_us": "",
         "flops": "",
@@ -1072,6 +983,8 @@ def _skip_row(case: MoeWritebackMatrixCase, reason: str) -> dict[str, str]:
 def _error_row(case: MoeWritebackMatrixCase, exc: BaseException) -> dict[str, str]:
     row = _skip_row(case, str(exc).splitlines()[0])
     row["status"] = "ERR"
+    row["auto_cta_geometry"] = moe_auto_cta_geometry_label(case.shape)
+    row["auto_split_k"] = moe_auto_split_k_label(case.shape)
     row["flops"] = "n/a"
     row["marlin_tflops"] = "n/a"
     return row
@@ -1105,11 +1018,10 @@ def _run_matrix_case(
         )
         if prepared_cache.get("prepare_key") != prepare_key:
             prepared_cache.clear()
-            with _matrix_env(case):
-                prepared = _prepare_benchmark_method_case(
-                    case,
-                    prepare_reference=check,
-                )
+            prepared = _prepare_benchmark_method_case(
+                case,
+                prepare_reference=check,
+            )
             prepared_cache["prepare_key"] = prepare_key
             prepared_cache["prepared"] = prepared
         else:
@@ -1134,58 +1046,57 @@ def _run_matrix_case(
             topk_ids = prepared_cache["topk_ids"]
 
         assert isinstance(prepared, _PreparedMoeCase)
-        with _matrix_env(case):
-            run_marlin = prepared.run_marlin
+        run_marlin = prepared.run_marlin
 
-            if check:
-                output = run_marlin(hidden_states, topk_weights, topk_ids)
-                all_finite = "yes" if torch.isfinite(output).all().item() else "no"
-                if output.shape != hidden_states.shape:
-                    raise AssertionError(
-                        f"output shape {tuple(output.shape)} != "
-                        f"{tuple(hidden_states.shape)}"
-                    )
-                if prepared.w1_dequant is None or prepared.w2_dequant is None:
-                    raise AssertionError("reference weights were not prepared")
-                reference = marlin_moe_reference(
-                    hidden_states,
-                    prepared.w1_dequant,
-                    prepared.w2_dequant,
-                    topk_weights,
-                    topk_ids,
-                ).to(torch.float16)
-                if all_finite == "yes":
-                    diff = (output - reference).abs().to(torch.float32)
-                    max_abs_err = format_float(float(diff.max().item()))
-                    try:
-                        if case.quant_name in {"uint4", "uint8"}:
-                            torch.testing.assert_close(
-                                output,
-                                reference,
-                                rtol=2e-1,
-                                atol=1.25,
-                            )
-                        else:
-                            torch.testing.assert_close(
-                                output,
-                                reference,
-                                rtol=7e-2,
-                                atol=1e-2,
-                            )
-                        check_pass = "yes"
-                    except AssertionError as exc:
-                        check_pass = "no"
-                        reason = str(exc).splitlines()[0]
-                else:
+        if check:
+            output = run_marlin(hidden_states, topk_weights, topk_ids)
+            all_finite = "yes" if torch.isfinite(output).all().item() else "no"
+            if output.shape != hidden_states.shape:
+                raise AssertionError(
+                    f"output shape {tuple(output.shape)} != "
+                    f"{tuple(hidden_states.shape)}"
+                )
+            if prepared.w1_dequant is None or prepared.w2_dequant is None:
+                raise AssertionError("reference weights were not prepared")
+            reference = marlin_moe_reference(
+                hidden_states,
+                prepared.w1_dequant,
+                prepared.w2_dequant,
+                topk_weights,
+                topk_ids,
+            ).to(torch.float16)
+            if all_finite == "yes":
+                diff = (output - reference).abs().to(torch.float32)
+                max_abs_err = format_float(float(diff.max().item()))
+                try:
+                    if case.quant_name in {"uint4", "uint8"}:
+                        torch.testing.assert_close(
+                            output,
+                            reference,
+                            rtol=2e-1,
+                            atol=1.25,
+                        )
+                    else:
+                        torch.testing.assert_close(
+                            output,
+                            reference,
+                            rtol=7e-2,
+                            atol=1e-2,
+                        )
+                    check_pass = "yes"
+                except AssertionError as exc:
                     check_pass = "no"
-                    max_abs_err = "inf"
-                    reason = "output contains non-finite values"
+                    reason = str(exc).splitlines()[0]
+            else:
+                check_pass = "no"
+                max_abs_err = "inf"
+                reason = "output contains non-finite values"
 
-            stats = time_cuda_callable(
-                lambda: run_marlin(hidden_states, topk_weights, topk_ids),
-                warmup_iters=warmup_iters,
-                iters=iters,
-            )
+        stats = time_cuda_callable(
+            lambda: run_marlin(hidden_states, topk_weights, topk_ids),
+            warmup_iters=warmup_iters,
+            iters=iters,
+        )
     except Exception as exc:
         return _error_row(case, exc)
 
@@ -1196,6 +1107,8 @@ def _run_matrix_case(
             "marlin_us": format_float(stats["median_us"]),
             "flops": str(_moe_flops(case)),
             "marlin_tflops": _format_tflops(_moe_flops(case), stats["median_us"]),
+            "auto_cta_geometry": moe_auto_cta_geometry_label(case.shape),
+            "auto_split_k": moe_auto_split_k_label(case.shape),
             "all_finite": all_finite,
             "check_pass": check_pass,
             "max_abs_err": max_abs_err,
@@ -1207,7 +1120,7 @@ def _run_matrix_case(
 
 def main() -> None:
     args = parse_args()
-    check_cuda_ready()
+    require_matching_cuda_benchmark_runtime()
     ops._load_dense()
     ops._load_moe()
 
@@ -1221,15 +1134,13 @@ def main() -> None:
     print(f"device={torch.cuda.get_device_name(0)}")
     print(f"capability={format_capability(runtime_capability(0))}")
     print(f"build_target={source_target_label()} ({source_target_cuda_arch_arg()})")
-    print("matrix=class x quant x group x shape x split-K x CTA")
+    print("matrix=class x quant x group x shape")
     print(f"preset={args.preset}")
     if args.path != "method":
         print("path=raw was requested, but writeback matrix benchmark uses method path.")
     print(f"quant_types={args.quant_types}")
     print(f"group_sizes={args.group_sizes}")
     print(f"shape_suite={args.shape_suite}")
-    print(f"split_k={args.split_k}")
-    print(f"cta={args.cta}")
     print(f"method_classes={args.method_classes}")
     print(f"warmup_iters={args.warmup_iters}, iters={args.iters}, check={args.check}")
     print(f"omit_skip={args.omit_skip}")
