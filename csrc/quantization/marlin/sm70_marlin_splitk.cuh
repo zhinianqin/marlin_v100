@@ -56,6 +56,68 @@ inline int sm70_marlin_auto_requested_split_k_from_tiles(int64_t size_k,
 
 inline int sm70_marlin_dense_auto_requested_split_k(
     int64_t size_m, int64_t size_n, int64_t size_k, Sm70CtaGeometry geometry) {
+  if (size_k < 4096 || size_k % kCtaK != 0) {
+    return 1;
+  }
+
+  if (size_k == 4096) {
+    if (size_n == 1024) {
+      if (size_m >= 2048) {
+        return 1;
+      }
+      if (size_m >= 1024) {
+        return 2;
+      }
+      if (size_m >= 64) {
+        return 8;
+      }
+      if (size_m >= 24) {
+        return 4;
+      }
+      return 8;
+    }
+
+    if (size_n >= 8192) {
+      if (size_m >= 48) {
+        return 1;
+      }
+      if (size_m >= 16) {
+        return 2;
+      }
+      return size_m == 1 ? 8 : 2;
+    }
+
+    if (size_n >= 4096) {
+      if (size_m >= 1024) {
+        return 1;
+      }
+      if (size_m >= 48) {
+        return 4;
+      }
+      return size_m <= 16 ? 8 : 4;
+    }
+  }
+
+  if (size_k >= 8192 && size_n <= 256) {
+    if (size_m >= 4096) {
+      return 2;
+    }
+    if (size_m >= 2048) {
+      return 4;
+    }
+    return 8;
+  }
+
+  if (size_k >= 8192 && size_n >= 4096) {
+    if (size_m >= 1024) {
+      return 1;
+    }
+    if (size_m >= 48) {
+      return 4;
+    }
+    return 8;
+  }
+
   int64_t const m_tiles = (size_m + geometry.cta_m - 1) / geometry.cta_m;
   int64_t const n_tiles = size_n / geometry.cta_n;
   int64_t const cta_tiles = m_tiles * (n_tiles > 0 ? n_tiles : 1);
@@ -71,7 +133,25 @@ inline int sm70_marlin_moe_auto_stage_requested_split_k(
       (effective_m + geometry.cta_m - 1) / geometry.cta_m;
   int64_t const n_tiles = size_n / geometry.cta_n;
   int64_t const cta_tiles = m_tiles * (n_tiles > 0 ? n_tiles : 1);
-  return sm70_marlin_auto_requested_split_k_from_tiles(size_k, cta_tiles, false);
+  if (size_k % kCtaK != 0) {
+    return 1;
+  }
+  if (size_k == 2048) {
+    return cta_tiles <= 64 ? 2 : 1;
+  }
+  if (size_k < 4096) {
+    return 1;
+  }
+  if (cta_tiles <= 16) {
+    return 8;
+  }
+  if (cta_tiles <= 32) {
+    return 4;
+  }
+  if (cta_tiles <= 128) {
+    return 2;
+  }
+  return 1;
 }
 
 inline torch::Tensor sm70_get_splitk_ctmp(

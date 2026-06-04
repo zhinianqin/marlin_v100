@@ -70,8 +70,8 @@ from tests.writeback_marlin_cases import (
     MoeWritebackMatrixCase,
     WRITEBACK_GROUP_SIZE_VALUES,
     iter_moe_writeback_matrix,
-    moe_auto_cta_geometry_label,
-    moe_auto_split_k_label,
+    moe_case_auto_cta_geometry_label,
+    moe_case_auto_split_k_label,
 )
 
 _MOE_QUANT_TYPE_CANDIDATES = {
@@ -983,8 +983,8 @@ def _skip_row(case: MoeWritebackMatrixCase, reason: str) -> dict[str, str]:
 def _error_row(case: MoeWritebackMatrixCase, exc: BaseException) -> dict[str, str]:
     row = _skip_row(case, str(exc).splitlines()[0])
     row["status"] = "ERR"
-    row["auto_cta_geometry"] = moe_auto_cta_geometry_label(case.shape)
-    row["auto_split_k"] = moe_auto_split_k_label(case.shape)
+    row["auto_cta_geometry"] = moe_case_auto_cta_geometry_label(case)
+    row["auto_split_k"] = moe_case_auto_split_k_label(case)
     row["flops"] = "n/a"
     row["marlin_tflops"] = "n/a"
     return row
@@ -1107,8 +1107,8 @@ def _run_matrix_case(
             "marlin_us": format_float(stats["median_us"]),
             "flops": str(_moe_flops(case)),
             "marlin_tflops": _format_tflops(_moe_flops(case), stats["median_us"]),
-            "auto_cta_geometry": moe_auto_cta_geometry_label(case.shape),
-            "auto_split_k": moe_auto_split_k_label(case.shape),
+            "auto_cta_geometry": moe_case_auto_cta_geometry_label(case),
+            "auto_split_k": moe_case_auto_split_k_label(case),
             "all_finite": all_finite,
             "check_pass": check_pass,
             "max_abs_err": max_abs_err,

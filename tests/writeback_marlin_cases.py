@@ -543,11 +543,23 @@ def dense_auto_cta(size_m: int, size_n: int) -> ResolvedCta | None:
     return ResolvedCta(cta_m, cta_n, warps)
 
 
-def moe_auto_cta(size_n: int, tokens: int = 0) -> ResolvedCta | None:
+def moe_auto_cta(
+    size_n: int,
+    tokens: int = 0,
+    quant_name: str | None = None,
+    group_size: int | None = None,
+) -> ResolvedCta | None:
     if size_n % 256 == 0:
         cta_n = 256
-        cta_m = 64 if tokens >= 1024 else 32
-        warps = 4
+        if quant_name == "uint4" and group_size == -1:
+            cta_m = 32
+            warps = 4
+        elif quant_name == "uint8" and group_size == -1 and tokens >= 1024:
+            cta_m = 64
+            warps = 8
+        else:
+            cta_m = 64 if tokens >= 1024 else 32
+            warps = 4
     elif size_n % 128 == 0:
         cta_n = 128
         if tokens >= 4096:
@@ -593,6 +605,49 @@ def dense_auto_split_k(shape: DenseShapeCase) -> int:
     cta = dense_auto_cta_geometry(shape)
     if cta is None:
         return 1
+    if shape.size_k < 4096 or shape.size_k % 32 != 0:
+        return 1
+
+    if shape.size_k == 4096:
+        if shape.size_n == 1024:
+            if shape.size_m >= 2048:
+                return 1
+            if shape.size_m >= 1024:
+                return 2
+            if shape.size_m >= 64:
+                return 8
+            if shape.size_m >= 24:
+                return 4
+            return 8
+
+        if shape.size_n >= 8192:
+            if shape.size_m >= 48:
+                return 1
+            if shape.size_m >= 16:
+                return 2
+            return 8 if shape.size_m == 1 else 2
+
+        if shape.size_n >= 4096:
+            if shape.size_m >= 1024:
+                return 1
+            if shape.size_m >= 48:
+                return 4
+            return 8 if shape.size_m <= 16 else 4
+
+    if shape.size_k >= 8192 and shape.size_n <= 256:
+        if shape.size_m >= 4096:
+            return 2
+        if shape.size_m >= 2048:
+            return 4
+        return 8
+
+    if shape.size_k >= 8192 and shape.size_n >= 4096:
+        if shape.size_m >= 1024:
+            return 1
+        if shape.size_m >= 48:
+            return 4
+        return 8
+
     m_tiles = (shape.size_m + cta.cta_m - 1) // cta.cta_m
     n_tiles = max(1, shape.size_n // cta.cta_n)
     return _split_k_from_tiles(
@@ -604,10 +659,23 @@ def dense_auto_split_k(shape: DenseShapeCase) -> int:
 
 def moe_auto_stage_cta_geometry(
     shape: MoeShapeCase,
+    *,
+    quant_name: str | None = None,
+    group_size: int | None = None,
 ) -> tuple[ResolvedCta | None, ResolvedCta | None]:
     return (
-        moe_auto_cta(2 * shape.intermediate, shape.tokens),
-        moe_auto_cta(shape.hidden, shape.tokens * shape.topk),
+        moe_auto_cta(
+            2 * shape.intermediate,
+            shape.tokens,
+            quant_name=quant_name,
+            group_size=group_size,
+        ),
+        moe_auto_cta(
+            shape.hidden,
+            shape.tokens * shape.topk,
+            quant_name=quant_name,
+            group_size=group_size,
+        ),
     )
 
 
@@ -643,8 +711,32 @@ def moe_auto_cta_geometry_label(shape: MoeShapeCase) -> str:
     return f"stage1={stage1_label};stage2={stage2_label}"
 
 
-def moe_auto_stage_split_k(shape: MoeShapeCase) -> tuple[int, int]:
-    stage1, stage2 = moe_auto_stage_cta_geometry(shape)
+def moe_case_auto_cta_geometry_label(
+    case: MoeWritebackMatrixCase,
+) -> str:
+    stage1, stage2 = moe_auto_stage_cta_geometry(
+        case.shape,
+        quant_name=case.quant_name,
+        group_size=case.group_size,
+    )
+    stage1_label = auto_cta_geometry_label(stage1)
+    stage2_label = auto_cta_geometry_label(stage2)
+    if stage1_label == stage2_label:
+        return stage1_label
+    return f"stage1={stage1_label};stage2={stage2_label}"
+
+
+def moe_auto_stage_split_k(
+    shape: MoeShapeCase,
+    *,
+    quant_name: str | None = None,
+    group_size: int | None = None,
+) -> tuple[int, int]:
+    stage1, stage2 = moe_auto_stage_cta_geometry(
+        shape,
+        quant_name=quant_name,
+        group_size=group_size,
+    )
     if stage1 is None or stage2 is None:
         return (1, 1)
 
@@ -652,11 +744,20 @@ def moe_auto_stage_split_k(shape: MoeShapeCase) -> tuple[int, int]:
         effective_m = shape.tokens * shape.topk
         m_tiles = (effective_m + cta.cta_m - 1) // cta.cta_m
         n_tiles = max(1, size_n // cta.cta_n)
-        return _split_k_from_tiles(
-            size_k,
-            m_tiles * n_tiles,
-            k_pressure_path=False,
-        )
+        cta_tiles = m_tiles * n_tiles
+        if size_k % 32 != 0:
+            return 1
+        if size_k == 2048:
+            return 2 if cta_tiles <= 64 else 1
+        if size_k < 4096:
+            return 1
+        if cta_tiles <= 16:
+            return 8
+        if cta_tiles <= 32:
+            return 4
+        if cta_tiles <= 128:
+            return 2
+        return 1
 
     return (
         _stage_split(2 * shape.intermediate, shape.hidden, stage1),
@@ -666,6 +767,17 @@ def moe_auto_stage_split_k(shape: MoeShapeCase) -> tuple[int, int]:
 
 def moe_auto_split_k_label(shape: MoeShapeCase) -> str:
     stage1, stage2 = moe_auto_stage_split_k(shape)
+    if stage1 == stage2:
+        return str(stage1)
+    return f"stage1={stage1};stage2={stage2}"
+
+
+def moe_case_auto_split_k_label(case: MoeWritebackMatrixCase) -> str:
+    stage1, stage2 = moe_auto_stage_split_k(
+        case.shape,
+        quant_name=case.quant_name,
+        group_size=case.group_size,
+    )
     if stage1 == stage2:
         return str(stage1)
     return f"stage1={stage1};stage2={stage2}"
@@ -838,8 +950,8 @@ def moe_writeback_matrix_summary(
         quants[case.quant_name] += 1
         groups[case.group_size] += 1
         shapes[case.shape.name] += 1
-        auto_cta_geometry[moe_auto_cta_geometry_label(case.shape)] += 1
-        auto_split_k[moe_auto_split_k_label(case.shape)] += 1
+        auto_cta_geometry[moe_case_auto_cta_geometry_label(case)] += 1
+        auto_split_k[moe_case_auto_split_k_label(case)] += 1
         routing[case.shape.routing_profile] += 1
         if case.supported:
             status["supported"] += 1

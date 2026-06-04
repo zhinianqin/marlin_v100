@@ -74,10 +74,40 @@ inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(int64_
   return {0, 0, 0};
 }
 
+inline Sm70CtaGeometry sm70_marlin_moe_u4_zp_auto_stage_cta_geometry_from_cta_n(
+    int64_t tokens, int auto_cta_n, int64_t group_size) {
+  if (auto_cta_n == 256 && group_size == -1) {
+    return {32, 256, 4};
+  }
+  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
+}
+
+inline Sm70CtaGeometry sm70_marlin_moe_u8_zp_auto_stage_cta_geometry_from_cta_n(
+    int64_t tokens, int auto_cta_n, int64_t group_size) {
+  if (auto_cta_n == 256 && group_size == -1 && tokens >= 1024) {
+    return {64, 256, 8};
+  }
+  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
+}
+
 inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry(
     int64_t tokens, int64_t size_n) {
   int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
   return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
+}
+
+inline Sm70CtaGeometry sm70_marlin_moe_u4_zp_auto_stage_cta_geometry(
+    int64_t tokens, int64_t size_n, int64_t group_size) {
+  int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
+  return sm70_marlin_moe_u4_zp_auto_stage_cta_geometry_from_cta_n(
+      tokens, auto_cta_n, group_size);
+}
+
+inline Sm70CtaGeometry sm70_marlin_moe_u8_zp_auto_stage_cta_geometry(
+    int64_t tokens, int64_t size_n, int64_t group_size) {
+  int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
+  return sm70_marlin_moe_u8_zp_auto_stage_cta_geometry_from_cta_n(
+      tokens, auto_cta_n, group_size);
 }
 
 inline bool sm70_marlin_moe_cta_geometry_is_supported(
