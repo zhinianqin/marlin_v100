@@ -17,8 +17,8 @@
 
 - `csrc/`
   放置需要回写主树的 Marlin 相关 CUDA/C++ 源码与最小 binding。
-- `python/marlin_v100/`
-  放置本地开发使用的 Python 薄封装，只服务于本工作区。
+- `vllm/`
+  放置最小上游式 Python package 与扩展落位目录。扩展通过 `vllm._C` / `vllm._moe_C` 加载。
 - `tests/`
   放置本地独立测试，不默认回写主树。
 - `upstream_map.yaml`
@@ -33,8 +33,8 @@
 - 优先使用本目录下的工具链：
   `./.venv/bin/python`、`./.venv/bin/pytest`、`./.venv/bin/cmake`、`./.venv/bin/ninja`
 - Python 相关命令统一带上：
-  `PYTHONPATH=$PWD/python`
-- 不要把本地工作区名 `marlin_v100` 传播到主树的上游 Python 包结构中
+  `PYTHONPATH=$PWD`
+- Python 扩展加载路径与上游对齐为 `vllm._C` / `vllm._moe_C`；不要重新引入 `marlin_v100` Python package
 - 不要重新引入对父级 vLLM 仓库路径、pytest 配置或 Python helper 的硬依赖
 - 不要把 `.venv/`、`build/`、`*.so`、`__pycache__/` 纳入版本管理
 - 修改上游可回写源码时，要同步检查 `upstream_map.yaml` 是否仍然准确
@@ -63,7 +63,7 @@ export MAX_JOBS=8
 export NVCC_THREADS=1
 export TORCH_CUDA_ARCH_LIST='7.5'
 export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_75,code=sm_75'
-PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
+PYTHONPATH=$PWD ./.venv/bin/python setup.py build_ext --inplace
 ```
 
 注意：Linux 下必须使用 `LD_LIBRARY_PATH`。不要把 `D_LIBRARY_PATH` 当成可生效的替代变量。
@@ -76,9 +76,10 @@ PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 
 构建后建议检查：
 
-- `python/marlin_v100/_C.abi3.so` 是否存在
-- `python/marlin_v100/_moe_C.abi3.so` 是否存在
-- `import marlin_v100`、`import marlin_v100._C`、`import marlin_v100._moe_C` 是否成功
+- `vllm/_C.abi3.so` 是否存在
+- `vllm/_moe_C.abi3.so` 是否存在
+- `import vllm._C`、`import vllm._moe_C` 是否成功
+- `torch.ops._C.marlin_gemm` 与 `torch.ops._moe_C.moe_wna16_marlin_gemm` 是否注册成功
 
 当前阶段的验收分层如下：
 
@@ -93,7 +94,6 @@ PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 
 默认可回写的是 Marlin 相关上游源码，默认不回写的是：
 
-- `python/marlin_v100/`
 - `tests/`
 - `.gitignore`
 - `README.md`

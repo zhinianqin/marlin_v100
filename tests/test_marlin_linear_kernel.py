@@ -12,9 +12,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from marlin_v100.calibration import source_target_capability, source_target_label
-from marlin_v100 import ops
-from marlin_v100 import quant_utils
+from tests.calibration import source_target_capability, source_target_label
+from tests import ops
+from tests import quant_utils
 from tests.helpers import (
     _quantize_fp8_weight,
     _quantize_mxfp4_weight,

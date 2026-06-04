@@ -17,12 +17,12 @@ import torch
 
 from benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
 from common import require_matching_cuda_benchmark_runtime, timestamp
-from marlin_v100 import ops
+from tests import ops
 
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_ROOT = ROOT / "benchmarks" / "results"
-EXTENSION_PATH = ROOT / "python" / "marlin_v100" / "_C.abi3.so"
+EXTENSION_PATH = ROOT / "vllm" / "_C.abi3.so"
 
 THREADBLOCK_CTA_M_CANDIDATES = (32, 64, 128, 256, 512)
 THREADBLOCK_CTA_N_CANDIDATES = (64, 128, 256, 512)
@@ -888,7 +888,7 @@ def main() -> None:
     env["PATH"] = f"{ROOT / '.venv' / 'bin'}:{Path(env['CUDA_HOME']) / 'bin'}:{env.get('PATH', '')}"
     env["LD_LIBRARY_PATH"] = f"{Path(env['CUDA_HOME']) / 'lib64'}:{env.get('LD_LIBRARY_PATH', '')}"
     env.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
-    env["PYTHONPATH"] = f"{ROOT / 'python'}:{env.get('PYTHONPATH', '')}"
+    env["PYTHONPATH"] = f"{ROOT}:{env.get('PYTHONPATH', '')}"
 
     build_text = run_build(args, out_dir, env)
     resource_text = run_cuobjdump(out_dir, env)

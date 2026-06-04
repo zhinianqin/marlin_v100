@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import statistics
-import sys
 import time
 from pathlib import Path
 from typing import Callable, Iterable
 
 import torch
 
-from marlin_v100.calibration import (
+from tests.calibration import (
     format_capability,
     runtime_capability,
     source_target_capability,
@@ -17,11 +16,6 @@ from marlin_v100.calibration import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-PYTHON_DIR = ROOT / "python"
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(PYTHON_DIR) not in sys.path:
-    sys.path.insert(0, str(PYTHON_DIR))
 
 
 def require_matching_cuda_benchmark_runtime() -> None:

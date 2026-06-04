@@ -20,9 +20,9 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS="${MAX_JOBS:-8}"
 export NVCC_THREADS="${NVCC_THREADS:-1}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.0}"
-export PYTHONPATH="$ROOT_DIR/python:$ROOT_DIR"
+export PYTHONPATH="$ROOT_DIR"
 
-if [[ ! -f "$ROOT_DIR/python/marlin_v100/_C.abi3.so" || ! -f "$ROOT_DIR/python/marlin_v100/_moe_C.abi3.so" ]]; then
+if [[ ! -f "$ROOT_DIR/vllm/_C.abi3.so" || ! -f "$ROOT_DIR/vllm/_moe_C.abi3.so" ]]; then
   echo "Extensions not found. Building first..."
   "$ROOT_DIR/build.sh"
 fi

@@ -4,15 +4,17 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from marlin_v100.calibration import (
+from tests.calibration import (
     source_target_capability,
     source_target_label,
     supported_moe_quant_type_names,
 )
-from marlin_v100 import moe, ops, routing
+from tests import ops
 from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
+    fused_marlin_moe,
+    grouped_topk,
     make_moe_model_like_inputs,
     marlin_moe_reference,
     marlin_quantize_experts_uint4_zp_with_metadata,
@@ -21,7 +23,9 @@ from tests.helpers import (
     marlin_quantize_experts_mxfp4_with_metadata,
     marlin_quantize_experts,
     marlin_quantize_experts_with_metadata,
+    moe_align_block_size,
     scalar_types,
+    topk_softmax,
 )
 
 _MOE_SUPPORTED_QUANT_NAMES = frozenset(
@@ -198,14 +202,14 @@ def test_topk_softmax_and_align_block_size_shapes():
     _require_moe_cuda()
 
     gating_output = torch.randn((8, 16), device="cuda", dtype=torch.float16)
-    topk_weights, topk_ids, token_expert_indices = routing.topk_softmax(
+    topk_weights, topk_ids, token_expert_indices = topk_softmax(
         gating_output, topk=2
     )
     assert topk_weights.shape == (8, 2)
     assert topk_ids.shape == (8, 2)
     assert token_expert_indices.shape == (8, 2)
 
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, block_size=16, num_experts=16
     )
     assert sorted_ids.dtype == torch.int32
@@ -227,7 +231,7 @@ def test_topk_softmax_matches_reference():
     )
     bias = torch.tensor([0.05, -0.10, 0.20, 0.15], device="cuda", dtype=torch.float32)
 
-    topk_weights, topk_ids, token_expert_indices = routing.topk_softmax(
+    topk_weights, topk_ids, token_expert_indices = topk_softmax(
         gating_output, topk=2, renormalize=True, bias=bias
     )
     ref_weights, ref_ids, ref_token_expert_indices = _topk_softmax_reference(
@@ -245,7 +249,7 @@ def test_moe_align_block_size_matches_reference():
     topk_ids = torch.tensor(
         [[0, 3], [1, 3], [0, 2], [1, 0]], device="cuda", dtype=torch.int32
     )
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, block_size=4, num_experts=4
     )
     ref_sorted_ids, ref_expert_ids, ref_num_tokens_post_pad = _moe_align_block_size_reference(
@@ -264,7 +268,7 @@ def test_grouped_topk_shapes():
 
     scores = torch.randn((8, 16), device="cuda", dtype=torch.float32)
     bias = torch.randn((16,), device="cuda", dtype=torch.float32)
-    topk_weights, topk_ids = routing.grouped_topk(
+    topk_weights, topk_ids = grouped_topk(
         scores=scores,
         num_expert_group=4,
         topk_group=2,
@@ -295,7 +299,7 @@ def test_grouped_topk_matches_reference():
         dtype=torch.float32,
     )
 
-    topk_weights, topk_ids = routing.grouped_topk(
+    topk_weights, topk_ids = grouped_topk(
         scores=scores,
         num_expert_group=4,
         topk_group=2,
@@ -336,7 +340,7 @@ def test_fused_marlin_moe_smoke(repack_impl: str):
     w2_scale = torch.ones((4, 1, 128), device="cuda", dtype=torch.float16)
 
     try:
-        output = moe.fused_marlin_moe(
+        output = fused_marlin_moe(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -502,7 +506,7 @@ def _run_fused_moe_accuracy_case(
         topk=topk,
     )
 
-    output = moe.fused_marlin_moe(
+    output = fused_marlin_moe(
         hidden_states=inputs["hidden_states"],
         w1=inputs["w1_q"],
         w2=inputs["w2_q"],
@@ -562,7 +566,7 @@ def _assert_moe_backend_rejects_act_order(
         tokens=tokens,
     )
     hidden_states = inputs["hidden_states"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         inputs["topk_ids"], block_size=moe_block_size, num_experts=inputs["experts"]
     )
 
@@ -624,7 +628,7 @@ def test_fused_marlin_moe_uint4b8_topk_weight_fusion_order_matches_reference(
     )
     inputs["topk_ids"] = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int32)
 
-    output = moe.fused_marlin_moe(
+    output = fused_marlin_moe(
         hidden_states=inputs["hidden_states"],
         w1=inputs["w1_q"],
         w2=inputs["w2_q"],
@@ -738,7 +742,7 @@ def test_fused_marlin_moe_uint4b8_rejects_unsupported_moe_block_size(
     )
 
     with pytest.raises(RuntimeError, match=_SUPPORTED_MOE_BLOCK_SIZE_ERROR):
-        moe.fused_marlin_moe(
+        fused_marlin_moe(
             hidden_states=inputs["hidden_states"],
             w1=inputs["w1_q"],
             w2=inputs["w2_q"],
@@ -803,7 +807,7 @@ def _run_stage1_kernel_case(
     tokens = inputs["tokens"]
     topk = inputs["topk"]
     intermediate = inputs["intermediate"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, block_size=moe_block_size, num_experts=experts
     )
 
@@ -890,7 +894,7 @@ def _run_forced_fused_kernel_case(
     hidden_states = inputs["hidden_states"]
     topk_weights = inputs["topk_weights"]
     topk_ids = inputs["topk_ids"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, block_size=moe_block_size, num_experts=experts
     )
 
@@ -1004,7 +1008,7 @@ def _assert_stage1_kernel_rejects_unsupported_config(
     hidden_states = inputs["hidden_states"]
     topk_weights = inputs["topk_weights"]
     topk_ids = inputs["topk_ids"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, block_size=moe_block_size, num_experts=experts
     )
 
@@ -1379,7 +1383,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         size_n = 160
         pack_factor = 8
         topk_ids = torch.zeros((tokens, topk), dtype=torch.int32, device="cuda")
-        sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+        sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
             topk_ids, block_size=16, num_experts=experts
         )
 
@@ -1441,7 +1445,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         w1_q, w1_scales, w1_zeros, _w1_dequant, w1_g_idx, w1_perm = (
             marlin_quantize_experts_uint4_zp_with_metadata(w1, -1)
         )
-        sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+        sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
             topk_ids, block_size=16, num_experts=experts
         )
         with pytest.raises(RuntimeError, match="requires K divisible by 32"):
@@ -1488,7 +1492,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
             intermediate=2048,
             topk=2,
         )
-        sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+        sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
             inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
         )
         with pytest.raises(RuntimeError, match="requires use_fp32_reduce=True"):
@@ -1830,7 +1834,7 @@ def test_moe_wna16_uint4_zp_rejects_non_uint4_quant_type():
         tokens=2,
     )
     hidden_states = inputs["hidden_states"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
     )
 
@@ -1888,7 +1892,7 @@ def test_moe_wna16_uint4_zp_rejects_packed_zero_points():
         tokens=2,
     )
     hidden_states = inputs["hidden_states"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
     )
 
@@ -1953,7 +1957,7 @@ def test_moe_wna16_uint4_zp_rejects_mismatched_zero_point_shape():
         tokens=2,
     )
     hidden_states = inputs["hidden_states"]
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
     )
     bad_zero_points = inputs["w1_zeros"][:, :, :-1].contiguous()

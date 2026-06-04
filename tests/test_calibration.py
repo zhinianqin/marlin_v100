@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from marlin_v100.calibration import (
+from tests.calibration import (
     act_order_runtime_group_size,
     architecture_support,
     supported_dense_group_sizes,

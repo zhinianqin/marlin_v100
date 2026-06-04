@@ -4,12 +4,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from marlin_v100.calibration import (
+from tests.calibration import (
     source_target_capability,
     source_target_label,
     supported_dense_quant_type_names,
 )
-from marlin_v100 import dense, ops
+from tests import ops
 from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
@@ -22,6 +22,7 @@ from tests.helpers import (
     marlin_quantize_uint4_zp,
     marlin_quantize_uint4_packed_zp,
     marlin_quantize_uint8_zp,
+    run_marlin_gemm,
     run_marlin_linear_kernel_case,
     scalar_types,
 )
@@ -492,7 +493,7 @@ def _run_nvfp4_dense_accuracy_case(
     weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
         marlin_quantize_nvfp4(w, 16)
     )
-    output = dense.run_marlin_gemm(
+    output = run_marlin_gemm(
         a,
         q_w,
         scales,
@@ -534,7 +535,7 @@ def _run_mxfp4_dense_accuracy_case(
     a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
     weight_ref, q_w, scales, g_idx, sort_indices, _ = marlin_quantize_mxfp4(w, 32)
-    output = dense.run_marlin_gemm(
+    output = run_marlin_gemm(
         a,
         q_w,
         scales,

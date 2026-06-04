@@ -9,7 +9,7 @@ from typing import Iterable, Mapping
 import torch
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 _CMAKE_LISTS = ROOT / "CMakeLists.txt"
 _CUDA_ARCH_RE = re.compile(r'set\(CUDA_ARCHS "(\d+)\.(\d+)"\)')
 

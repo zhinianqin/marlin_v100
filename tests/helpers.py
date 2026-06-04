@@ -6,8 +6,8 @@ import math
 import pytest
 import torch
 
-from marlin_v100.calibration import validate_dense_group_size
-from marlin_v100 import dense, ops, quant_utils
+from tests import ops, quant_utils
+from tests.calibration import validate_dense_group_size, validate_dense_marlin_call, validate_moe_marlin_call
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,295 @@ def marlin_make_c_tmp(
 
 def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int, device=device)
+
+
+def get_scale_perms() -> tuple[list[int], list[int]]:
+    scale_perm: list[int] = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single: list[int] = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return scale_perm, scale_perm_single
+
+
+def marlin_permute_scales(
+    scales: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    is_a_8bit: bool = False,
+) -> torch.Tensor:
+    del size_k, group_size, is_a_8bit
+    return scales.reshape((-1, size_n)).contiguous()
+
+
+def marlin_permute_bias(bias: torch.Tensor) -> torch.Tensor:
+    origin_shape = bias.shape
+    _, scale_perm_single = get_scale_perms()
+    bias = bias.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    return bias.reshape(*origin_shape).contiguous()
+
+
+def run_marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    c_tmp: torch.Tensor | None = None,
+    c: torch.Tensor | None = None,
+    b_bias: torch.Tensor | None = None,
+    a_scales: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
+    b_zeros: torch.Tensor | None = None,
+    g_idx: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    is_k_full: bool = True,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = True,
+    is_zp_float: bool | None = None,
+) -> torch.Tensor:
+    if is_zp_float is None:
+        is_zp_float = b_zeros is not None
+    validate_dense_marlin_call(
+        b_type_id=b_type_id,
+        size_k=size_k,
+        num_groups=int(b_scales.size(0)),
+        g_idx=g_idx,
+        perm=perm,
+        is_k_full=is_k_full,
+    )
+    return ops.marlin_gemm(
+        a,
+        c,
+        b_q_weight,
+        b_bias,
+        b_scales,
+        a_scales,
+        global_scale,
+        b_zeros,
+        g_idx,
+        perm,
+        c_tmp,
+        b_type_id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
+    max_num_m_blocks = max_num_tokens_padded // block_size + 1
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
+    ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map,
+    )
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def fused_marlin_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type_id: int,
+    moe_block_size: int = 16,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    c_tmp: torch.Tensor | None = None,
+    global_scale1: torch.Tensor | None = None,
+    global_scale2: torch.Tensor | None = None,
+    g_idx1: torch.Tensor | None = None,
+    g_idx2: torch.Tensor | None = None,
+    sort_indices1: torch.Tensor | None = None,
+    sort_indices2: torch.Tensor | None = None,
+    w1_zeros: torch.Tensor | None = None,
+    w2_zeros: torch.Tensor | None = None,
+    is_w1_zp_float: bool = False,
+    is_w2_zp_float: bool = False,
+    is_k_full: bool = True,
+) -> torch.Tensor:
+    m, k = hidden_states.shape
+    topk = topk_ids.shape[1]
+    validate_moe_marlin_call(
+        b_type_id=quant_type_id,
+        size_k=k,
+        num_groups=int(w1_scale.size(1)),
+        g_idx=g_idx1,
+        perm=sort_indices1,
+        is_k_full=is_k_full,
+    )
+    validate_moe_marlin_call(
+        b_type_id=quant_type_id,
+        size_k=int(w2.shape[1] * 16),
+        num_groups=int(w2_scale.size(1)),
+        g_idx=g_idx2,
+        perm=sort_indices2,
+        is_k_full=is_k_full,
+    )
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        topk_ids, moe_block_size, w1.shape[0]
+    )
+
+    gate_up_width = int(w1_scale.shape[-1])
+    if gate_up_width % 2 != 0:
+        raise ValueError(f"w1_scale output width must be even, got {gate_up_width}")
+    n = gate_up_width // 2
+    intermediate = torch.empty((m * topk, gate_up_width), dtype=hidden_states.dtype, device=hidden_states.device)
+    intermediate = ops.moe_wna16_marlin_gemm(
+        hidden_states,
+        intermediate,
+        w1,
+        bias1,
+        w1_scale,
+        None,
+        global_scale1,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        c_tmp,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        topk,
+        False,
+        quant_type_id,
+        m,
+        gate_up_width,
+        k,
+        is_k_full,
+        False,
+        True,
+        is_w1_zp_float,
+        -1,
+        -1,
+        -1,
+    )
+    gate, up = intermediate.view(m * topk, gate_up_width).chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate) * up
+    output = torch.empty((m * topk, k), dtype=hidden_states.dtype, device=hidden_states.device)
+    output = ops.moe_wna16_marlin_gemm(
+        activated,
+        output,
+        w2,
+        bias2,
+        w2_scale,
+        None,
+        global_scale2,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        c_tmp,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        1,
+        True,
+        quant_type_id,
+        m * topk,
+        k,
+        n,
+        is_k_full,
+        False,
+        True,
+        is_w2_zp_float,
+        -1,
+        -1,
+        -1,
+    )
+    return output.view(m, topk, k).sum(dim=1)
+
+
+def topk_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool = False,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = gating_output.shape[0]
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=gating_output.device)
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=gating_output.device)
+    token_expert_indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=gating_output.device)
+    ops.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        gating_output,
+        renormalize,
+        bias,
+    )
+    return topk_weights, topk_ids, token_expert_indices
+
+
+def topk_sigmoid(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool = False,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = gating_output.shape[0]
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=gating_output.device)
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=gating_output.device)
+    token_expert_indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=gating_output.device)
+    ops.topk_sigmoid(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        gating_output,
+        renormalize,
+        bias,
+    )
+    return topk_weights, topk_ids, token_expert_indices
+
+
+def grouped_topk(
+    scores: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    bias: torch.Tensor,
+    scoring_func: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return ops.grouped_topk(
+        scores,
+        num_expert_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        bias,
+        scoring_func,
+    )
 
 
 def _supported_quant_types() -> tuple[ScalarType, ...]:
@@ -651,7 +940,7 @@ def marlin_quantize(
         return marlin_quantize_fp8(weight, group_size, act_order)
 
     if quant_type not in _supported_quant_types():
-        raise ValueError("Local marlin_v100 helper currently supports uint4b8 and uint8b128 only.")
+        raise ValueError("Local test helper currently supports uint4b8 and uint8b128 only.")
     validate_dense_group_size(group_size)
 
     size_k, size_n = weight.shape
@@ -674,7 +963,7 @@ def marlin_quantize(
         weight_perm,
         is_a_8bit=False,
     )
-    marlin_scales = dense.marlin_permute_scales(
+    marlin_scales = marlin_permute_scales(
         scales,
         size_k,
         size_n,
@@ -697,7 +986,7 @@ def marlin_quantize_fp8(
     size_k, size_n = weight.shape
     fp8_weight, scales, _dequantized = _quantize_fp8_weight(weight, group_size)
     marlin_q_weight = fp8_weight_to_marlin_weight(fp8_weight)
-    marlin_scales = dense.marlin_permute_scales(
+    marlin_scales = marlin_permute_scales(
         _fp8_fused_exponent_bias_into_scales(scales).to(torch.float16),
         size_k,
         size_n,
@@ -734,7 +1023,7 @@ def marlin_quantize_nvfp4(
         group_size,
     )
     marlin_q_weight = fp4_e2m1_weight_to_marlin_weight(q_weight)
-    raw_marlin_scales = dense.marlin_permute_scales(
+    raw_marlin_scales = marlin_permute_scales(
         fp8_scales,
         size_k,
         size_n,
@@ -785,7 +1074,7 @@ def marlin_quantize_mxfp4(
     size_k, size_n = weight.shape
     q_weight, fp8_scales, dequantized = _quantize_mxfp4_weight(weight, group_size)
     marlin_q_weight = fp4_e2m1_weight_to_marlin_weight(q_weight)
-    marlin_scales = dense.marlin_permute_scales(
+    marlin_scales = marlin_permute_scales(
         fp8_scales,
         size_k,
         size_n,
@@ -813,7 +1102,7 @@ def marlin_dequantize(
             "preconverted FP4 weights."
         )
     if quant_type not in _supported_quant_types() and not _is_fp8_quant_type(quant_type):
-        raise ValueError("Local marlin_v100 helper currently supports uint4b8, uint8b128, and fp8 only.")
+        raise ValueError("Local test helper currently supports uint4b8, uint8b128, and fp8 only.")
     unpacked = marlin_unpack(q_weight, size_k, size_n, quant_type).to(torch.float32)
     unpermuted_scales = marlin_unpermute_scales(scales, size_k, size_n, group_size, quant_type)
     if group_size == -1:
@@ -907,7 +1196,7 @@ def marlin_quantize_uint4_packed_zp(
         weight_perm,
         is_a_8bit=False,
     )
-    marlin_scales = dense.marlin_permute_scales(
+    marlin_scales = marlin_permute_scales(
         scales,
         size_k,
         size_n,
@@ -946,7 +1235,7 @@ def marlin_quantize_uint4_zp(
         weight_perm,
         is_a_8bit=False,
     )
-    marlin_scales = dense.marlin_permute_scales(
+    marlin_scales = marlin_permute_scales(
         scales,
         size_k,
         size_n,
@@ -954,7 +1243,7 @@ def marlin_quantize_uint4_zp(
         is_a_8bit=False,
     )
     zp = (zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
-    marlin_zp = dense.marlin_permute_scales(
+    marlin_zp = marlin_permute_scales(
         zp,
         size_k,
         size_n,
@@ -988,7 +1277,7 @@ def marlin_quantize_uint8_zp(
         weight_perm,
         is_a_8bit=False,
     )
-    marlin_scales = dense.marlin_permute_scales(
+    marlin_scales = marlin_permute_scales(
         scales,
         size_k,
         size_n,
@@ -996,7 +1285,7 @@ def marlin_quantize_uint8_zp(
         is_a_8bit=False,
     )
     zp = (zero_points.to(torch.float32) * scales.to(torch.float32)).to(weight.dtype)
-    marlin_zp = dense.marlin_permute_scales(
+    marlin_zp = marlin_permute_scales(
         zp,
         size_k,
         size_n,
@@ -1356,7 +1645,7 @@ def marlin_unpack(
 ) -> torch.Tensor:
     if quant_type not in _supported_unpack_quant_types():
         raise ValueError(
-            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, uint8b128, and fp8 unpacking."
+            "Local test helper currently supports uint4, uint4b8, uint8, uint8b128, and fp8 unpacking."
         )
     return _marlin_unpack_impl(q_weight, size_k, size_n, quant_type)
 
@@ -1439,7 +1728,7 @@ def marlin_unpermute_scales(
 ) -> torch.Tensor:
     if quant_type not in _supported_unpack_quant_types():
         raise ValueError(
-            "Local marlin_v100 helper currently supports uint4, uint4b8, uint8, uint8b128, and fp8 scale unpermute."
+            "Local test helper currently supports uint4, uint4b8, uint8, uint8b128, and fp8 scale unpermute."
         )
     return _marlin_unpermute_scales_impl(scales, size_k, size_n, group_size)
 

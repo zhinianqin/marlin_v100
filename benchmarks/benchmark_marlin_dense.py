@@ -32,7 +32,7 @@ except ModuleNotFoundError:
         timestamp,
     )
 
-from marlin_v100.calibration import (
+from tests.calibration import (
     format_capability,
     runtime_capability,
     source_target_cuda_arch_arg,

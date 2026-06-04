@@ -13,7 +13,7 @@ from common import (
     time_cuda_callable,
     timestamp,
 )
-from marlin_v100 import ops
+from tests import ops
 
 
 CTA_M_CANDIDATES = (8, 16, 32, 48, 64)

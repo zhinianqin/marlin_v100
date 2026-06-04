@@ -12,7 +12,7 @@ set(PYTHON_SUPPORTED_VERSIONS "3.10" "3.11" "3.12" "3.13")
 if (VLLM_PYTHON_EXECUTABLE)
   find_python_from_executable(${VLLM_PYTHON_EXECUTABLE} "${PYTHON_SUPPORTED_VERSIONS}")
 else()
-  message(FATAL_ERROR "Please set VLLM_PYTHON_EXECUTABLE before configuring marlin_v100.")
+  message(FATAL_ERROR "Please set VLLM_PYTHON_EXECUTABLE before configuring local Marlin extensions.")
 endif()
 
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
@@ -130,7 +130,7 @@ list(APPEND MARLIN_V100_MOE_SRC "${MARLIN_MOE_OTHER_SRC}")
 
 define_extension_target(
   _C
-  DESTINATION marlin_v100
+  DESTINATION vllm
   LANGUAGE ${VLLM_GPU_LANG}
   SOURCES ${MARLIN_V100_DENSE_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}
@@ -141,7 +141,7 @@ define_extension_target(
 
 define_extension_target(
   _moe_C
-  DESTINATION marlin_v100
+  DESTINATION vllm
   LANGUAGE ${VLLM_GPU_LANG}
   SOURCES ${MARLIN_V100_MOE_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}

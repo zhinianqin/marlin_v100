@@ -4,8 +4,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from marlin_v100 import dense, moe, ops
-from marlin_v100.calibration import (
+from tests import ops
+from tests.calibration import (
     quant_type_name_from_id,
     source_target_capability,
     source_target_label,
@@ -14,6 +14,7 @@ from marlin_v100.calibration import (
 from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
+    fused_marlin_moe,
     fp4_e2m1_weight_to_marlin_weight,
     fp8_weight_to_marlin_weight,
     make_moe_model_like_inputs,
@@ -34,6 +35,7 @@ from tests.helpers import (
     marlin_quantize_uint4_zp,
     marlin_quantize_uint4_packed_zp,
     marlin_quantize_uint8_zp,
+    run_marlin_gemm,
     scalar_types,
 )
 
@@ -493,7 +495,7 @@ def test_dense_wrapper_rejects_incomplete_act_order_metadata_before_loading_exte
     g_idx = torch.arange(128, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="g_idx and perm must be provided together"):
-        dense.run_marlin_gemm(
+        run_marlin_gemm(
             a,
             b_q_weight,
             b_scales,
@@ -517,7 +519,7 @@ def test_dense_wrapper_rejects_act_order_metadata_before_loading_extension():
     c_tmp = torch.empty((0,), dtype=torch.float32)
 
     with pytest.raises(ValueError, match="act_order is not supported"):
-        dense.run_marlin_gemm(
+        run_marlin_gemm(
             a,
             q_weight,
             scales,
@@ -543,7 +545,7 @@ def test_moe_wrapper_rejects_incomplete_act_order_metadata_before_loading_extens
     g_idx = torch.arange(128, dtype=torch.int32).repeat(2, 1)
 
     with pytest.raises(ValueError, match="g_idx and perm must be provided together"):
-        moe.fused_marlin_moe(
+        fused_marlin_moe(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -574,7 +576,7 @@ def test_moe_wrapper_rejects_act_order_metadata_before_loading_extension():
     )
 
     with pytest.raises(ValueError, match="act_order is not supported"):
-        moe.fused_marlin_moe(
+        fused_marlin_moe(
             hidden_states=hidden_states,
             w1=w1_q,
             w2=w2_q,

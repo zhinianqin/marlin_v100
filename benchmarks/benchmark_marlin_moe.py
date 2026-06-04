@@ -25,14 +25,14 @@ except ModuleNotFoundError:
         time_cuda_callable,
         timestamp,
     )
-from marlin_v100.calibration import (
+from tests.calibration import (
     format_capability,
     runtime_capability,
     supported_moe_quant_type_names,
     source_target_cuda_arch_arg,
     source_target_label,
 )
-from marlin_v100 import ops
+from tests import ops
 from tests.helpers import (
     _quantize_uint4_with_zero_point,
     _quantize_uint8_with_zero_point,

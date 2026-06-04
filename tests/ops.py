@@ -11,14 +11,14 @@ _moe_loaded = False
 def _load_dense() -> None:
     global _dense_loaded
     if not _dense_loaded:
-        importlib.import_module("marlin_v100._C")
+        importlib.import_module("vllm._C")
         _dense_loaded = True
 
 
 def _load_moe() -> None:
     global _moe_loaded
     if not _moe_loaded:
-        importlib.import_module("marlin_v100._moe_C")
+        importlib.import_module("vllm._moe_C")
         _moe_loaded = True
 
 

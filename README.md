@@ -4,21 +4,26 @@
 
 `marlin_v100` 是从 `vllm-0.17.1` 主树中抽出的最小 Marlin 开发工作区，用于独立开发和验证 Marlin dense 与 Marlin MoE 两部分能力。
 
-这个目录的目标不是复制完整的 vLLM，而是保留 Marlin 相关 CUDA 源码、最小 Python 薄封装、最小测试集合，以及与主树同步所需的映射信息，方便在一个更小的工作区里迭代。
+这个目录的目标不是复制完整的 vLLM，而是保留 Marlin 相关 CUDA 源码、最小上游式 `vllm` Python package、最小测试集合，以及与主树同步所需的映射信息，方便在一个更小的工作区里迭代。
 
 当前项目按“仓库外可用”维护：将 `marlin_v100/` 单独 clone 到父级 vLLM 仓库之外后，仍应可以独立完成构建、扩展导入和测试收集。
 
-当前包名为 `marlin_v100`，构建产物为：
+当前扩展加载路径与上游对齐，构建产物为：
 
-- `marlin_v100._C`
-- `marlin_v100._moe_C`
+- `vllm._C` -> `vllm/_C.abi3.so`
+- `vllm._moe_C` -> `vllm/_moe_C.abi3.so`
+
+加载扩展后，底层 torch op namespace 仍为：
+
+- `torch.ops._C`
+- `torch.ops._moe_C`
 
 ## 目录说明
 
 - `csrc/`
   Marlin dense、Marlin MoE 以及最小 binding 所需的 CUDA/C++ 源码。
-- `python/marlin_v100/`
-  最小 Python 薄封装，负责加载扩展、封装 dense 与 MoE 调用。
+- `vllm/`
+  最小上游式 Python package 与扩展落位目录，负责通过 `vllm._C` / `vllm._moe_C` 加载本地扩展。
 - `tests/`
   生成器测试、dense 轻量测试、MoE 轻量测试。
 - `setup.py`
@@ -80,24 +85,27 @@ export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_75,code=sm_75'
 进入目录后，使用下面的命令构建：
 
 ```bash
-PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
+PYTHONPATH=$PWD ./.venv/bin/python setup.py build_ext --inplace
 ```
 
 构建成功后，产物会落在：
 
-- `python/marlin_v100/_C.abi3.so`
-- `python/marlin_v100/_moe_C.abi3.so`
+- `vllm/_C.abi3.so`
+- `vllm/_moe_C.abi3.so`
 
 可用下面的方式做最小导入检查：
 
 ```bash
-PYTHONPATH=$PWD/python ./.venv/bin/python - <<'PY'
-import marlin_v100
-import marlin_v100._C
-import marlin_v100._moe_C
-print(marlin_v100.__file__)
-print(marlin_v100._C.__file__)
-print(marlin_v100._moe_C.__file__)
+PYTHONPATH=$PWD ./.venv/bin/python - <<'PY'
+import torch
+import vllm._C
+import vllm._moe_C
+
+assert hasattr(torch.ops._C, "marlin_gemm")
+assert hasattr(torch.ops._moe_C, "moe_wna16_marlin_gemm")
+print(vllm._C.__file__)
+print(vllm._moe_C.__file__)
+print("imports ok")
 PY
 ```
 
@@ -107,10 +115,11 @@ PY
 
 建议的验收步骤是：
 
-- `PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace`
-- `import marlin_v100`
-- `import marlin_v100._C`
-- `import marlin_v100._moe_C`
+- `PYTHONPATH=$PWD ./.venv/bin/python setup.py build_ext --inplace`
+- `import vllm._C`
+- `import vllm._moe_C`
+- `hasattr(torch.ops._C, "marlin_gemm")`
+- `hasattr(torch.ops._moe_C, "moe_wna16_marlin_gemm")`
 
 ## 当前限制
 
@@ -133,7 +142,6 @@ PY
 
 - 本目录的文档文件
 - 本目录的测试文件
-- 本目录的 Python 薄封装
 - 本目录的本地构建辅助文件
 
 回写前建议先做一次 dry-run diff，确认仅覆盖映射内文件。
@@ -156,13 +164,13 @@ git commit -m "Initialize marlin_v100 workspace"
 
 - `.venv/`
 - `build/`
-- `python/marlin_v100/_C*.so`
-- `python/marlin_v100/_moe_C*.so`
+- `vllm/_C*.so`
+- `vllm/_moe_C*.so`
 
 建议纳入版本管理的内容包括：
 
 - `csrc/`
-- `python/marlin_v100/*.py`
+- `vllm/`
 - `tests/`
 - `setup.py`
 - `CMakeLists.txt`
