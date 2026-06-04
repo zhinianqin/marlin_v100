@@ -422,11 +422,12 @@ def test_marlin_quantize_experts_uint4_zp_round_trip_matches_original_weights(gr
 
     assert q_weights.shape[0] == weights.shape[0]
     assert scales.shape == (weights.shape[0], expected_groups, weights.shape[2])
-    assert zero_points.shape == (weights.shape[0], expected_groups, weights.shape[2] // 8)
+    assert zero_points.shape == (weights.shape[0], expected_groups, weights.shape[2])
     assert dequantized.shape == weights.shape
     assert g_idx.shape == (weights.shape[0], 0)
     assert perm.shape == (weights.shape[0], 0)
-    assert zero_points.dtype == torch.int32
+    assert zero_points.dtype == torch.float16
+    assert zero_points.is_contiguous()
     assert torch.isfinite(dequantized).all()
     torch.testing.assert_close(dequantized, weights, atol=4.0e-1, rtol=3.0e-1)
 

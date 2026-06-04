@@ -15,7 +15,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS="${MAX_JOBS:-8}"
 export NVCC_THREADS="${NVCC_THREADS:-1}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.0}"
-export PYTHONPATH="$ROOT_DIR/python"
+export PYTHONPATH="$ROOT_DIR/python:$ROOT_DIR"
 
 export CMAKE_ARGS="$(
   "$ROOT_DIR/.venv/bin/python" - <<'PY'

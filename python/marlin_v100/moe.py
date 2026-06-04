@@ -42,7 +42,6 @@ def fused_marlin_moe(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     c_tmp: torch.Tensor | None = None,
-    workspace: torch.Tensor | None = None,
     global_scale1: torch.Tensor | None = None,
     global_scale2: torch.Tensor | None = None,
     g_idx1: torch.Tensor | None = None,
@@ -51,6 +50,8 @@ def fused_marlin_moe(
     sort_indices2: torch.Tensor | None = None,
     w1_zeros: torch.Tensor | None = None,
     w2_zeros: torch.Tensor | None = None,
+    is_w1_zp_float: bool = False,
+    is_w2_zp_float: bool = False,
     is_k_full: bool = True,
 ) -> torch.Tensor:
     m, k = hidden_states.shape
@@ -74,8 +75,6 @@ def fused_marlin_moe(
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
     )
-    if c_tmp is None:
-        c_tmp = workspace
 
     # Local quantized expert helpers preserve the logical output width in the
     # scale tensors, which is the most reliable source for the dense width here.
@@ -107,7 +106,7 @@ def fused_marlin_moe(
         is_k_full,
         False,
         True,
-        w1_zeros is not None,
+        is_w1_zp_float,
         -1,
         -1,
         -1,
@@ -141,7 +140,7 @@ def fused_marlin_moe(
         is_k_full,
         False,
         True,
-        w2_zeros is not None,
+        is_w2_zp_float,
         -1,
         -1,
         -1,

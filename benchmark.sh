@@ -33,7 +33,7 @@ export MAX_JOBS="${MAX_JOBS:-8}"
 export NVCC_THREADS="${NVCC_THREADS:-1}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.0}"
 export CMAKE_ARGS="${CMAKE_ARGS:--DCMAKE_CUDA_FLAGS=-gencode arch=compute_70,code=sm_70}"
-export PYTHONPATH="$ROOT_DIR/python"
+export PYTHONPATH="$ROOT_DIR/python:$ROOT_DIR"
 
 read -r -a DENSE_EXTRA_ARGS <<<"${DENSE_ARGS:-}"
 read -r -a MOE_EXTRA_ARGS <<<"${MOE_ARGS:-}"
@@ -42,7 +42,7 @@ read -r -a PURE_GEMM_SWEEP_EXTRA_ARGS <<<"${PURE_GEMM_SWEEP_ARGS:-}"
 
 if [[ ! -f "$ROOT_DIR/python/marlin_v100/_C.abi3.so" || ! -f "$ROOT_DIR/python/marlin_v100/_moe_C.abi3.so" ]]; then
   echo "Extensions not found. Building first..."
-  "$ROOT_DIR/.venv/bin/python" setup.py build_ext --inplace
+  "$ROOT_DIR/build.sh"
 fi
 
 exec > >(tee "$LOG_FILE") 2>&1

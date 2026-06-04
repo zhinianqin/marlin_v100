@@ -69,11 +69,6 @@ _SM70_ROW_GROUPS = (
 )
 
 
-def marlin_make_workspace_new(device: torch.device, max_blocks_per_sm: int = 4) -> torch.Tensor:
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
-
-
 def marlin_make_c_tmp(
     device: torch.device,
     numel_or_shape: int | tuple[int, ...],
@@ -1019,6 +1014,239 @@ def marlin_quantize_uint8_zp(
     return weight, marlin_q_weight, marlin_scales, marlin_zp, dequantized
 
 
+@dataclass
+class MarlinLinearKernelCase:
+    quant_name: str
+    group_size: int
+    num_groups: int
+    kernel: object
+    layer: torch.nn.Module
+    activation: torch.Tensor
+    weight: torch.Tensor
+    q_weight: torch.Tensor
+    scales: torch.Tensor
+    zero_points: torch.Tensor
+    dequantized: torch.Tensor
+    reference: torch.Tensor | None = None
+    output: torch.Tensor | None = None
+
+
+def _marlin_linear_kernel_quant_config(quant_name: str):
+    from vllm.scalar_type import scalar_types as vllm_scalar_types
+
+    if quant_name == "uint4":
+        return (
+            scalar_types.uint4,
+            vllm_scalar_types.uint4,
+            _quantize_uint4_with_zero_point,
+            marlin_dequantize_uint4_zp,
+            True,
+        )
+    if quant_name == "uint8":
+        return (
+            scalar_types.uint8,
+            vllm_scalar_types.uint8,
+            _quantize_uint8_with_zero_point,
+            marlin_dequantize_uint8_zp,
+            True,
+        )
+    if quant_name == "uint4b8":
+        return (
+            scalar_types.uint4b8,
+            vllm_scalar_types.uint4b8,
+            lambda weight, group_size: (
+                *_quantize_unsigned_with_bias(weight, group_size, scalar_types.uint4b8.bias),
+                None,
+            ),
+            marlin_dequantize,
+            False,
+        )
+    if quant_name == "uint8b128":
+        return (
+            scalar_types.uint8b128,
+            vllm_scalar_types.uint8b128,
+            lambda weight, group_size: (
+                *_quantize_unsigned_with_bias(weight, group_size, scalar_types.uint8b128.bias),
+                None,
+            ),
+            marlin_dequantize,
+            False,
+        )
+    if quant_name == "fp8":
+        def quantize_fp8_for_kernel(
+            weight: torch.Tensor,
+            group_size: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, None]:
+            fp8_weight, scales, _dequantized = _quantize_fp8_weight(
+                weight,
+                group_size,
+            )
+            raw_q_weight = fp8_weight.contiguous().view(torch.uint8).to(torch.int32)
+            fused_scales = _fp8_fused_exponent_bias_into_scales(scales).to(
+                weight.dtype
+            )
+            return raw_q_weight, fused_scales, None
+
+        return (
+            scalar_types.float8_e4m3fn,
+            vllm_scalar_types.float8_e4m3fn,
+            quantize_fp8_for_kernel,
+            marlin_dequantize,
+            False,
+        )
+    raise ValueError(f"Unsupported MarlinLinearKernel quant_name={quant_name!r}")
+
+
+def prepare_marlin_linear_kernel_case(
+    *,
+    quant_name: str,
+    group_size: int,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> MarlinLinearKernelCase:
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+        MarlinLinearKernel,
+    )
+    from vllm.model_executor.parameter import (
+        GroupQuantScaleParameter,
+        PackedvLLMParameter,
+    )
+
+    validate_dense_group_size(group_size)
+    if activation.dtype != torch.float16:
+        raise ValueError(f"Expected fp16 activation, got {activation.dtype}")
+    if weight.dtype != torch.float16:
+        raise ValueError(f"Expected fp16 weight, got {weight.dtype}")
+
+    size_k, size_n = weight.shape
+    if activation.shape[-1] != size_k:
+        raise ValueError(
+            f"activation.shape[-1]={activation.shape[-1]} does not match size_k={size_k}"
+        )
+
+    local_quant_type, vllm_quant_type, quantize, dequantize, has_zp = (
+        _marlin_linear_kernel_quant_config(quant_name)
+    )
+    quantized = quantize(weight, group_size)
+    q_weight = quantized[0]
+    scales = quantized[1]
+    zero_points = quantized[2]
+    num_bits = local_quant_type.size_bits
+    num_groups = scales.shape[0]
+    packed_weight = gptq_pack(q_weight, num_bits, size_k, size_n)
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "qweight",
+        PackedvLLMParameter(
+            packed_weight.contiguous(),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+        ),
+    )
+    layer.register_parameter(
+        "scales",
+        GroupQuantScaleParameter(
+            scales.contiguous(),
+            input_dim=0,
+            output_dim=1,
+        ),
+    )
+    if has_zp:
+        assert zero_points is not None
+        packed_zero_points = pack_cols(
+            zero_points,
+            num_bits,
+            num_groups,
+            size_n,
+        ).t().contiguous()
+        layer.register_parameter(
+            "qzeros",
+            PackedvLLMParameter(
+                packed_zero_points,
+                input_dim=1,
+                output_dim=0,
+                packed_dim=0,
+            ),
+        )
+
+    config = MPLinearLayerConfig(
+        full_weight_shape=(size_k, size_n),
+        partition_weight_shape=(size_k, size_n),
+        weight_type=vllm_quant_type,
+        act_type=torch.float16,
+        group_size=group_size,
+        zero_points=has_zp,
+        has_g_idx=False,
+    )
+    kernel = MarlinLinearKernel(
+        config,
+        "qweight",
+        "scales",
+        "qzeros" if has_zp else None,
+    )
+    kernel.process_weights_after_loading(layer)
+
+    if has_zp:
+        dequantized = dequantize(
+            layer.qweight,
+            layer.scales,
+            layer.qzeros,
+            size_k,
+            size_n,
+            group_size,
+        )
+    else:
+        dequantized = dequantize(
+            layer.qweight,
+            layer.scales,
+            size_k,
+            size_n,
+            group_size,
+            local_quant_type,
+        )
+    return MarlinLinearKernelCase(
+        quant_name=quant_name,
+        group_size=group_size,
+        num_groups=num_groups,
+        kernel=kernel,
+        layer=layer,
+        activation=activation,
+        weight=weight,
+        q_weight=q_weight,
+        scales=scales,
+        zero_points=zero_points
+        if zero_points is not None
+        else torch.empty(0, dtype=torch.int32, device=weight.device),
+        dequantized=dequantized,
+    )
+
+
+def run_marlin_linear_kernel_case(
+    *,
+    quant_name: str,
+    group_size: int,
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+) -> MarlinLinearKernelCase:
+    case = prepare_marlin_linear_kernel_case(
+        quant_name=quant_name,
+        group_size=group_size,
+        activation=activation,
+        weight=weight,
+    )
+    case.output = case.kernel.apply_weights(case.layer, activation)
+    case.reference = torch.matmul(
+        activation.to(torch.float32),
+        case.dequantized.to(torch.float32),
+    ).to(torch.float16)
+    return case
+
+
 def marlin_dequantize_uint4_packed_zp(
     q_weight: torch.Tensor,
     scales: torch.Tensor,
@@ -1444,15 +1672,25 @@ def make_moe_model_like_inputs(
     topk: int,
     device: torch.device | str,
     dtype: torch.dtype = torch.float16,
+    routing_profile: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hidden_states = torch.randn((tokens, hidden), device=device, dtype=dtype)
-    topk_weights = torch.rand((tokens, topk), device=device, dtype=torch.float32)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if routing_profile is None:
+        topk_weights = torch.rand((tokens, topk), device=device, dtype=torch.float32)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    topk_ids = torch.empty((tokens, topk), device=device, dtype=torch.int32)
-    for token_idx in range(tokens):
-        for route_idx in range(topk):
-            topk_ids[token_idx, route_idx] = (token_idx + route_idx) % experts
+        topk_ids = torch.empty((tokens, topk), device=device, dtype=torch.int32)
+        for token_idx in range(tokens):
+            for route_idx in range(topk):
+                topk_ids[token_idx, route_idx] = (token_idx + route_idx) % experts
+    else:
+        topk_weights, topk_ids = make_moe_routing_tensors(
+            tokens=tokens,
+            experts=experts,
+            topk=topk,
+            device=device,
+            routing_profile=routing_profile,
+        )
 
     # Use fan-in-scaled weights so the local MoE benchmark checks resemble the
     # activation ranges seen in real models instead of overflowing fp16 paths
@@ -1462,6 +1700,47 @@ def make_moe_model_like_inputs(
     w2 = torch.randn((experts, intermediate, hidden), device=device, dtype=dtype)
     w2 = w2 * (1.0 / math.sqrt(intermediate))
     return hidden_states, topk_weights, topk_ids, w1, w2
+
+
+def make_moe_routing_tensors(
+    *,
+    tokens: int,
+    experts: int,
+    topk: int,
+    device: torch.device | str,
+    routing_profile: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    topk_weights = torch.full(
+        (tokens, topk),
+        1.0 / float(topk),
+        device=device,
+        dtype=torch.float32,
+    )
+    topk_ids = torch.empty((tokens, topk), device=device, dtype=torch.int32)
+    if routing_profile == "uniform":
+        for token_idx in range(tokens):
+            for route_idx in range(topk):
+                topk_ids[token_idx, route_idx] = (token_idx + route_idx) % experts
+        return topk_weights, topk_ids
+
+    if routing_profile != "zipfian":
+        raise ValueError(f"Unsupported routing_profile={routing_profile!r}")
+
+    if experts <= 1:
+        topk_ids.zero_()
+        return topk_weights, topk_ids
+
+    hot_tokens = (tokens * 3 + 4) // 5
+    cold_experts = experts - 1
+    for token_idx in range(tokens):
+        for route_idx in range(topk):
+            if route_idx == 0 and token_idx < hot_tokens:
+                expert = 0
+            else:
+                offset = token_idx + route_idx
+                expert = 1 + (offset % cold_experts)
+            topk_ids[token_idx, route_idx] = expert
+    return topk_weights, topk_ids
 
 
 def marlin_moe_reference(

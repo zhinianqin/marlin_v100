@@ -15,10 +15,9 @@ from marlin_v100.calibration import (
 _QUANT_CANDIDATES = ("uint4", "uint4b8", "uint8", "uint8b128", "fp8", "nvfp4", "mxfp4")
 
 
-def test_sm70_support_matrix_supports_fp8_nvfp4_and_mxfp4_dense_weight_only():
+def test_sm70_support_matrix_supports_all_current_dense_and_moe_quant_types():
     target = (7, 0)
-
-    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == (
+    expected_quant_types = (
         "uint4",
         "uint4b8",
         "uint8",
@@ -27,10 +26,9 @@ def test_sm70_support_matrix_supports_fp8_nvfp4_and_mxfp4_dense_weight_only():
         "nvfp4",
         "mxfp4",
     )
-    assert supported_moe_quant_type_names(_QUANT_CANDIDATES, target) == (
-        "uint4",
-        "uint4b8",
-    )
+
+    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == expected_quant_types
+    assert supported_moe_quant_type_names(_QUANT_CANDIDATES, target) == expected_quant_types
     assert supported_act_order_quant_type_names(_QUANT_CANDIDATES, target) == ()
     assert supported_dense_group_sizes((-1, 0, 32, 64, 128), target) == (-1, 32, 64, 128)
     with pytest.raises(ValueError, match="act_order is not supported"):
@@ -44,18 +42,16 @@ def test_sm70_support_matrix_supports_fp8_nvfp4_and_mxfp4_dense_weight_only():
 
 def test_unknown_capability_falls_back_to_sm70_style_quant_candidates():
     target = (8, 0)
-
-    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == (
+    expected_quant_types = (
         "uint4",
         "uint4b8",
         "uint8",
         "uint8b128",
         "fp8",
     )
-    assert supported_moe_quant_type_names(_QUANT_CANDIDATES, target) == (
-        "uint4",
-        "uint4b8",
-    )
+
+    assert supported_dense_quant_type_names(_QUANT_CANDIDATES, target) == expected_quant_types
+    assert supported_moe_quant_type_names(_QUANT_CANDIDATES, target) == expected_quant_types
     assert supported_act_order_quant_type_names(_QUANT_CANDIDATES, target) == ()
     assert supported_dense_group_sizes((-1, 0, 32, 64, 128), target) == (-1, 32, 64, 128)
     with pytest.raises(ValueError, match="act_order is not supported"):

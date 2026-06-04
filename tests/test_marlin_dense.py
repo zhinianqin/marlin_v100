@@ -22,6 +22,7 @@ from tests.helpers import (
     marlin_quantize_uint4_zp,
     marlin_quantize_uint4_packed_zp,
     marlin_quantize_uint8_zp,
+    run_marlin_linear_kernel_case,
     scalar_types,
 )
 
@@ -642,6 +643,59 @@ def _run_dense_uint4_zp_accuracy_case(
     use_fp32_reduce: bool = True,
     c_tmp: torch.Tensor | None = None,
 ) -> None:
+    if not use_fp32_reduce or c_tmp is not None:
+        _run_dense_uint4_zp_raw_accuracy_case(
+            repack_impl=repack_impl,
+            group_size=group_size,
+            rtol=rtol,
+            atol=atol,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            use_fp32_reduce=use_fp32_reduce,
+            c_tmp=c_tmp,
+        )
+        return
+
+    _require_marlin_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint4,
+        act_order=False,
+        group_size=64 if group_size == -1 else group_size,
+    )
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    case = run_marlin_linear_kernel_case(
+        quant_name="uint4",
+        group_size=group_size,
+        activation=a,
+        weight=w,
+    )
+
+    assert case.output is not None
+    assert case.reference is not None
+    assert torch.isfinite(case.output).all()
+    assert not torch.all(case.output == 0)
+    assert case.output.float().std().item() > 0
+    torch.testing.assert_close(case.output, case.reference, rtol=rtol, atol=atol)
+
+
+def _run_dense_uint4_zp_raw_accuracy_case(
+    *,
+    repack_impl: str,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+    use_fp32_reduce: bool = True,
+    c_tmp: torch.Tensor | None = None,
+) -> None:
     _require_marlin_cuda()
     assert_repack_layout_matches_reference(
         repack_impl,
@@ -689,6 +743,57 @@ def _run_dense_uint4_zp_accuracy_case(
 
 
 def _run_dense_uint8_zp_accuracy_case(
+    *,
+    repack_impl: str,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    size_m: int = 16,
+    size_k: int = 256,
+    size_n: int = 256,
+    c_tmp: torch.Tensor | None = None,
+) -> None:
+    if c_tmp is not None:
+        _run_dense_uint8_zp_raw_accuracy_case(
+            repack_impl=repack_impl,
+            group_size=group_size,
+            rtol=rtol,
+            atol=atol,
+            size_m=size_m,
+            size_k=size_k,
+            size_n=size_n,
+            c_tmp=c_tmp,
+        )
+        return
+
+    _require_marlin_cuda()
+    assert_repack_layout_matches_reference(
+        repack_impl,
+        quant_type=scalar_types.uint8,
+        act_order=False,
+        group_size=64 if group_size == -1 else group_size,
+    )
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    case = run_marlin_linear_kernel_case(
+        quant_name="uint8",
+        group_size=group_size,
+        activation=a,
+        weight=w,
+    )
+
+    assert case.output is not None
+    assert case.reference is not None
+    assert torch.isfinite(case.output).all()
+    assert not torch.all(case.output == 0)
+    assert case.output.float().std().item() > 0
+    torch.testing.assert_close(case.output, case.reference, rtol=rtol, atol=atol)
+
+
+def _run_dense_uint8_zp_raw_accuracy_case(
     *,
     repack_impl: str,
     group_size: int,

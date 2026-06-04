@@ -1,548 +1,844 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+import csv
+import os
+from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import torch
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 
 try:
-    from benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
     from common import (
         banner,
         check_cuda_ready,
         format_float,
-        print_table,
         time_cuda_callable,
         timestamp,
     )
 except ModuleNotFoundError:
-    from benchmarks.benchmark_shapes import DENSE_PRESETS, DENSE_WEIGHT_SHAPES
     from benchmarks.common import (
         banner,
         check_cuda_ready,
         format_float,
-        print_table,
         time_cuda_callable,
         timestamp,
     )
+
 from marlin_v100.calibration import (
-    architecture_support,
     format_capability,
     runtime_capability,
-    supported_dense_group_sizes,
-    supported_dense_quant_type_names,
     source_target_cuda_arch_arg,
     source_target_label,
 )
-from marlin_v100 import dense, ops
 from tests.helpers import (
-    marlin_quantize,
-    marlin_quantize_mxfp4,
-    marlin_quantize_nvfp4,
-    marlin_quantize_uint4_zp,
-    marlin_quantize_uint8_zp,
-    scalar_types,
+    _quantize_unsigned_with_bias,
+    _quantize_uint4_with_zero_point,
+    _quantize_uint8_with_zero_point,
+    awq_pack,
+    gptq_pack,
+    pack_cols,
+    prepare_marlin_linear_kernel_case,
 )
+from tests.writeback_marlin_cases import (
+    DENSE_ALL_QUANT_NAMES,
+    DENSE_BENCHMARK_SHAPE_CASES,
+    DENSE_CTA_CASES,
+    DENSE_CTA_ENV_BY_QUANT,
+    DENSE_IRREGULAR_SHAPE_CASES,
+    DENSE_REGULAR_SHAPE_CASES,
+    DENSE_SPLIT_K_ENV_BY_QUANT,
+    DENSE_WRITEBACK_CLASS_CASES,
+    DenseShapeCase,
+    DenseWritebackMatrixCase,
+    WRITEBACK_GROUP_SIZE_VALUES,
+    WRITEBACK_SPLIT_K_VALUES,
+    iter_dense_writeback_matrix,
+)
+from vllm.scalar_type import scalar_types
 
-_DENSE_QUANT_TYPE_CANDIDATES = {
-    "uint4": scalar_types.uint4,
-    "uint4b8": scalar_types.uint4b8,
-    "uint8": scalar_types.uint8,
-    "uint8b128": scalar_types.uint8b128,
-    "fp8": scalar_types.float8_e4m3fn,
-    "nvfp4": scalar_types.float4_e2m1f,
-    "mxfp4": scalar_types.float4_e2m1f,
+
+_DENSE_CLASS_CHOICES = tuple(case.name for case in DENSE_WRITEBACK_CLASS_CASES)
+_DENSE_CTA_CHOICES = tuple(case.name for case in DENSE_CTA_CASES)
+_SHAPE_SUITE_CASES = {
+    "regular": DENSE_REGULAR_SHAPE_CASES,
+    "irregular": DENSE_IRREGULAR_SHAPE_CASES,
+    "all": DENSE_BENCHMARK_SHAPE_CASES,
 }
-QUANT_TYPES = {
-    name: _DENSE_QUANT_TYPE_CANDIDATES[name]
-    for name in supported_dense_quant_type_names(_DENSE_QUANT_TYPE_CANDIDATES)
-}
-GROUP_SIZE_CANDIDATES = (-1, 32, 64, 128)
-RUNTIME_GROUP_SIZES = supported_dense_group_sizes(GROUP_SIZE_CANDIDATES)
-GROUP_SIZES = tuple(dict.fromkeys((*RUNTIME_GROUP_SIZES, 16)))
-LAUNCH_DOMINATED_FLOPS = 1_000_000_000
+_DENSE_CSV_FIELDNAMES = [
+    "dense_class",
+    "quant",
+    "group_size",
+    "shape_id",
+    "M",
+    "K",
+    "N",
+    "split_k",
+    "cta",
+    "status",
+    "marlin_us",
+    "flops",
+    "marlin_tflops",
+    "all_finite",
+    "reason",
+]
 
 
-def parse_bool_arg(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value!r}")
+@contextmanager
+def _matrix_env(case: DenseWritebackMatrixCase):
+    changes: list[tuple[str, str | None]] = []
+    for env_name, value in (
+        (DENSE_SPLIT_K_ENV_BY_QUANT.get(case.quant_name), None if case.split_k == "unset" else case.split_k),
+        (DENSE_CTA_ENV_BY_QUANT.get(case.quant_name), case.cta.value),
+    ):
+        if env_name is None:
+            continue
+        changes.append((env_name, os.environ.get(env_name)))
+        if value is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = value
+    try:
+        yield
+    finally:
+        for env_name, old_value in reversed(changes):
+            if old_value is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = old_value
 
 
-def parse_act_order_values(mode: str) -> list[bool]:
-    if mode == "off":
-        return [False]
-    if mode == "on":
-        return [True]
-    if mode == "all":
-        return [False, True]
-    raise ValueError(f"Unsupported act_order mode: {mode!r}")
+def _dense_flops(shape: DenseShapeCase) -> int:
+    return 2 * shape.size_m * shape.size_k * shape.size_n
 
 
-def parse_is_k_full_values(mode: str) -> list[bool]:
-    if mode == "true":
-        return [True]
-    if mode == "false":
-        return [False]
-    if mode == "all":
-        return [True, False]
-    raise ValueError(f"Unsupported is_k_full mode: {mode!r}")
+def _format_tflops(flops: int, latency_us: float) -> str:
+    return f"{flops / (latency_us * 1_000_000):.6f}"
 
 
-def dense_flops(size_m: int, size_k: int, size_n: int) -> int:
-    return 2 * size_m * size_k * size_n
+def _set_parameter_data(layer: torch.nn.Module, name: str, value: torch.Tensor) -> None:
+    param = getattr(layer, name)
+    if tuple(param.shape) != tuple(value.shape):
+        raise ValueError(
+            f"{name} expected shape {tuple(param.shape)}, got {tuple(value.shape)}"
+        )
+    param.data.copy_(value.to(device=param.device, dtype=param.dtype))
 
 
-def format_flops(value: int) -> str:
-    for unit, scale in (("T", 10**12), ("G", 10**9), ("M", 10**6), ("K", 10**3)):
-        if value >= scale:
-            return f"{value / scale:.2f}{unit}"
-    return str(value)
-
-
-def tflops_from_us(flops: int, latency_us: float) -> float:
-    if latency_us <= 0.0:
-        return 0.0
-    return flops / (latency_us * 1_000_000.0)
-
-
-def is_launch_dominated(flops: int) -> bool:
-    return flops < LAUNCH_DOMINATED_FLOPS
-
-
-def _is_supported_dense_benchmark_case(
+def _make_compressed_tensors_wna16_layer_case(
+    *,
     quant_name: str,
     group_size: int,
-    act_order: bool,
-    is_k_full: bool,
     size_k: int,
     size_n: int,
-) -> bool:
-    if group_size != -1 and size_k % group_size != 0:
-        return False
-    if quant_name != "nvfp4" and group_size == 16:
-        return False
-    if act_order and is_k_full and group_size == -1:
-        return False
-    if quant_name == "fp8":
-        return (
-            group_size in (-1, 128)
-            and not act_order
-            and is_k_full
-            and size_k % 32 == 0
-            and size_n % 64 == 0
+) -> tuple[torch.nn.Module, Any]:
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa: E501
+        CompressedTensorsWNA16,
+    )
+
+    symmetric = quant_name in {"uint4b8", "uint8b128"}
+    if quant_name == "uint4":
+        num_bits = 4
+        quantize = _quantize_uint4_with_zero_point
+    elif quant_name == "uint8":
+        num_bits = 8
+        quantize = _quantize_uint8_with_zero_point
+    elif quant_name == "uint4b8":
+        num_bits = 4
+
+        def quantize(weight: torch.Tensor, gs: int):
+            q_weight, scales = _quantize_unsigned_with_bias(
+                weight, gs, scalar_types.uint4b8.bias
+            )
+            return q_weight, scales, None
+
+    elif quant_name == "uint8b128":
+        num_bits = 8
+
+        def quantize(weight: torch.Tensor, gs: int):
+            q_weight, scales = _quantize_unsigned_with_bias(
+                weight, gs, scalar_types.uint8b128.bias
+            )
+            return q_weight, scales, None
+
+    else:
+        raise ValueError(f"Unsupported quant_name={quant_name!r}")
+
+    scheme = CompressedTensorsWNA16(
+        strategy="channel" if group_size == -1 else "group",
+        num_bits=num_bits,
+        group_size=None if group_size == -1 else group_size,
+        symmetric=symmetric,
+    )
+    layer = torch.nn.Module()
+    scheme.create_weights(
+        layer=layer,
+        output_size=size_n,
+        input_size=size_k,
+        output_partition_sizes=[size_n],
+        input_size_per_partition=size_k,
+        params_dtype=torch.float16,
+        weight_loader=lambda param, loaded_weight: None,
+    )
+    weight = torch.zeros(size_k, size_n, dtype=torch.float16, device="cuda")
+    q_weight, scales, zero_points = quantize(weight, group_size)
+    packed_weight = gptq_pack(q_weight, num_bits, size_k, size_n)
+    _set_parameter_data(layer, "weight_packed", packed_weight.t().contiguous())
+    _set_parameter_data(layer, "weight_scale", scales.t().contiguous())
+    _set_parameter_data(
+        layer, "weight_shape", torch.tensor([size_k, size_n], dtype=torch.int64)
+    )
+    if zero_points is not None:
+        packed_zero_points = pack_cols(
+            zero_points, num_bits, scales.shape[0], size_n
         )
-    if quant_name == "nvfp4":
-        return (
-            group_size == 16
-            and not act_order
-            and is_k_full
-            and size_k % 32 == 0
-            and size_n % 64 == 0
+        _set_parameter_data(
+            layer, "weight_zero_point", packed_zero_points.t().contiguous()
         )
-    if quant_name == "mxfp4":
-        return (
-            group_size == 32
-            and not act_order
-            and is_k_full
-            and size_k % 32 == 0
-            and size_n % 64 == 0
+    layer.to("cuda")
+    scheme.process_weights_after_loading(layer)
+    return layer, scheme
+
+
+def _make_gptq_marlin_linear_method_case(
+    *,
+    quant_name: str,
+    group_size: int,
+    size_k: int,
+    size_n: int,
+) -> tuple[torch.nn.Module, Any]:
+    from vllm.model_executor.layers.quantization.gptq_marlin import (
+        GPTQMarlinConfig,
+        GPTQMarlinLinearMethod,
+    )
+
+    if quant_name == "uint4b8":
+        num_bits = 4
+        bias = scalar_types.uint4b8.bias
+    elif quant_name == "uint8b128":
+        num_bits = 8
+        bias = scalar_types.uint8b128.bias
+    else:
+        raise ValueError(f"Unsupported GPTQ dense quant_name={quant_name!r}")
+
+    method = GPTQMarlinLinearMethod(
+        GPTQMarlinConfig(
+            weight_bits=num_bits,
+            group_size=group_size,
+            desc_act=False,
+            is_sym=True,
+            lm_head_quantized=False,
+            dynamic={},
+            full_config={},
         )
-    return True
+    )
+    layer = torch.nn.Module()
+    method.create_weights(
+        layer=layer,
+        input_size_per_partition=size_k,
+        output_partition_sizes=[size_n],
+        input_size=size_k,
+        output_size=size_n,
+        params_dtype=torch.float16,
+        weight_loader=lambda param, loaded_weight: None,
+    )
+    weight = torch.zeros(size_k, size_n, dtype=torch.float16, device="cuda")
+    q_weight, scales = _quantize_unsigned_with_bias(weight, group_size, bias)
+    _set_parameter_data(layer, "qweight", gptq_pack(q_weight, num_bits, size_k, size_n))
+    _set_parameter_data(layer, "scales", scales)
+    layer.to("cuda")
+    method.process_weights_after_loading(layer)
+    return layer, method
+
+
+def _make_awq_marlin_linear_method_case(
+    *,
+    quant_name: str,
+    group_size: int,
+    size_k: int,
+    size_n: int,
+) -> tuple[torch.nn.Module, Any]:
+    from vllm.model_executor.layers.quantization.awq_marlin import (
+        AWQMarlinConfig,
+        AWQMarlinLinearMethod,
+    )
+
+    if quant_name == "uint4":
+        num_bits = 4
+        quantize = _quantize_uint4_with_zero_point
+    elif quant_name == "uint8":
+        num_bits = 8
+        quantize = _quantize_uint8_with_zero_point
+    else:
+        raise ValueError(f"Unsupported AWQ dense quant_name={quant_name!r}")
+
+    method = AWQMarlinLinearMethod(
+        AWQMarlinConfig(
+            weight_bits=num_bits,
+            group_size=group_size,
+            zero_point=True,
+            lm_head_quantized=False,
+            modules_to_not_convert=None,
+            full_config={},
+        )
+    )
+    layer = torch.nn.Module()
+    method.create_weights(
+        layer=layer,
+        input_size_per_partition=size_k,
+        output_partition_sizes=[size_n],
+        input_size=size_k,
+        output_size=size_n,
+        params_dtype=torch.float16,
+        weight_loader=lambda param, loaded_weight: None,
+    )
+    weight = torch.zeros(size_k, size_n, dtype=torch.float16, device="cuda")
+    q_weight, scales, zero_points = quantize(weight, group_size)
+    num_groups = zero_points.shape[0]
+    _set_parameter_data(layer, "qweight", awq_pack(q_weight, num_bits, size_k, size_n))
+    _set_parameter_data(layer, "scales", scales)
+    _set_parameter_data(
+        layer, "qzeros", awq_pack(zero_points, num_bits, num_groups, size_n)
+    )
+    layer.to("cuda")
+    method.process_weights_after_loading(layer)
+    return layer, method
+
+
+def _make_fp8_layer(*, size_k: int, size_n: int) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = size_k
+    layer.output_size_per_partition = size_n
+    layer.logical_widths = [size_n]
+    layer.orig_dtype = torch.float16
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.zeros(size_n, size_k, dtype=torch.float8_e4m3fn, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(torch.ones(size_n, dtype=torch.float32, device="cuda"), requires_grad=False),
+    )
+    return layer
+
+
+def _make_fp8_block_layer(*, size_k: int, size_n: int) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = size_k
+    layer.output_size_per_partition = size_n
+    layer.logical_widths = [size_n]
+    layer.orig_dtype = torch.float16
+    layer.weight_block_size = [64, 128]
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.zeros(size_n, size_k, dtype=torch.float8_e4m3fn, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale_inv",
+        torch.nn.Parameter(
+            torch.ones((size_n + 63) // 64, size_k // 128, dtype=torch.float32, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    return layer
+
+
+def _make_compressed_tensors_fp8_layer_case(
+    *,
+    group_size: int,
+    size_k: int,
+    size_n: int,
+) -> tuple[torch.nn.Module, Any]:
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
+        CompressedTensorsW8A16Fp8,
+    )
+
+    if group_size == -1:
+        weight_quant = QuantizationArgs(
+            num_bits=8,
+            type=QuantizationType.FLOAT,
+            symmetric=True,
+            strategy=QuantizationStrategy.CHANNEL,
+        )
+    elif group_size == 128:
+        weight_quant = QuantizationArgs(
+            num_bits=8,
+            type=QuantizationType.FLOAT,
+            symmetric=True,
+            strategy=QuantizationStrategy.BLOCK,
+            block_structure=[64, 128],
+            dynamic=False,
+        )
+    else:
+        raise ValueError(f"Unsupported FP8 group_size={group_size}")
+    scheme = CompressedTensorsW8A16Fp8(weight_quant, is_static_input_scheme=False)
+    layer = torch.nn.Module()
+    scheme.create_weights(
+        layer=layer,
+        input_size_per_partition=size_k,
+        output_partition_sizes=[size_n],
+        input_size=size_k,
+        output_size=size_n,
+        params_dtype=torch.float16,
+        weight_loader=lambda param, loaded_weight: None,
+    )
+    layer.to("cuda")
+    layer.weight.data.zero_()
+    layer.weight_scale.data.fill_(1.0)
+    scheme.process_weights_after_loading(layer)
+    return layer, scheme
+
+
+def _make_nvfp4_layer(*, size_k: int, size_n: int) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = size_k
+    layer.output_size_per_partition = size_n
+    layer.logical_widths = [size_n]
+    layer.params_dtype = torch.float16
+    layer.orig_dtype = torch.float16
+    layer.register_parameter(
+        "weight_packed",
+        torch.nn.Parameter(
+            torch.zeros(size_n, size_k // 2, dtype=torch.uint8, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "weight_global_scale",
+        torch.nn.Parameter(torch.ones(1, dtype=torch.float32, device="cuda"), requires_grad=False),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(
+            torch.ones(size_n, size_k // 16, dtype=torch.float8_e4m3fn, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "input_global_scale_inv",
+        torch.nn.Parameter(torch.ones(1, dtype=torch.float32, device="cuda"), requires_grad=False),
+    )
+    layer.register_parameter(
+        "alpha",
+        torch.nn.Parameter(torch.ones(1, dtype=torch.float32, device="cuda"), requires_grad=False),
+    )
+    return layer
+
+
+def _make_mxfp4_layer(*, size_k: int, size_n: int) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = size_k
+    layer.output_size_per_partition = size_n
+    layer.logical_widths = [size_n]
+    layer.params_dtype = torch.float16
+    layer.orig_dtype = torch.float16
+    layer.register_parameter(
+        "weight_packed",
+        torch.nn.Parameter(
+            torch.zeros(size_n, size_k // 2, dtype=torch.uint8, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(
+            torch.ones(size_n, size_k // 32, dtype=torch.uint8, device="cuda"),
+            requires_grad=False,
+        ),
+    )
+    return layer
+
+
+def _prepare_dense_class_case(
+    case: DenseWritebackMatrixCase,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    size_k = case.shape.size_k
+    size_n = case.shape.size_n
+    weight = torch.zeros(size_k, size_n, dtype=torch.float16, device="cuda")
+    activation = torch.zeros(1, size_k, dtype=torch.float16, device="cuda")
+
+    if case.class_case.name == "marlin_linear_kernel":
+        prepared = prepare_marlin_linear_kernel_case(
+            quant_name=case.quant_name,
+            group_size=case.group_size,
+            activation=activation,
+            weight=weight,
+        )
+        return lambda x, prepared=prepared: prepared.kernel.apply_weights(
+            prepared.layer, x
+        )
+    if case.class_case.name == "gptq_marlin_linear_method":
+        layer, method = _make_gptq_marlin_linear_method_case(
+            quant_name=case.quant_name,
+            group_size=case.group_size,
+            size_k=size_k,
+            size_n=size_n,
+        )
+        return lambda x, layer=layer, method=method: method.apply(layer, x, None)
+    if case.class_case.name == "awq_marlin_linear_method":
+        layer, method = _make_awq_marlin_linear_method_case(
+            quant_name=case.quant_name,
+            group_size=case.group_size,
+            size_k=size_k,
+            size_n=size_n,
+        )
+        return lambda x, layer=layer, method=method: method.apply(layer, x, None)
+    if case.class_case.name == "compressed_tensors_wna16":
+        layer, scheme = _make_compressed_tensors_wna16_layer_case(
+            quant_name=case.quant_name,
+            group_size=case.group_size,
+            size_k=size_k,
+            size_n=size_n,
+        )
+        return lambda x, layer=layer, scheme=scheme: scheme.apply_weights(layer, x, None)
+    if case.class_case.name == "marlin_fp8_scaled_mm":
+        from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (  # noqa: E501
+            FP8ScaledMMLinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+            MarlinFP8ScaledMMLinearKernel,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8DynamicTokenSym,
+            kFp8Static128BlockSym,
+            kFp8StaticChannelSym,
+        )
+
+        block_quant = case.group_size == 128
+        layer = (
+            _make_fp8_block_layer(size_k=size_k, size_n=size_n)
+            if block_quant
+            else _make_fp8_layer(size_k=size_k, size_n=size_n)
+        )
+        kernel = MarlinFP8ScaledMMLinearKernel(
+            FP8ScaledMMLinearLayerConfig(
+                weight_quant_key=(
+                    kFp8Static128BlockSym if block_quant else kFp8StaticChannelSym
+                ),
+                activation_quant_key=kFp8DynamicTokenSym,
+                out_dtype=None,
+            ),
+            ["weight", "weight_scale", "input_scale", "input_scale_ub"],
+        )
+        kernel.process_weights_after_loading(layer)
+        return lambda x, layer=layer, kernel=kernel: kernel.apply_weights(layer, x)
+    if case.class_case.name == "compressed_tensors_w8a16_fp8":
+        layer, scheme = _make_compressed_tensors_fp8_layer_case(
+            group_size=case.group_size,
+            size_k=size_k,
+            size_n=size_n,
+        )
+        return lambda x, layer=layer, scheme=scheme: scheme.apply_weights(layer, x)
+    if case.class_case.name == "compressed_tensors_w4a16_nvfp4":
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_nvfp4 import (  # noqa: E501
+            CompressedTensorsW4A16Fp4,
+        )
+
+        layer = _make_nvfp4_layer(size_k=size_k, size_n=size_n)
+        scheme = CompressedTensorsW4A16Fp4()
+        scheme.process_weights_after_loading(layer)
+        return lambda x, layer=layer, scheme=scheme: scheme.apply_weights(layer, x)
+    if case.class_case.name == "compressed_tensors_w4a16_mxfp4":
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_mxfp4 import (  # noqa: E501
+            CompressedTensorsW4A16Mxfp4,
+        )
+
+        layer = _make_mxfp4_layer(size_k=size_k, size_n=size_n)
+        scheme = CompressedTensorsW4A16Mxfp4()
+        scheme.process_weights_after_loading(layer)
+        return lambda x, layer=layer, scheme=scheme: scheme.apply_weights(layer, x)
+    raise AssertionError(f"Unhandled dense class {case.class_case.name!r}")
+
+
+def _iter_filtered_matrix(
+    args: argparse.Namespace,
+) -> Iterator[DenseWritebackMatrixCase]:
+    allowed_shapes = {shape.name for shape in _SHAPE_SUITE_CASES[args.shape_suite]}
+    class_cases = tuple(
+        case for case in DENSE_WRITEBACK_CLASS_CASES if case.name in args.dense_classes
+    )
+    shapes = tuple(
+        sorted(
+            (
+                shape
+                for shape in _SHAPE_SUITE_CASES[args.shape_suite]
+                if shape.name in allowed_shapes
+            ),
+            key=lambda shape: (
+                shape.size_k,
+                shape.size_n,
+                shape.size_m,
+                shape.name,
+            ),
+        )
+    )
+    cta_cases = tuple(case for case in DENSE_CTA_CASES if case.name in args.cta)
+    yielded = 0
+    for case in iter_dense_writeback_matrix(
+        class_cases=class_cases,
+        quant_names=tuple(args.quant_types),
+        group_sizes=tuple(args.group_sizes),
+        shapes=shapes,
+        split_k_values=tuple(args.split_k),
+        cta_cases=cta_cases,
+    ):
+        yield case
+        yielded += 1
+        if args.max_cases is not None and yielded >= args.max_cases:
+            return
+
+
+def _count_filtered_matrix(args: argparse.Namespace) -> int:
+    return sum(1 for _case in _iter_filtered_matrix(args))
 
 
 def parse_args() -> argparse.Namespace:
-    support = architecture_support()
-    parser = argparse.ArgumentParser(description="Benchmark local Marlin dense kernels.")
-    parser.add_argument(
-        "--preset",
-        choices=sorted(DENSE_PRESETS.keys()),
-        default="full",
-        help="Benchmark preset to run.",
+    parser = argparse.ArgumentParser(
+        description="Benchmark dense Marlin writeback class matrix."
     )
+    parser.add_argument("--preset", default="full", help="Compatibility option.")
     parser.add_argument(
-        "--models",
+        "--dense-classes",
         nargs="+",
-        choices=sorted(DENSE_WEIGHT_SHAPES.keys()),
-        help="Dense shape presets to run. Defaults to the selected preset.",
-    )
-    parser.add_argument(
-        "--batch-sizes",
-        nargs="+",
-        type=int,
-        help="Batch sizes (M dimension). Defaults to the selected preset.",
+        choices=_DENSE_CLASS_CHOICES,
+        default=list(_DENSE_CLASS_CHOICES),
     )
     parser.add_argument(
         "--quant-types",
         nargs="+",
-        choices=sorted(QUANT_TYPES.keys()),
-        default=list(QUANT_TYPES.keys()),
-        help="Quantized weight types to benchmark for the current source target.",
+        default=list(DENSE_ALL_QUANT_NAMES),
     )
     parser.add_argument(
         "--group-sizes",
         nargs="+",
         type=int,
-        choices=list(GROUP_SIZES),
-        default=list(GROUP_SIZES),
-        help=(
-            "Group sizes to benchmark for the current source target "
-            f"({source_target_label()}; supported defaults={list(support.dense_group_sizes)}, "
-            "plus nvfp4-only 16; mxfp4 uses 32)."
-        ),
+        default=list(WRITEBACK_GROUP_SIZE_VALUES),
     )
     parser.add_argument(
-        "--act-order",
-        choices=("off", "on", "all"),
-        default="off",
-        help="Whether to benchmark act_order off only, on only, or both.",
-    )
-    parser.add_argument(
-        "--is-k-full",
-        choices=("true", "false", "all"),
+        "--shape-suite",
+        choices=("regular", "irregular", "all"),
         default="all",
-        help="For act_order cases, benchmark full-K, non-full-K, or both.",
     )
     parser.add_argument(
-        "--reuse-output",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Also report kernel_like_us using preallocated output buffers.",
+        "--split-k",
+        nargs="+",
+        choices=list(WRITEBACK_SPLIT_K_VALUES),
+        default=list(WRITEBACK_SPLIT_K_VALUES),
     )
     parser.add_argument(
-        "--use-fp32-reduce",
-        type=parse_bool_arg,
-        default=True,
-        metavar="{true,false}",
-        help="Whether to enable Marlin fp32 reduction.",
-    )
-    parser.add_argument(
-        "--report-tflops",
-        action="store_true",
-        help="Report derived TFLOPs alongside latency.",
+        "--cta",
+        nargs="+",
+        choices=list(_DENSE_CTA_CHOICES),
+        default=list(_DENSE_CTA_CHOICES),
     )
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--csv", type=Path)
+    parser.add_argument("--max-cases", type=int)
+    parser.add_argument(
+        "--omit-skip",
+        action="store_true",
+        help="Do not save or print SKIP rows; still count them in the summary.",
+    )
     return parser.parse_args()
 
 
-def run_case(
-    model: str,
-    quant_name: str,
-    group_size: int,
-    act_order: bool,
-    is_k_full: bool,
-    size_m: int,
-    size_k: int,
-    size_n: int,
-    reuse_output: bool,
-    use_fp32_reduce: bool,
+def _skip_row(case: DenseWritebackMatrixCase, reason: str) -> dict[str, str]:
+    return {
+        "dense_class": case.class_case.name,
+        "quant": case.quant_name,
+        "group_size": str(case.group_size),
+        "shape_id": case.shape.name,
+        "M": str(case.shape.size_m),
+        "K": str(case.shape.size_k),
+        "N": str(case.shape.size_n),
+        "split_k": case.split_k,
+        "cta": case.cta.name,
+        "status": "SKIP",
+        "marlin_us": "n/a",
+        "flops": "n/a",
+        "marlin_tflops": "n/a",
+        "all_finite": "n/a",
+        "reason": reason,
+    }
+
+
+def _error_row(case: DenseWritebackMatrixCase, exc: BaseException) -> dict[str, str]:
+    row = _skip_row(case, str(exc).splitlines()[0])
+    row["status"] = "ERR"
+    row["flops"] = "n/a"
+    row["marlin_tflops"] = "n/a"
+    return row
+
+
+def _run_matrix_case(
+    case: DenseWritebackMatrixCase,
+    *,
     warmup_iters: int,
     iters: int,
-    c_tmp: torch.Tensor | None = None,
-) -> dict[str, object] | None:
-    if not _is_supported_dense_benchmark_case(
-        quant_name=quant_name,
-        group_size=group_size,
-        act_order=act_order,
-        is_k_full=is_k_full,
-        size_k=size_k,
-        size_n=size_n,
-    ):
-        return None
+    check: bool,
+    prepared_cache: dict[str, object],
+) -> dict[str, str]:
+    if not case.supported:
+        return _skip_row(case, case.reason)
 
-    quant_type = QUANT_TYPES[quant_name]
-    device = torch.device("cuda")
-    a = torch.randn((size_m, size_k), device=device, dtype=torch.float16)
-    weight = torch.randn((size_k, size_n), device=device, dtype=torch.float16)
-    b_zeros = None
-    global_scale = None
-    if quant_name == "uint4":
-        if act_order:
-            return None
-        _weight, q_weight, scales, b_zeros, weight_ref = marlin_quantize_uint4_zp(
-            weight, group_size
+    try:
+        prepare_key = (
+            case.class_case.name,
+            case.quant_name,
+            case.group_size,
+            case.shape.size_k,
+            case.shape.size_n,
         )
-        g_idx = torch.empty(0, dtype=torch.int, device=device)
-        sort_indices = torch.empty(0, dtype=torch.int, device=device)
-    elif quant_name == "uint8":
-        if act_order:
-            return None
-        _weight, q_weight, scales, b_zeros, weight_ref = marlin_quantize_uint8_zp(
-            weight, group_size
-        )
-        g_idx = torch.empty(0, dtype=torch.int, device=device)
-        sort_indices = torch.empty(0, dtype=torch.int, device=device)
-    elif quant_name == "nvfp4":
-        weight_ref, q_weight, scales, global_scale, g_idx, sort_indices, _ = (
-            marlin_quantize_nvfp4(weight, group_size)
-        )
-    elif quant_name == "mxfp4":
-        weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize_mxfp4(
-            weight,
-            group_size,
-        )
-    else:
-        weight_ref, q_weight, scales, g_idx, sort_indices, _ = marlin_quantize(
-            weight, quant_type, group_size, act_order
-        )
-    torch_output = torch.empty((size_m, size_n), device=device, dtype=torch.float16)
-    marlin_output = torch.empty((size_m, size_n), device=device, dtype=torch.float16)
-    flops = dense_flops(size_m, size_k, size_n)
+        if prepared_cache.get("prepare_key") != prepare_key:
+            prepared_cache.clear()
+            run_marlin = _prepare_dense_class_case(case)
+            prepared_cache["prepare_key"] = prepare_key
+            prepared_cache["run_marlin"] = run_marlin
 
-    def run_torch_operator() -> torch.Tensor:
-        return torch.matmul(a, weight_ref)
-
-    def run_marlin_operator() -> torch.Tensor:
-        return dense.run_marlin_gemm(
-            a,
-            q_weight,
-            scales,
-            quant_type.id,
-            size_m,
-            size_n,
-            size_k,
-            c_tmp=c_tmp,
-            b_zeros=b_zeros,
-            global_scale=global_scale,
-            g_idx=g_idx,
-            perm=sort_indices,
-            is_k_full=is_k_full,
-            use_fp32_reduce=use_fp32_reduce,
-        )
-
-    results: dict[str, dict[str, float]] = {}
-    torch_stats = time_cuda_callable(
-        run_torch_operator, warmup_iters=warmup_iters, iters=iters
-    )
-    marlin_stats = time_cuda_callable(
-        run_marlin_operator, warmup_iters=warmup_iters, iters=iters
-    )
-    results["operator_us"] = {
-        "torch_us": torch_stats["median_us"],
-        "marlin_us": marlin_stats["median_us"],
-        "speedup": torch_stats["median_us"] / marlin_stats["median_us"],
-    }
-
-    if reuse_output:
-        def run_torch_kernel_like() -> torch.Tensor:
-            return torch.mm(a, weight_ref, out=torch_output)
-
-        def run_marlin_kernel_like() -> torch.Tensor:
-            return dense.run_marlin_gemm(
-                a,
-                q_weight,
-                scales,
-                quant_type.id,
-                size_m,
-                size_n,
-                size_k,
-                c_tmp=c_tmp,
-                c=marlin_output,
-                b_zeros=b_zeros,
-                global_scale=global_scale,
-                g_idx=g_idx,
-                perm=sort_indices,
-                is_k_full=is_k_full,
-                use_fp32_reduce=use_fp32_reduce,
+        input_key = (case.shape.size_m, case.shape.size_k)
+        if prepared_cache.get("input_key") != input_key:
+            x = torch.zeros(
+                case.shape.size_m,
+                case.shape.size_k,
+                dtype=torch.float16,
+                device="cuda",
             )
+            prepared_cache["input_key"] = input_key
+            prepared_cache["x"] = x
+        else:
+            x = prepared_cache["x"]
+        run_marlin = prepared_cache["run_marlin"]
 
-        torch_stats = time_cuda_callable(
-            run_torch_kernel_like, warmup_iters=warmup_iters, iters=iters
-        )
-        marlin_stats = time_cuda_callable(
-            run_marlin_kernel_like, warmup_iters=warmup_iters, iters=iters
-        )
-        results["kernel_like_us"] = {
-            "torch_us": torch_stats["median_us"],
-            "marlin_us": marlin_stats["median_us"],
-            "speedup": torch_stats["median_us"] / marlin_stats["median_us"],
-        }
+        all_finite = "n/a"
+        with _matrix_env(case):
+            if check:
+                output = run_marlin(x)
+                all_finite = "yes" if torch.isfinite(output).all().item() else "no"
+                if output.shape != (case.shape.size_m, case.shape.size_n):
+                    raise AssertionError(
+                        f"output shape {tuple(output.shape)} != "
+                        f"{(case.shape.size_m, case.shape.size_n)}"
+                    )
+            stats = time_cuda_callable(
+                lambda: run_marlin(x),
+                warmup_iters=warmup_iters,
+                iters=iters,
+            )
+    except Exception as exc:
+        return _error_row(case, exc)
 
+    flops = _dense_flops(case.shape)
     return {
-        "model": model,
-        "quant": quant_name,
-        "group_size": group_size,
-        "act_order": act_order,
-        "is_k_full": is_k_full if act_order else True,
-        "mkn": f"{size_m}x{size_k}x{size_n}",
-        "flops": flops,
-        "launch_dominated": is_launch_dominated(flops),
-        "results": results,
+        "dense_class": case.class_case.name,
+        "quant": case.quant_name,
+        "group_size": str(case.group_size),
+        "shape_id": case.shape.name,
+        "M": str(case.shape.size_m),
+        "K": str(case.shape.size_k),
+        "N": str(case.shape.size_n),
+        "split_k": case.split_k,
+        "cta": case.cta.name,
+        "status": "OK",
+        "marlin_us": format_float(stats["median_us"]),
+        "flops": str(flops),
+        "marlin_tflops": _format_tflops(flops, stats["median_us"]),
+        "all_finite": all_finite,
+        "reason": "",
     }
-
-
-def build_rows(
-    rows: list[dict[str, object]],
-    metric_name: str,
-    report_tflops: bool,
-) -> list[list[str]]:
-    rendered: list[list[str]] = []
-    for row in rows:
-        metrics = row["results"][metric_name]
-        table_row = [
-            str(row["model"]),
-            str(row["quant"]),
-            str(row["group_size"]),
-            "yes" if bool(row["act_order"]) else "no",
-            "yes" if bool(row["is_k_full"]) else "no",
-            str(row["mkn"]),
-            format_flops(int(row["flops"])),
-            "yes" if bool(row["launch_dominated"]) else "no",
-            format_float(metrics["torch_us"]),
-            format_float(metrics["marlin_us"]),
-            f"{metrics['speedup']:.2f}x",
-        ]
-        if report_tflops:
-            flops = int(row["flops"])
-            table_row.extend(
-                [
-                    format_float(tflops_from_us(flops, metrics["torch_us"])),
-                    format_float(tflops_from_us(flops, metrics["marlin_us"])),
-                ]
-            )
-        rendered.append(table_row)
-    return rendered
-
-
-def render_metric_table(
-    rows: list[dict[str, object]],
-    metric_name: str,
-    report_tflops: bool,
-) -> None:
-    headers = [
-        "model",
-        "quant",
-        "group_size",
-        "act_order",
-        "is_k_full",
-        "MKN",
-        "flops",
-        "launch_dominated",
-        "torch_us",
-        "marlin_us",
-        "speedup",
-    ]
-    if report_tflops:
-        headers.extend(["torch_tflops", "marlin_tflops"])
-    print(metric_name)
-    print_table(headers=headers, rows=build_rows(rows, metric_name, report_tflops))
 
 
 def main() -> None:
     args = parse_args()
     check_cuda_ready()
-    ops._load_dense()
+    selected_cases = _count_filtered_matrix(args)
+    csv_path = args.csv or Path("benchmarks/results") / (
+        f"{timestamp().replace(' ', '_').replace(':', '')}_dense_writeback_matrix.csv"
+    )
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    preset = DENSE_PRESETS[args.preset]
-    models = args.models or list(preset["models"])
-    batch_sizes = args.batch_sizes or list(preset["batch_sizes"])
-
-    banner(f"Marlin Dense Benchmark ({timestamp()})")
+    banner(f"Marlin Dense Writeback Matrix Benchmark ({timestamp()})")
     print(f"device={torch.cuda.get_device_name(0)}")
     print(f"capability={format_capability(runtime_capability(0))}")
     print(f"build_target={source_target_label()} ({source_target_cuda_arch_arg()})")
-    print("note=results are only comparable when runtime capability matches the source target build.")
+    print("matrix=class x quant x group x shape x split-K x CTA")
     print(f"preset={args.preset}")
-    print(f"models={models}")
-    print(f"batch_sizes={batch_sizes}")
+    print(f"dense_classes={args.dense_classes}")
     print(f"quant_types={args.quant_types}")
     print(f"group_sizes={args.group_sizes}")
-    print(f"act_order={args.act_order}")
-    print(f"is_k_full={args.is_k_full}")
-    print(f"reuse_output={args.reuse_output}")
-    print(f"use_fp32_reduce={args.use_fp32_reduce}")
-    print(f"report_tflops={args.report_tflops}")
-    print(f"launch_dominated_flops<{LAUNCH_DOMINATED_FLOPS}")
-    print(f"warmup_iters={args.warmup_iters}, iters={args.iters}")
+    print(f"shape_suite={args.shape_suite}")
+    print(f"split_k={args.split_k}")
+    print(f"cta={args.cta}")
+    print(f"warmup_iters={args.warmup_iters}, iters={args.iters}, check={args.check}")
+    print(f"omit_skip={args.omit_skip}")
+    print(f"selected_cases={selected_cases}")
+    print(f"csv={csv_path}")
 
-    case_specs: list[tuple[str, str, int, bool, bool, int, int, int]] = []
-    act_order_values = parse_act_order_values(args.act_order)
-    requested_is_k_full = parse_is_k_full_values(args.is_k_full)
-    for model in models:
-        for size_k, size_n in DENSE_WEIGHT_SHAPES[model]:
-            for quant_name in args.quant_types:
-                for group_size in args.group_sizes:
-                    for act_order in act_order_values:
-                        is_k_full_values = requested_is_k_full if act_order else [True]
-                        for is_k_full in is_k_full_values:
-                            if not _is_supported_dense_benchmark_case(
-                                quant_name=quant_name,
-                                group_size=group_size,
-                                act_order=act_order,
-                                is_k_full=is_k_full,
-                                size_k=size_k,
-                                size_n=size_n,
-                            ):
-                                continue
-                            for size_m in batch_sizes:
-                                case_specs.append(
-                                    (
-                                        model,
-                                        quant_name,
-                                        group_size,
-                                        act_order,
-                                        is_k_full,
-                                        size_m,
-                                        size_k,
-                                        size_n,
-                                    )
-                                )
-
-    print(f"total_cases={len(case_specs)}")
-
-    rows: list[dict[str, object]] = []
-    for index, (model, quant_name, group_size, act_order, is_k_full, size_m, size_k, size_n) in enumerate(
-        case_specs, start=1
-    ):
-        print(
-            "case "
-            f"{index}/{len(case_specs)}: model={model}, quant={quant_name}, "
-            f"group_size={group_size}, act_order={act_order}, is_k_full={is_k_full}, "
-            f"mkn={size_m}x{size_k}x{size_n}",
-            flush=True,
-        )
-        row = run_case(
-            model=model,
-            quant_name=quant_name,
-            group_size=group_size,
-            act_order=act_order,
-            is_k_full=is_k_full,
-            size_m=size_m,
-            size_k=size_k,
-            size_n=size_n,
-            reuse_output=args.reuse_output,
-            use_fp32_reduce=args.use_fp32_reduce,
-            warmup_iters=args.warmup_iters,
-            iters=args.iters,
-        )
-        if row is not None:
-            rows.append(row)
-
-    grouped_rows: dict[tuple[int, bool, bool], list[dict[str, object]]] = defaultdict(list)
-    for row in rows:
-        grouped_rows[(int(row["group_size"]), bool(row["act_order"]), bool(row["is_k_full"]))].append(
-            row
-        )
-
-    for group_size, act_order, is_k_full in sorted(grouped_rows):
-        group_rows = grouped_rows[(group_size, act_order, is_k_full)]
-        print()
-        print(
-            f"group_size={group_size}, act_order={act_order}, "
-            f"is_k_full={is_k_full if act_order else True}"
-        )
-        render_metric_table(group_rows, metric_name="operator_us", report_tflops=args.report_tflops)
-        if args.reuse_output:
-            print()
-            render_metric_table(
-                group_rows,
-                metric_name="kernel_like_us",
-                report_tflops=args.report_tflops,
+    status_counts: Counter[str] = Counter()
+    skip_reasons: Counter[str] = Counter()
+    saved_rows = 0
+    prepared_cache: dict[str, object] = {}
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_DENSE_CSV_FIELDNAMES)
+        writer.writeheader()
+        for index, case in enumerate(_iter_filtered_matrix(args), start=1):
+            row = _run_matrix_case(
+                case,
+                warmup_iters=args.warmup_iters,
+                iters=args.iters,
+                check=args.check,
+                prepared_cache=prepared_cache,
             )
+            status_counts[row["status"]] += 1
+            if row["status"] == "SKIP":
+                skip_reasons[row["reason"]] += 1
+                if args.omit_skip:
+                    continue
+
+            writer.writerow(row)
+            saved_rows += 1
+            if saved_rows % 100 == 0 or row["status"] in {"ERR", "MISMATCH"}:
+                f.flush()
+            if (
+                saved_rows % 1000 == 0
+                or row["status"] in {"ERR", "MISMATCH"}
+                or index == selected_cases
+            ):
+                print(
+                    f"case {index}/{selected_cases} saved {saved_rows}: "
+                    f"{case.id} [{row['status']}]",
+                    flush=True,
+                )
+
+    print()
+    print(
+        "summary: "
+        f"selected_cases={selected_cases}, saved_rows={saved_rows}, "
+        f"OK={status_counts['OK']}, SKIP={status_counts['SKIP']}, "
+        f"ERR={status_counts['ERR']}, MISMATCH={status_counts['MISMATCH']}"
+    )
+    if skip_reasons:
+        print("top_skip_reasons:")
+        for reason, count in skip_reasons.most_common(10):
+            print(f"{count}\t{reason}")
+        print()
+    print(f"csv={csv_path}")
 
 
 if __name__ == "__main__":

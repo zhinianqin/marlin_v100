@@ -43,6 +43,9 @@ _FLOAT16_DTYPE_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
     rf"|{source_target_label()} build only supports float16 outputs\."
     rf"|{source_target_label()} build only supports float16 scales\."
+    rf"|{source_target_label()} Marlin MoE supports only float16 activations\."
+    rf"|{source_target_label()} Marlin MoE supports only float16 outputs\."
+    rf"|{source_target_label()} Marlin MoE supports only float16 scales"
 )
 _FORCED_GEOMETRY_REPACK_CASES = (_REPACK_IMPL_CASES[0],)
 _SUPPORTED_THREAD_GEOMETRY_ERROR = (
@@ -514,6 +517,8 @@ def _run_fused_moe_accuracy_case(
         global_scale2=inputs["w2_global_scale"],
         w1_zeros=inputs["w1_zeros"],
         w2_zeros=inputs["w2_zeros"],
+        is_w1_zp_float=inputs["w1_zeros"] is not None,
+        is_w2_zp_float=inputs["w2_zeros"] is not None,
         g_idx1=inputs["w1_g_idx"],
         g_idx2=inputs["w2_g_idx"],
         sort_indices1=inputs["w1_perm"],
