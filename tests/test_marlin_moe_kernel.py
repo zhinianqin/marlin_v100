@@ -79,6 +79,7 @@ class _RecordedGemm:
     size_n: int
     size_k: int
     top_k: int
+    use_fp32_reduce: bool
     is_zp_float: bool
 
 
@@ -404,7 +405,6 @@ def _install_fused_marlin_cpu_mocks(monkeypatch: pytest.MonkeyPatch) -> list[_Re
             b_q_type,
             is_k_full,
             use_atomic_add,
-            use_fp32_reduce,
             thread_k,
             thread_n,
             blocks_per_sm,
@@ -417,6 +417,7 @@ def _install_fused_marlin_cpu_mocks(monkeypatch: pytest.MonkeyPatch) -> list[_Re
                 size_n=size_n,
                 size_k=size_k,
                 top_k=top_k,
+                use_fp32_reduce=use_fp32_reduce,
                 is_zp_float=is_zp_float,
             )
         )
@@ -762,7 +763,7 @@ def _assert_fresh_c_tmp(layer: torch.nn.Module) -> None:
     assert not layer.c_tmp.requires_grad
 
 
-def _assert_apply_resizes_and_reuses_c_tmp(
+def _assert_apply_keeps_empty_c_tmp(
     method: Any,
     layer: torch.nn.Module,
     records: list[_RecordedGemm],
@@ -778,14 +779,15 @@ def _assert_apply_resizes_and_reuses_c_tmp(
     topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
     output = method.apply(layer, hidden_states, topk_weights, topk_ids, None)
 
-    required = hidden_states.shape[0] * topk * max(2 * intermediate_size, hidden_size)
     assert output.shape == hidden_states.shape
-    assert layer.c_tmp.numel() >= required
     assert layer.c_tmp.dtype == torch.float32
     assert layer.c_tmp.is_contiguous()
+    assert layer.c_tmp.numel() == 0
     assert len(records) == 2
     assert records[0].c_tmp is layer.c_tmp
     assert records[1].c_tmp is layer.c_tmp
+    assert records[0].use_fp32_reduce is False
+    assert records[1].use_fp32_reduce is False
     assert records[0].is_zp_float is expected_zp_float
     assert records[1].is_zp_float is expected_zp_float
     if expected_zp_float:
@@ -804,6 +806,8 @@ def _assert_apply_resizes_and_reuses_c_tmp(
     assert len(records) == 2
     assert records[0].c_tmp is first_c_tmp
     assert records[1].c_tmp is first_c_tmp
+    assert records[0].use_fp32_reduce is False
+    assert records[1].use_fp32_reduce is False
     assert records[0].is_zp_float is expected_zp_float
     assert records[1].is_zp_float is expected_zp_float
 
@@ -812,12 +816,13 @@ def _assert_apply_resizes_and_reuses_c_tmp(
     larger_weights = torch.full((5, topk), 0.5, dtype=torch.float32)
     larger_ids = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0], [0, 1]], dtype=torch.int32)
     method.apply(layer, larger_hidden, larger_weights, larger_ids, None)
-    larger_required = larger_hidden.shape[0] * topk * max(2 * intermediate_size, hidden_size)
-    assert layer.c_tmp is not first_c_tmp
-    assert layer.c_tmp.numel() >= larger_required
+    assert layer.c_tmp is first_c_tmp
+    assert layer.c_tmp.numel() == 0
     assert len(records) == 2
     assert records[0].c_tmp is layer.c_tmp
     assert records[1].c_tmp is layer.c_tmp
+    assert records[0].use_fp32_reduce is False
+    assert records[1].use_fp32_reduce is False
     assert records[0].is_zp_float is expected_zp_float
     assert records[1].is_zp_float is expected_zp_float
 
@@ -902,6 +907,8 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                 stage1, stage2 = records
                 assert stage1.c_tmp is layer.c_tmp
                 assert stage2.c_tmp is layer.c_tmp
+                assert stage1.use_fp32_reduce is False
+                assert stage2.use_fp32_reduce is False
                 assert stage1.size_m == matrix_case.shape.tokens
                 assert stage1.size_k == matrix_case.shape.hidden
                 assert stage1.size_n == 2 * matrix_case.shape.intermediate
@@ -924,14 +931,9 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                     assert stage1.b_qzeros is None
                     assert stage2.b_qzeros is None
 
-                required_c_tmp = (
-                    matrix_case.shape.tokens
-                    * matrix_case.shape.topk
-                    * max(2 * matrix_case.shape.intermediate, matrix_case.shape.hidden)
-                )
                 assert layer.c_tmp.dtype == torch.float32
                 assert layer.c_tmp.is_contiguous()
-                assert layer.c_tmp.numel() >= required_c_tmp
+                assert layer.c_tmp.numel() == 0
                 assert not layer.c_tmp.requires_grad
 
                 c_tmp_numel = int(layer.c_tmp.numel())
@@ -1011,7 +1013,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
         )
 
 
-def test_fused_marlin_moe_resizes_and_persists_c_tmp(monkeypatch: pytest.MonkeyPatch):
+def test_fused_marlin_moe_keeps_empty_c_tmp(monkeypatch: pytest.MonkeyPatch):
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
 
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
@@ -1043,15 +1045,17 @@ def test_fused_marlin_moe_resizes_and_persists_c_tmp(monkeypatch: pytest.MonkeyP
     assert output.shape == hidden_states.shape
     assert owner.c_tmp.dtype == torch.float32
     assert owner.c_tmp.is_contiguous()
-    assert owner.c_tmp.numel() >= 2 * 2 * max(2 * 16, 32)
+    assert owner.c_tmp.numel() == 0
     assert len(records) == 2
     assert records[0].c_tmp is owner.c_tmp
     assert records[1].c_tmp is owner.c_tmp
+    assert records[0].use_fp32_reduce is False
+    assert records[1].use_fp32_reduce is False
     assert records[0].is_zp_float is False
     assert records[1].is_zp_float is False
 
 
-def test_gptq_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
+def test_gptq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.quantization.gptq_marlin as gptq_mod
@@ -1082,7 +1086,7 @@ def test_gptq_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
     layer = _make_minimal_moe_layer(prefix="gptq")
     method.process_weights_after_loading(layer)
     _assert_fresh_c_tmp(layer)
-    _assert_apply_resizes_and_reuses_c_tmp(method, layer, records)
+    _assert_apply_keeps_empty_c_tmp(method, layer, records)
 
 
 @pytest.mark.parametrize(
@@ -1118,7 +1122,7 @@ def test_gptq_marlin_moe_method_class_uses_owner(
     )
     method.process_weights_after_loading(layer)
     _assert_fresh_c_tmp(layer)
-    _assert_apply_resizes_and_reuses_c_tmp(
+    _assert_apply_keeps_empty_c_tmp(
         method,
         layer,
         records,
@@ -1133,7 +1137,7 @@ def test_gptq_marlin_moe_method_class_uses_owner(
         pytest.param(8, scalar_types.uint8, id="uint8_zp"),
     ),
 )
-def test_awq_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
+def test_awq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
     num_bits: int,
     expected_quant_type: Any,
@@ -1170,7 +1174,7 @@ def test_awq_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
     assert layer.w2_qzeros.dtype == torch.float16
     assert layer.w13_qzeros.is_contiguous()
     assert layer.w2_qzeros.is_contiguous()
-    _assert_apply_resizes_and_reuses_c_tmp(
+    _assert_apply_keeps_empty_c_tmp(
         method, layer, records, expected_zp_float=True
     )
 
@@ -1215,7 +1219,7 @@ def test_awq_marlin_moe_method_class_uses_owner(
     _assert_fresh_c_tmp(layer)
     assert layer.w13_qzeros.dtype == torch.float16
     assert layer.w2_qzeros.dtype == torch.float16
-    _assert_apply_resizes_and_reuses_c_tmp(
+    _assert_apply_keeps_empty_c_tmp(
         method,
         layer,
         records,
@@ -1223,7 +1227,7 @@ def test_awq_marlin_moe_method_class_uses_owner(
     )
 
 
-def test_compressed_tensors_wna16_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
+def test_compressed_tensors_wna16_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe as ct_mod
@@ -1258,7 +1262,7 @@ def test_compressed_tensors_wna16_marlin_moe_method_persists_c_tmp_and_apply_use
     layer.marlin_state = SimpleNamespace()
     method.process_weights_after_loading(layer)
     _assert_fresh_c_tmp(layer)
-    _assert_apply_resizes_and_reuses_c_tmp(method, layer, records)
+    _assert_apply_keeps_empty_c_tmp(method, layer, records)
 
 
 @pytest.mark.parametrize(
@@ -1307,7 +1311,7 @@ def test_compressed_tensors_wna16_marlin_moe_method_class_uses_owner(
     layer.marlin_state = SimpleNamespace()
     method.process_weights_after_loading(layer)
     _assert_fresh_c_tmp(layer)
-    _assert_apply_resizes_and_reuses_c_tmp(
+    _assert_apply_keeps_empty_c_tmp(
         method,
         layer,
         records,
@@ -1315,7 +1319,7 @@ def test_compressed_tensors_wna16_marlin_moe_method_class_uses_owner(
     )
 
 
-def test_quark_w8a8_fp8_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
+def test_quark_w8a8_fp8_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.quantization.quark.quark_moe as quark_mod
@@ -1384,7 +1388,7 @@ def test_quark_w8a8_fp8_marlin_moe_method_persists_c_tmp_and_apply_uses_owner(
     )
     method.process_weights_after_loading(layer)
     _assert_fresh_c_tmp(layer)
-    _assert_apply_resizes_and_reuses_c_tmp(
+    _assert_apply_keeps_empty_c_tmp(
         method,
         layer,
         records,

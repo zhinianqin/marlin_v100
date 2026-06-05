@@ -31,54 +31,40 @@ torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
                                     torch::Tensor& b_q_weight,
                                     torch::Tensor& b_scales, int64_t size_m,
                                     int64_t size_n, int64_t size_k,
-                                    int64_t group_size,
-                                    std::optional<torch::Tensor> const&
-                                        c_tmp_or_none);
+                                    int64_t group_size);
 torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
                                   torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
-                                  int64_t group_size,
-                                  std::optional<torch::Tensor> const&
-                                      c_tmp_or_none);
+                                  int64_t group_size);
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
                                   torch::Tensor& b_zeros, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
-                                  int64_t group_size,
-                                  std::optional<torch::Tensor> const&
-                                      c_tmp_or_none);
+                                  int64_t group_size);
 torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
                                       torch::Tensor& b_q_weight,
                                       torch::Tensor& b_scales, int64_t size_m,
                                       int64_t size_n, int64_t size_k,
-                                      int64_t group_size,
-                                      std::optional<torch::Tensor> const&
-                                          c_tmp_or_none);
+                                      int64_t group_size);
 torch::Tensor sm70_marlin_fp8_gemm(torch::Tensor& a, torch::Tensor& c,
                                    torch::Tensor& b_q_weight,
                                    torch::Tensor& b_scales, int64_t size_m,
                                    int64_t size_n, int64_t size_k,
-                                   int64_t group_size,
-                                   std::optional<torch::Tensor> const&
-                                       c_tmp_or_none);
+                                   int64_t group_size);
 torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      torch::Tensor& b_q_weight,
                                      torch::Tensor& b_scales,
                                      torch::Tensor& global_scale,
                                      int64_t size_m, int64_t size_n,
-                                     int64_t size_k, int64_t group_size,
-                                     std::optional<torch::Tensor> const&
-                                         c_tmp_or_none);
+                                     int64_t size_k, int64_t group_size);
 torch::Tensor sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      torch::Tensor& b_q_weight,
                                      torch::Tensor& b_scales, int64_t size_m,
                                      int64_t size_n, int64_t size_k,
-                                     int64_t group_size,
-                                     std::optional<torch::Tensor> const&
-                                         c_tmp_or_none);
+                                     int64_t group_size);
 
 torch::Tensor marlin_gemm(
     torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
@@ -169,8 +155,13 @@ torch::Tensor marlin_gemm(
               "SM70 Marlin currently implements only uint4, "
               "uint4b8, uint8, uint8b128, fp8_e4m3fn, nvfp4, and "
               "mxfp4 dense weights.");
-  TORCH_CHECK(use_fp32_reduce,
-              "SM70 Marlin requires use_fp32_reduce=True.");
+  TORCH_CHECK(!use_fp32_reduce,
+              "SM70 Marlin requires use_fp32_reduce=false.");
+  if (c_tmp_or_none.has_value()) {
+    TORCH_CHECK(c_tmp_or_none.value().numel() == 0,
+                "SM70 Marlin requires an empty c_tmp tensor because split-K "
+                "reduces directly into the output tensor.");
+  }
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -419,7 +410,7 @@ torch::Tensor marlin_gemm(
         has_zp && is_zp_float,
         "SM70 Marlin uint4 dense path requires fp16 zero points.");
     return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size, c_tmp_or_none);
+                               size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kU8) {
@@ -429,7 +420,7 @@ torch::Tensor marlin_gemm(
         has_zp && is_zp_float,
         "SM70 Marlin uint8 dense path requires fp16 zero points.");
     return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size, c_tmp_or_none);
+                               size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kU8B128) {
@@ -440,7 +431,7 @@ torch::Tensor marlin_gemm(
                 "SM70 Marlin uint8b128 does not support "
                 "zero-point metadata.");
     return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                                   size_k, group_size, c_tmp_or_none);
+                                   size_k, group_size);
   }
 
   if (b_type == vllm::kFE4M3fn) {
@@ -455,7 +446,7 @@ torch::Tensor marlin_gemm(
                 "SM70 Marlin FP8 does not support zero-point "
                 "metadata.");
     return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                                size_k, group_size, c_tmp_or_none);
+                                size_k, group_size);
   }
 
   if (b_type == vllm::kFE2M1f) {
@@ -473,8 +464,7 @@ torch::Tensor marlin_gemm(
                   "Got ",
                   group_size);
       return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales, global_scale,
-                                    size_m, size_n, size_k, group_size,
-                                    c_tmp_or_none);
+                                    size_m, size_n, size_k, group_size);
     }
 
     TORCH_CHECK(s_type == vllm::kFE8M0fnu,
@@ -485,14 +475,14 @@ torch::Tensor marlin_gemm(
                 "when global_scale is not provided. Got ",
                 group_size);
     return sm70_marlin_mxfp4_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                                  size_k, group_size, c_tmp_or_none);
+                                  size_k, group_size);
   }
 
   TORCH_CHECK(!has_zp && !is_zp_float,
               "SM70 Marlin uint4b8 does not support zero-point "
               "metadata.");
   return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                               size_k, group_size, c_tmp_or_none);
+                               size_k, group_size);
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {

@@ -20,7 +20,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    marlin_ensure_c_tmp,
+    marlin_make_c_tmp,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
@@ -141,14 +141,15 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        required_c_tmp_numel = (
-            x.reshape(-1, x.shape[-1]).shape[0] * layer.output_size_per_partition
-        )
-        layer.c_tmp = marlin_ensure_c_tmp(
-            getattr(layer, "c_tmp", None),
-            x.device,
-            required_c_tmp_numel,
-        )
+        c_tmp = getattr(layer, "c_tmp", None)
+        if (
+            c_tmp is None
+            or c_tmp.device != x.device
+            or c_tmp.dtype != torch.float32
+            or not c_tmp.is_contiguous()
+            or c_tmp.numel() != 0
+        ):
+            layer.c_tmp = marlin_make_c_tmp(x.device)
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,

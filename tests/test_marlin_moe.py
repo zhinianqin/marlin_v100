@@ -600,7 +600,7 @@ def _assert_moe_backend_rejects_act_order(
             hidden_states.shape[1],
             is_k_full,
             False,
-            True,
+            False,
             inputs["w1_zeros"] is not None,
             -1,
             -1,
@@ -836,7 +836,7 @@ def _run_stage1_kernel_case(
         hidden_states.shape[1],
         is_k_full,
         False,
-        True,
+        False,
         inputs["w1_zeros"] is not None,
         thread_k,
         thread_n,
@@ -923,7 +923,7 @@ def _run_forced_fused_kernel_case(
         hidden,
         True,
         False,
-        True,
+        False,
         inputs["w1_zeros"] is not None,
         thread_k,
         thread_n,
@@ -956,7 +956,7 @@ def _run_forced_fused_kernel_case(
         intermediate,
         True,
         False,
-        True,
+        False,
         inputs["w2_zeros"] is not None,
         thread_k,
         thread_n,
@@ -1038,7 +1038,7 @@ def _assert_stage1_kernel_rejects_unsupported_config(
             hidden,
             True,
             False,
-            True,
+            False,
             inputs["w1_zeros"] is not None,
             thread_k,
             thread_n,
@@ -1314,8 +1314,8 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
             atol=2.0,
         )
 
-    def test_moe_wna16_uint4_zp_auto_split_k_reuses_c_tmp_matches_reference():
-        c_tmp = torch.empty((1 * 2 * 4096,), dtype=torch.float32, device="cuda")
+    def test_moe_wna16_uint4_zp_auto_split_k_keeps_empty_c_tmp_matches_reference():
+        c_tmp = torch.empty((0,), dtype=torch.float32, device="cuda")
         _run_stage1_kernel_case(
             scalar_types.uint4,
             repack_impl="gptq",
@@ -1330,20 +1330,22 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
             rtol=2e-1,
             atol=2.0,
         )
+        assert c_tmp.numel() == 0
 
-    def test_moe_wna16_uint4_zp_no_split_accepts_unused_c_tmp():
+    def test_moe_wna16_uint4_zp_no_split_rejects_non_empty_c_tmp():
         c_tmp = torch.empty((1,), dtype=torch.float32, device="cuda")
-        _run_stage1_kernel_case(
-            scalar_types.uint4,
-            repack_impl="gptq",
-            group_size=32,
-            act_order=False,
-            is_k_full=True,
-            tokens=2,
-            c_tmp=c_tmp,
-            rtol=2e-1,
-            atol=2.0,
-        )
+        with pytest.raises(RuntimeError, match="empty c_tmp"):
+            _run_stage1_kernel_case(
+                scalar_types.uint4,
+                repack_impl="gptq",
+                group_size=32,
+                act_order=False,
+                is_k_full=True,
+                tokens=2,
+                c_tmp=c_tmp,
+                rtol=2e-1,
+                atol=2.0,
+            )
 
     @pytest.mark.parametrize(
         ("intermediate", "case_id"),
@@ -1417,8 +1419,8 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 size_k,
                 True,
                 False,
-                True,
-                True,
+                False,
+                False,
                 -1,
                 -1,
                 -1,
@@ -1474,14 +1476,14 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 hidden,
                 True,
                 False,
-                True,
-                True,
+                False,
+                False,
                 -1,
                 -1,
                 -1,
             )
 
-    def test_moe_wna16_uint4_zp_auto_split_k_rejects_fp16_reduce():
+    def test_moe_wna16_uint4_zp_auto_split_k_rejects_fp32_reduce():
         inputs = _make_moe_accuracy_inputs(
             scalar_types.uint4,
             repack_impl="gptq",
@@ -1495,7 +1497,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
             inputs["topk_ids"], block_size=16, num_experts=inputs["experts"]
         )
-        with pytest.raises(RuntimeError, match="requires use_fp32_reduce=True"):
+        with pytest.raises(RuntimeError, match="requires use_fp32_reduce=false"):
             ops.moe_wna16_marlin_gemm(
                 inputs["hidden_states"],
                 torch.empty(
@@ -1525,16 +1527,16 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
                 inputs["hidden_states"].shape[1],
                 True,
                 False,
-                False,
+                True,
                 True,
                 -1,
                 -1,
                 -1,
             )
 
-    def test_moe_wna16_uint4_zp_auto_split_k_rejects_small_c_tmp():
+    def test_moe_wna16_uint4_zp_auto_split_k_rejects_non_empty_c_tmp():
         c_tmp = torch.empty((1 * 2 * 4096 - 1,), dtype=torch.float32, device="cuda")
-        with pytest.raises(RuntimeError, match=r"c_tmp\.numel.*M\*N"):
+        with pytest.raises(RuntimeError, match="empty c_tmp"):
             _run_stage1_kernel_case(
                 scalar_types.uint4,
                 repack_impl="gptq",
@@ -1551,27 +1553,17 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
             )
 
     @pytest.mark.parametrize(
-        ("make_c_tmp", "message"),
+        "make_c_tmp",
         (
-            (
-                lambda device: torch.empty((1, 2, 4096), device=device, dtype=torch.float16),
-                "dtype torch.float32",
-            ),
-            (
-                lambda device: torch.empty((2, 4096), device=device, dtype=torch.float32).t(),
-                "contiguous",
-            ),
-            (
-                lambda device: torch.empty((1, 2, 4096), dtype=torch.float32),
-                "CUDA tensor",
-            ),
+            lambda device: torch.empty((1, 2, 4096), device=device, dtype=torch.float16),
+            lambda device: torch.empty((2, 4096), device=device, dtype=torch.float32).t(),
+            lambda device: torch.empty((1, 2, 4096), dtype=torch.float32),
         ),
     )
-    def test_moe_wna16_uint4_zp_auto_split_k_rejects_invalid_c_tmp(
+    def test_moe_wna16_uint4_zp_auto_split_k_rejects_non_empty_c_tmp_variants(
         make_c_tmp,
-        message: str,
     ):
-        with pytest.raises(RuntimeError, match=message):
+        with pytest.raises(RuntimeError, match="empty c_tmp"):
             _run_stage1_kernel_case(
                 scalar_types.uint4,
                 repack_impl="gptq",
@@ -1871,8 +1863,8 @@ def test_moe_wna16_uint4_zp_rejects_non_uint4_quant_type():
             hidden_states.shape[1],
             True,
             False,
-            True,
-            True,
+            False,
+            False,
             -1,
             -1,
             -1,
@@ -1936,7 +1928,7 @@ def test_moe_wna16_uint4_zp_rejects_packed_zero_points():
             hidden_states.shape[1],
             True,
             False,
-            True,
+            False,
             False,
             -1,
             -1,
@@ -1992,8 +1984,8 @@ def test_moe_wna16_uint4_zp_rejects_mismatched_zero_point_shape():
             hidden_states.shape[1],
             True,
             False,
-            True,
-            True,
+            False,
+            False,
             -1,
             -1,
             -1,
@@ -2048,7 +2040,7 @@ def test_marlin_moe_rejects_mismatched_capability_or_unsupported_dtypes(repack_i
                 128,
                 True,
                 False,
-                True,
+                False,
                 False,
                 -1,
                 -1,
@@ -2085,7 +2077,7 @@ def test_marlin_moe_rejects_mismatched_capability_or_unsupported_dtypes(repack_i
             128,
             True,
             False,
-            True,
+            False,
             False,
             -1,
             -1,

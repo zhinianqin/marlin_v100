@@ -434,7 +434,6 @@ struct Sm70MoeU8Launcher {
   int64_t size_n;
   int64_t size_k;
   int requested_split_k;
-  std::optional<torch::Tensor> const& c_tmp_or_none;
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
@@ -442,8 +441,7 @@ struct Sm70MoeU8Launcher {
     return launch_sm70_marlin_moe_gemm<Traits>(
         a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
         expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
-        top_k, mul_topk_weights, size_m, size_n, size_k, requested_split_k,
-        c_tmp_or_none);
+        top_k, mul_topk_weights, size_m, size_n, size_k, requested_split_k);
   }
 };
 
@@ -455,8 +453,7 @@ torch::Tensor sm70_marlin_u8_gemm(
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
-    std::optional<torch::Tensor> const& c_tmp_or_none) {
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
   Sm70CtaGeometry const geometry =
@@ -476,7 +473,7 @@ torch::Tensor sm70_marlin_u8_gemm(
   Sm70MoeU8Launcher const launcher{
       a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-      mul_topk_weights, size_m, size_n, size_k, requested_split_k, c_tmp_or_none};
+      mul_topk_weights, size_m, size_n, size_k, requested_split_k};
   return dispatch_sm70_marlin_moe_geometry(launcher, geometry, group_size,
                                            "U8");
 }

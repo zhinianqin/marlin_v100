@@ -31,10 +31,8 @@ using marlin::sm70::configure_sm70_dynamic_smem;
 using marlin::sm70::kCtaK;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
-using marlin::sm70::launch_sm70_fp32_to_fp16;
 using marlin::sm70::sm70_marlin_moe_auto_stage_requested_split_k;
 using marlin::sm70::sm70_active_split_k;
-using marlin::sm70::sm70_get_splitk_ctmp;
 using marlin::sm70::sm70_splitk_partition;
 
 inline constexpr char const* kSupportedSm70MarlinMoeCtaGeometries =
@@ -511,12 +509,12 @@ class Sm70MoeScatterEpilogue {
                       int32_t const* __restrict__ sorted_token_ids,
                       float const* __restrict__ topk_weights,
                       cutlass::half_t* __restrict__ c,
-                      float* __restrict__ c_tmp, int n, int moe_block,
-                      int local_m_offset, int moe_block_size,
-                      int expanded_token_count, int padded_tokens,
-                      bool mul_topk_weights,
+                      int n, int moe_block, int local_m_offset,
+                      int moe_block_size, int expanded_token_count,
+                      int padded_tokens, bool mul_topk_weights,
                       bool atomic_store, float output_scale) const {
     float const* frag_ptr = reinterpret_cast<float const*>(&frag);
+    half* c_half = reinterpret_cast<half*>(c);
     int const thread_start_row = destination_iterator.thread_start_row();
     int const thread_start_column = destination_iterator.thread_start_column();
 
@@ -565,7 +563,7 @@ class Sm70MoeScatterEpilogue {
                 float const value =
                     frag_ptr[frag_base + e] * route_scale * output_scale;
                 if (atomic_store) {
-                  atomicAdd(c_tmp + offset, value);
+                  atomicAdd(c_half + offset, __float2half_rn(value));
                 } else {
                   c[offset] = cutlass::half_t(value);
                 }
@@ -599,10 +597,9 @@ class Sm70MoeScatterEpilogue {
                   int32_t const* __restrict__ sorted_token_ids,
                   float const* __restrict__ topk_weights,
                   cutlass::half_t* __restrict__ c,
-                  float* __restrict__ c_tmp, int n, int moe_block,
-                  int local_m_offset, int moe_block_size,
-                  int expanded_token_count, int padded_tokens,
-                  bool mul_topk_weights,
+                  int n, int moe_block, int local_m_offset,
+                  int moe_block_size, int expanded_token_count,
+                  int padded_tokens, bool mul_topk_weights,
                   bool atomic_store, float output_scale = 1.0f) {
     AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
 
@@ -639,7 +636,7 @@ class Sm70MoeScatterEpilogue {
       }
 
       store_fragment(destination_iterator, aligned_accum_fragment,
-                     sorted_token_ids, topk_weights, c, c_tmp, n, moe_block,
+                     sorted_token_ids, topk_weights, c, n, moe_block,
                      local_m_offset, moe_block_size, expanded_token_count,
                      padded_tokens, mul_topk_weights, atomic_store,
                      output_scale);
@@ -656,7 +653,7 @@ void sm70_marlin_moe_gemm_kernel(
     typename Traits::GemmSpec::ScaleElement const* __restrict__ b_scales,
     typename Traits::GemmSpec::ZeroElement const* __restrict__ b_zeros,
     float const* __restrict__ global_scale,
-    cutlass::half_t* __restrict__ c, float* __restrict__ c_tmp,
+    cutlass::half_t* __restrict__ c,
     int32_t const* __restrict__ sorted_token_ids,
     int32_t const* __restrict__ expert_ids,
     int32_t const* __restrict__ num_tokens_past_padded,
@@ -732,7 +729,7 @@ void sm70_marlin_moe_gemm_kernel(
     output_scale = global_scale[expert];
   }
   Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
-  epilogue(iterator_D, accumulators, sorted_token_ids, topk_weights, c, c_tmp, n,
+  epilogue(iterator_D, accumulators, sorted_token_ids, topk_weights, c, n,
            moe_block, local_m_offset, moe_block_size, m * top_k,
            padded_tokens, mul_topk_weights, SplitK, output_scale);
 }
@@ -745,7 +742,7 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
     bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
-    int requested_split_k, std::optional<torch::Tensor> const& c_tmp_or_none) {
+    int requested_split_k) {
   using Spec = typename Traits::GemmSpec;
   using SharedStorage = typename Traits::SharedStorage;
   constexpr int Warps = Traits::MmaCore::kThreads / 32;
@@ -774,7 +771,7 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
         reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
         reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
         b_scales_ptr, b_zeros_ptr, global_scale_ptr,
-        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()), nullptr,
+        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
         sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
         num_tokens_past_padded.data_ptr<int32_t>(),
         topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
@@ -793,10 +790,9 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * top_k * size_n;
-  auto c_tmp = sm70_get_splitk_ctmp(c_tmp_or_none, a.device(), numel);
   C10_CUDA_CHECK(cudaMemsetAsync(
-      c_tmp.data_ptr<float>(), 0,
-      static_cast<size_t>(numel) * sizeof(float), stream));
+      c.data_ptr<at::Half>(), 0,
+      static_cast<size_t>(numel) * sizeof(at::Half), stream));
 
   int const active_split_k =
       sm70_active_split_k(static_cast<int>(size_k), requested_split_k);
@@ -806,17 +802,11 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       b_scales_ptr, b_zeros_ptr, global_scale_ptr,
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
-      c_tmp.data_ptr<float>(), sorted_token_ids.data_ptr<int32_t>(),
+      sorted_token_ids.data_ptr<int32_t>(),
       expert_ids.data_ptr<int32_t>(), num_tokens_past_padded.data_ptr<int32_t>(),
       topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
       mul_topk_weights, int(size_m), int(size_n), int(size_k),
       int(a.stride(0)), requested_split_k);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  launch_sm70_fp32_to_fp16(
-      c_tmp.data_ptr<float>(),
-      reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()), numel,
-      stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return c;
 }

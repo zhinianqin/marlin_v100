@@ -1,15 +1,9 @@
 #pragma once
 
-#include <ATen/ATen.h>
-#include <c10/cuda/CUDAException.h>
-
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
-#include <torch/library.h>
-#include <torch/types.h>
 
 #include <cstdint>
-#include <optional>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/functional.h"
@@ -154,26 +148,6 @@ inline int sm70_marlin_moe_auto_stage_requested_split_k(
   return 1;
 }
 
-inline torch::Tensor sm70_get_splitk_ctmp(
-    std::optional<torch::Tensor> const& c_tmp_or_none, torch::Device device,
-    int64_t required_numel) {
-  if (!c_tmp_or_none.has_value()) {
-    return torch::empty({required_numel},
-                        torch::TensorOptions().dtype(at::kFloat).device(device));
-  }
-
-  torch::Tensor c_tmp = c_tmp_or_none.value();
-  TORCH_CHECK(c_tmp.device().is_cuda(), "c_tmp must be a CUDA tensor.");
-  TORCH_CHECK(c_tmp.device() == device,
-              "c_tmp device must match the activation device.");
-  TORCH_CHECK(c_tmp.scalar_type() == at::ScalarType::Float,
-              "c_tmp must have dtype torch.float32.");
-  TORCH_CHECK(c_tmp.is_contiguous(), "c_tmp must be contiguous.");
-  TORCH_CHECK(c_tmp.numel() >= required_numel, "c_tmp.numel = ", c_tmp.numel(),
-              " is smaller than M*N = ", required_numel, ".");
-  return c_tmp;
-}
-
 CUTLASS_HOST_DEVICE
 int sm70_splitk_ceil_div_int(int numerator, int denominator) {
   return (numerator + denominator - 1) / denominator;
@@ -257,7 +231,7 @@ CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
 }
 
 template <typename Traits>
-class Sm70AtomicFp32Epilogue {
+class Sm70AtomicFp16Epilogue {
  public:
   using CutlassEpilogue = typename Traits::Epilogue;
   using SharedStorage = typename CutlassEpilogue::Base::SharedStorage;
@@ -276,8 +250,9 @@ class Sm70AtomicFp32Epilogue {
   CUTLASS_DEVICE
   void atomic_store_fragment(OutputTileIterator const& destination_iterator,
                              typename SharedLoadIterator::Fragment const& frag,
-                             float* __restrict__ c_tmp, int n) const {
+                             cutlass::half_t* __restrict__ c, int n) const {
     float const* frag_ptr = reinterpret_cast<float const*>(&frag);
+    half* c_half = reinterpret_cast<half*>(c);
     int const thread_start_row = destination_iterator.thread_start_row();
     int const thread_start_column = destination_iterator.thread_start_column();
     int const extent_row = destination_iterator.extent_row();
@@ -310,9 +285,10 @@ class Sm70AtomicFp32Epilogue {
             if (logical_row < extent_row) {
               CUTLASS_PRAGMA_UNROLL
               for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
-                atomicAdd(c_tmp + int64_t(logical_row) * n +
-                              logical_column_base + e,
-                          frag_ptr[frag_base + e]);
+                int64_t const offset =
+                    int64_t(logical_row) * n + logical_column_base + e;
+                atomicAdd(c_half + offset,
+                          __float2half_rn(frag_ptr[frag_base + e]));
               }
             }
           }
@@ -323,7 +299,7 @@ class Sm70AtomicFp32Epilogue {
 
  public:
   CUTLASS_DEVICE
-  Sm70AtomicFp32Epilogue(SharedStorage& shared_storage, int thread_idx,
+  Sm70AtomicFp16Epilogue(SharedStorage& shared_storage, int thread_idx,
                               int warp_idx, int lane_idx)
       : warp_tile_iterator_(shared_storage.reference(), lane_idx),
         shared_load_iterator_(shared_storage.reference(), thread_idx) {
@@ -341,7 +317,7 @@ class Sm70AtomicFp32Epilogue {
   CUTLASS_DEVICE
   void operator()(OutputTileIterator destination_iterator,
                   AccumulatorTile const& accumulators,
-                  float* __restrict__ c_tmp, int n) {
+                  cutlass::half_t* __restrict__ c, int n) {
     AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
 
     CUTLASS_PRAGMA_UNROLL
@@ -376,46 +352,11 @@ class Sm70AtomicFp32Epilogue {
             CutlassEpilogue::kSmemPointerOffset);
       }
 
-      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c_tmp,
+      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c,
                             n);
       ++destination_iterator;
     }
   }
 };
-
-static __global__ void sm70_fp32_to_fp16_kernel(
-    float const* __restrict__ c_tmp, cutlass::half_t* __restrict__ c,
-    int64_t numel) {
-  int64_t const base =
-      (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
-  half* c_half = reinterpret_cast<half*>(c);
-
-  if (base + 3 < numel) {
-    float4 const values = *reinterpret_cast<float4 const*>(c_tmp + base);
-    half2* c_half2 = reinterpret_cast<half2*>(c_half + base);
-    c_half2[0] = __floats2half2_rn(values.x, values.y);
-    c_half2[1] = __floats2half2_rn(values.z, values.w);
-    return;
-  }
-
-  for (int offset = 0; offset < 4; ++offset) {
-    int64_t const idx = base + offset;
-    if (idx < numel) {
-      c_half[idx] = __float2half_rn(c_tmp[idx]);
-    }
-  }
-}
-
-inline void launch_sm70_fp32_to_fp16(float const* c_tmp,
-                                           cutlass::half_t* c,
-                                           int64_t numel,
-                                           cudaStream_t stream) {
-  dim3 convert_block(256);
-  dim3 convert_grid(static_cast<unsigned>(
-      (numel + int64_t(convert_block.x) * 4 - 1) /
-      (int64_t(convert_block.x) * 4)));
-  sm70_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream>>>(
-      c_tmp, c, numel);
-}
 
 }  // namespace marlin::sm70

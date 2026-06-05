@@ -83,8 +83,8 @@ class MarlinLinearKernel(MPLinearKernel):
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # Lazily grown split-K scratch buffer. The buffer is persistent on the
-        # kernel instance so repeated apply calls do not allocate in the hot path.
+        # Empty compatibility tensor. SM70 split-K reduces directly into the
+        # output tensor and must not allocate an fp32 c_tmp workspace.
         self.c_tmp = torch.empty(0, dtype=torch.float32, device=device)
         self.is_zp_float = False
 
@@ -224,14 +224,14 @@ class MarlinLinearKernel(MPLinearKernel):
         w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
 
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
-        #  None for marlin
-        c_tmp_numel = x.reshape(-1, x.shape[-1]).shape[0] * c.partition_weight_shape[1]
+        #  None for marlin.
         if (
             self.c_tmp.device != x.device
             or self.c_tmp.dtype != torch.float32
-            or self.c_tmp.numel() < c_tmp_numel
+            or not self.c_tmp.is_contiguous()
+            or self.c_tmp.numel() != 0
         ):
-            self.c_tmp = torch.empty(c_tmp_numel, dtype=torch.float32, device=x.device)
+            self.c_tmp = torch.empty(0, dtype=torch.float32, device=x.device)
 
         return apply_gptq_marlin_linear(
             input=x,

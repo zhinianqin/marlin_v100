@@ -339,7 +339,7 @@ def test_marlin_dense_smoke_local_helpers(repack_impl: str):
         w.shape[0],
         True,
         False,
-        True,
+        False,
         False,
     )
     assert output.shape == (a.shape[0], w.shape[1])
@@ -396,7 +396,7 @@ def _run_dense_accuracy_case(
         w.shape[0],
         is_k_full,
         False,
-        True,
+        False,
         False,
     )
     reference = marlin_dense_reference(
@@ -456,7 +456,7 @@ def _run_fp8_dense_accuracy_case(
         w.shape[0],
         True,
         False,
-        True,
+        False,
         False,
     )
     reference = marlin_dense_reference(
@@ -506,7 +506,7 @@ def _run_nvfp4_dense_accuracy_case(
         g_idx=g_idx,
         perm=sort_indices,
         is_k_full=True,
-        use_fp32_reduce=True,
+        use_fp32_reduce=False,
     )
     reference = torch.matmul(
         a.to(torch.float32),
@@ -547,7 +547,7 @@ def _run_mxfp4_dense_accuracy_case(
         g_idx=g_idx,
         perm=sort_indices,
         is_k_full=True,
-        use_fp32_reduce=True,
+        use_fp32_reduce=False,
     )
     reference = torch.matmul(
         a.to(torch.float32),
@@ -604,7 +604,7 @@ def _assert_dense_backend_rejects_act_order(
             w.shape[0],
             is_k_full,
             False,
-            True,
+            False,
             False,
         )
 
@@ -618,10 +618,10 @@ def _run_dense_uint4_zp_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
-    use_fp32_reduce: bool = True,
+    use_fp32_reduce: bool = False,
     c_tmp: torch.Tensor | None = None,
 ) -> None:
-    if not use_fp32_reduce or c_tmp is not None:
+    if use_fp32_reduce or c_tmp is not None:
         _run_dense_uint4_zp_raw_accuracy_case(
             repack_impl=repack_impl,
             group_size=group_size,
@@ -671,7 +671,7 @@ def _run_dense_uint4_zp_raw_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
-    use_fp32_reduce: bool = True,
+    use_fp32_reduce: bool = False,
     c_tmp: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
@@ -815,7 +815,7 @@ def _run_dense_uint8_zp_raw_accuracy_case(
         w.shape[0],
         True,
         False,
-        True,
+        False,
         True,
     )
     reference = torch.matmul(a.to(torch.float32), dequantized.to(torch.float32)).to(
@@ -1000,7 +1000,7 @@ def test_marlin_dense_auto_split_k_quant_matches_reference(
     ("quant_name", "group_size", "size_k", "rtol", "atol"),
     _SPLIT_K_QUANT_CASES,
 )
-def test_marlin_dense_auto_split_k_quant_reuses_c_tmp_matches_reference(
+def test_marlin_dense_auto_split_k_quant_keeps_empty_c_tmp_matches_reference(
     quant_name: str,
     group_size: int,
     size_k: int,
@@ -1009,7 +1009,7 @@ def test_marlin_dense_auto_split_k_quant_reuses_c_tmp_matches_reference(
 ):
     if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
         pytest.skip(f"{quant_name} dense path is not supported in this build")
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 16 * 256)
+    c_tmp = marlin_make_c_tmp(torch.device("cuda"))
     _run_split_k_quant_accuracy_case(
         quant_name,
         group_size=group_size,
@@ -1020,13 +1020,14 @@ def test_marlin_dense_auto_split_k_quant_reuses_c_tmp_matches_reference(
         atol=atol,
         c_tmp=c_tmp,
     )
+    assert c_tmp.numel() == 0
 
 
 @pytest.mark.parametrize(
     ("quant_name", "group_size", "_size_k", "rtol", "atol"),
     _SPLIT_K_QUANT_CASES,
 )
-def test_marlin_dense_no_split_quant_accepts_unused_c_tmp(
+def test_marlin_dense_no_split_quant_rejects_non_empty_c_tmp(
     quant_name: str,
     group_size: int,
     _size_k: int,
@@ -1036,16 +1037,17 @@ def test_marlin_dense_no_split_quant_accepts_unused_c_tmp(
     if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
         pytest.skip(f"{quant_name} dense path is not supported in this build")
     c_tmp = marlin_make_c_tmp(torch.device("cuda"), 1)
-    _run_split_k_quant_accuracy_case(
-        quant_name,
-        group_size=group_size,
-        size_m=16,
-        size_k=256,
-        size_n=256,
-        rtol=rtol,
-        atol=atol,
-        c_tmp=c_tmp,
-    )
+    with pytest.raises(RuntimeError, match="empty c_tmp"):
+        _run_split_k_quant_accuracy_case(
+            quant_name,
+            group_size=group_size,
+            size_m=16,
+            size_k=256,
+            size_n=256,
+            rtol=rtol,
+            atol=atol,
+            c_tmp=c_tmp,
+        )
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
@@ -1201,7 +1203,7 @@ def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -1387,8 +1389,8 @@ def test_marlin_dense_uint4_zp_auto_split_k_large_k_smoke_matches_reference():
     )
 
 
-def test_marlin_dense_uint4_zp_auto_split_k_reuses_c_tmp_matches_reference():
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 16 * 256)
+def test_marlin_dense_uint4_zp_auto_split_k_keeps_empty_c_tmp_matches_reference():
+    c_tmp = marlin_make_c_tmp(torch.device("cuda"))
     _run_dense_uint4_zp_accuracy_case(
         repack_impl="gptq",
         group_size=128,
@@ -1399,24 +1401,26 @@ def test_marlin_dense_uint4_zp_auto_split_k_reuses_c_tmp_matches_reference():
         size_n=256,
         c_tmp=c_tmp,
     )
+    assert c_tmp.numel() == 0
 
 
-def test_marlin_dense_uint4_zp_no_split_accepts_unused_c_tmp():
+def test_marlin_dense_uint4_zp_no_split_rejects_non_empty_c_tmp():
     c_tmp = marlin_make_c_tmp(torch.device("cuda"), 1)
-    _run_dense_uint4_zp_accuracy_case(
-        repack_impl="gptq",
-        group_size=128,
-        rtol=5e-2,
-        atol=2.5e-1,
-        size_m=16,
-        size_k=256,
-        size_n=256,
-        c_tmp=c_tmp,
-    )
+    with pytest.raises(RuntimeError, match="empty c_tmp"):
+        _run_dense_uint4_zp_accuracy_case(
+            repack_impl="gptq",
+            group_size=128,
+            rtol=5e-2,
+            atol=2.5e-1,
+            size_m=16,
+            size_k=256,
+            size_n=256,
+            c_tmp=c_tmp,
+        )
 
 
-def test_marlin_dense_uint4_zp_auto_split_k_requires_fp32_reduce():
-    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=True"):
+def test_marlin_dense_uint4_zp_auto_split_k_rejects_fp32_reduce():
+    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=false"):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl="gptq",
             group_size=128,
@@ -1425,13 +1429,13 @@ def test_marlin_dense_uint4_zp_auto_split_k_requires_fp32_reduce():
             size_m=16,
             size_k=4096,
             size_n=256,
-            use_fp32_reduce=False,
+            use_fp32_reduce=True,
         )
 
 
-def test_marlin_dense_uint4_zp_auto_split_k_rejects_small_c_tmp():
+def test_marlin_dense_uint4_zp_auto_split_k_rejects_non_empty_c_tmp():
     c_tmp = marlin_make_c_tmp(torch.device("cuda"), 16 * 256 - 1)
-    with pytest.raises(RuntimeError, match=r"c_tmp\.numel.*M\*N"):
+    with pytest.raises(RuntimeError, match="empty c_tmp"):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl="gptq",
             group_size=128,
@@ -1445,27 +1449,17 @@ def test_marlin_dense_uint4_zp_auto_split_k_rejects_small_c_tmp():
 
 
 @pytest.mark.parametrize(
-    ("make_c_tmp", "message"),
+    "make_c_tmp",
     (
-        (
-            lambda device: torch.empty((16, 256), device=device, dtype=torch.float16),
-            "dtype torch.float32",
-        ),
-        (
-            lambda device: torch.empty((16, 256), device=device, dtype=torch.float32).t(),
-            "contiguous",
-        ),
-        (
-            lambda device: torch.empty((16, 256), dtype=torch.float32),
-            "CUDA tensor",
-        ),
+        lambda device: torch.empty((16, 256), device=device, dtype=torch.float16),
+        lambda device: torch.empty((16, 256), device=device, dtype=torch.float32).t(),
+        lambda device: torch.empty((16, 256), dtype=torch.float32),
     ),
 )
-def test_marlin_dense_uint4_zp_auto_split_k_rejects_invalid_c_tmp(
+def test_marlin_dense_uint4_zp_auto_split_k_rejects_non_empty_c_tmp_variants(
     make_c_tmp,
-    message: str,
 ):
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(RuntimeError, match="empty c_tmp"):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl="gptq",
             group_size=128,
@@ -1478,8 +1472,8 @@ def test_marlin_dense_uint4_zp_auto_split_k_rejects_invalid_c_tmp(
         )
 
 
-def test_marlin_dense_uint4_zp_rejects_fp16_reduce_without_split_k():
-    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=True"):
+def test_marlin_dense_uint4_zp_rejects_fp32_reduce_without_split_k():
+    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=false"):
         _run_dense_uint4_zp_accuracy_case(
             repack_impl="gptq",
             group_size=128,
@@ -1488,7 +1482,7 @@ def test_marlin_dense_uint4_zp_rejects_fp16_reduce_without_split_k():
             size_m=8,
             size_k=256,
             size_n=256,
-            use_fp32_reduce=False,
+            use_fp32_reduce=True,
         )
 
 
@@ -1559,7 +1553,7 @@ def test_marlin_dense_uint4_zp_requires_zeros():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -1592,7 +1586,7 @@ def test_marlin_dense_uint8_zp_requires_zeros():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -1627,7 +1621,7 @@ def test_marlin_dense_uint4_zp_rejects_packed_zero_points():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             True,
         )
 
@@ -1665,7 +1659,7 @@ def test_marlin_dense_uint8_zp_rejects_packed_zero_points():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             True,
         )
 
@@ -1701,7 +1695,7 @@ def test_marlin_dense_uint4b8_rejects_zp_metadata():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             True,
         )
 
@@ -1734,7 +1728,7 @@ def test_marlin_dense_uint8_zp_rejects_zeros_without_flag():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -1770,7 +1764,7 @@ def test_marlin_dense_uint8b128_rejects_zp_metadata():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             True,
         )
 
@@ -1805,7 +1799,7 @@ def test_marlin_dense_uint8b128_rejects_is_zp_float_without_metadata():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             True,
         )
 
@@ -1838,7 +1832,7 @@ def test_marlin_dense_uint4_zp_rejects_zeros_without_flag():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -1874,7 +1868,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
             w.shape[0],
             True,
             False,
-            True,
+            False,
             True,
         )
 
@@ -2013,7 +2007,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2051,7 +2045,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 bad_k,
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2079,7 +2073,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 size_k,
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2113,7 +2107,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -2142,7 +2136,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2169,7 +2163,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2192,7 +2186,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2215,7 +2209,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2239,7 +2233,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 True,
             )
 
@@ -2262,7 +2256,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 True,
             )
 
@@ -2285,7 +2279,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 False,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2334,7 +2328,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2357,7 +2351,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2380,7 +2374,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2415,7 +2409,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2438,7 +2432,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2461,7 +2455,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2484,7 +2478,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 True,
             )
 
@@ -2507,7 +2501,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 False,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2556,7 +2550,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2579,7 +2573,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2605,7 +2599,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2637,7 +2631,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -2667,7 +2661,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2690,7 +2684,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2713,7 +2707,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2736,7 +2730,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 True,
             )
 
@@ -2759,7 +2753,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 False,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2798,7 +2792,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 bad_k,
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2828,7 +2822,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 size_k,
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -2873,7 +2867,7 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes(repack
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
         return
@@ -2899,7 +2893,7 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes(repack
             w.shape[0],
             True,
             False,
-            True,
+            False,
             False,
         )
 
@@ -2946,7 +2940,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                     w.shape[0],
                     True,
                     False,
-                    True,
+                    False,
                     False,
                 )
             return
@@ -2972,7 +2966,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -3000,7 +2994,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )
 
@@ -3028,6 +3022,6 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 w.shape[0],
                 True,
                 False,
-                True,
+                False,
                 False,
             )

@@ -47,26 +47,23 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
 
-def _ensure_marlin_moe_c_tmp(
+def _marlin_moe_empty_c_tmp(
     c_tmp: torch.Tensor | None,
     c_tmp_owner: torch.nn.Module | None,
     device: torch.device,
-    required_numel: int,
 ) -> torch.Tensor:
     if c_tmp_owner is not None:
         c_tmp = getattr(c_tmp_owner, "c_tmp", c_tmp)
 
-    needs_alloc = (
+    needs_empty = (
         c_tmp is None
         or c_tmp.device != device
         or c_tmp.dtype != torch.float32
         or not c_tmp.is_contiguous()
-        or c_tmp.numel() < required_numel
+        or c_tmp.numel() != 0
     )
-    if needs_alloc:
-        c_tmp = torch.empty(
-            required_numel, dtype=torch.float32, device=device, requires_grad=False
-        )
+    if needs_empty:
+        c_tmp = marlin_make_c_tmp(device)
 
     if c_tmp_owner is not None:
         c_tmp_owner.c_tmp = c_tmp
@@ -118,11 +115,10 @@ def _fused_marlin_moe(
     M, K = hidden_states.size()
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
-    c_tmp = _ensure_marlin_moe_c_tmp(
+    c_tmp = _marlin_moe_empty_c_tmp(
         c_tmp=c_tmp,
         c_tmp_owner=c_tmp_owner,
         device=hidden_states.device,
-        required_numel=M * num_topk * max(w13_num_shards * N, K),
     )
 
     if intermediate_cache13 is None:
@@ -180,7 +176,7 @@ def _fused_marlin_moe(
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_fp32_reduce=False,
         is_zp_float=is_w1_zp_float,
     )
     activation_func(
@@ -232,7 +228,7 @@ def _fused_marlin_moe(
         size_k=N,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=True,
+        use_fp32_reduce=False,
         is_zp_float=is_w2_zp_float,
     )
 

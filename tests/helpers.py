@@ -71,7 +71,7 @@ _SM70_ROW_GROUPS = (
 
 def marlin_make_c_tmp(
     device: torch.device,
-    numel_or_shape: int | tuple[int, ...],
+    numel_or_shape: int | tuple[int, ...] = 0,
 ) -> torch.Tensor:
     if isinstance(numel_or_shape, tuple):
         return torch.empty(numel_or_shape, dtype=torch.float32, device=device)
@@ -128,7 +128,7 @@ def run_marlin_gemm(
     perm: torch.Tensor | None = None,
     is_k_full: bool = True,
     use_atomic_add: bool = False,
-    use_fp32_reduce: bool = True,
+    use_fp32_reduce: bool = False,
     is_zp_float: bool | None = None,
 ) -> torch.Tensor:
     if is_zp_float is None:
@@ -264,7 +264,7 @@ def fused_marlin_moe(
         k,
         is_k_full,
         False,
-        True,
+        False,
         is_w1_zp_float,
         -1,
         -1,
@@ -298,7 +298,7 @@ def fused_marlin_moe(
         n,
         is_k_full,
         False,
-        True,
+        False,
         is_w2_zp_float,
         -1,
         -1,

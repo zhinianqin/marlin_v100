@@ -35,8 +35,7 @@ torch::Tensor sm70_marlin_u4_gemm(
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
-    std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);
 
 torch::Tensor sm70_marlin_u4b8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
@@ -44,7 +43,7 @@ torch::Tensor sm70_marlin_u4b8_gemm(
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
     bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
-    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t group_size);
 
 torch::Tensor sm70_marlin_u8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
@@ -52,8 +51,7 @@ torch::Tensor sm70_marlin_u8_gemm(
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
-    std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);
 
 torch::Tensor sm70_marlin_u8b128_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
@@ -61,7 +59,7 @@ torch::Tensor sm70_marlin_u8b128_gemm(
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
     bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
-    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t group_size);
 
 torch::Tensor sm70_marlin_fp8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
@@ -69,7 +67,7 @@ torch::Tensor sm70_marlin_fp8_gemm(
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
     bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
-    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t group_size);
 
 torch::Tensor sm70_marlin_nvfp4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
@@ -77,8 +75,7 @@ torch::Tensor sm70_marlin_nvfp4_gemm(
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
-    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size,
-    std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);
 
 torch::Tensor sm70_marlin_mxfp4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
@@ -86,7 +83,7 @@ torch::Tensor sm70_marlin_mxfp4_gemm(
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
     bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
-    int64_t group_size, std::optional<torch::Tensor> const& c_tmp_or_none);
+    int64_t group_size);
 
 }  // namespace MARLIN_NAMESPACE_NAME
 
@@ -186,8 +183,13 @@ torch::Tensor moe_wna16_marlin_gemm(
                   b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
               "SM70 Marlin MoE supports uint4, uint4b8, uint8, "
               "uint8b128, fp8_e4m3fn, nvfp4, and mxfp4 weights.");
-  TORCH_CHECK(use_fp32_reduce,
-              "SM70 Marlin MoE requires use_fp32_reduce=True.");
+  TORCH_CHECK(!use_fp32_reduce,
+              "SM70 Marlin MoE requires use_fp32_reduce=false.");
+  if (c_tmp_or_none.has_value()) {
+    TORCH_CHECK(c_tmp_or_none.value().numel() == 0,
+                "SM70 Marlin MoE requires an empty c_tmp tensor because "
+                "split-K reduces directly into the output tensor.");
+  }
 
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
@@ -429,7 +431,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
         a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+        mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kU8) {
@@ -438,7 +440,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u8_gemm(
         a, c, b_q_weight, b_scales, b_zeros, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+        mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kU4B8) {
@@ -448,7 +450,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u4b8_gemm(
         a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+        mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kU8B128) {
@@ -458,7 +460,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u8b128_gemm(
         a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+        mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kFE4M3fn) {
@@ -471,7 +473,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     return MARLIN_NAMESPACE_NAME::sm70_marlin_fp8_gemm(
         a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+        mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
   if (b_type == vllm::kFE2M1f) {
@@ -487,7 +489,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       return MARLIN_NAMESPACE_NAME::sm70_marlin_nvfp4_gemm(
           a, c, b_q_weight, b_scales, global_scale, sorted_token_ids, expert_ids,
           num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-          mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+          mul_topk_weights, size_m, size_n, size_k, group_size);
     }
 
     TORCH_CHECK(s_type == vllm::kFE8M0fnu,
@@ -499,7 +501,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     return MARLIN_NAMESPACE_NAME::sm70_marlin_mxfp4_gemm(
         a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, group_size, c_tmp_or_none);
+        mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
   TORCH_CHECK(false, "Unsupported SM70 Marlin MoE weight type.");
