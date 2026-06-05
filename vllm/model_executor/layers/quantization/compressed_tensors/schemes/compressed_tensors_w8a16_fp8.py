@@ -50,8 +50,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # turing and up
-        return 75
+        return 70
 
     def create_weights(
         self,

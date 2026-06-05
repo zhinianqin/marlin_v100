@@ -43,9 +43,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_act_int8_process_scales,
     marlin_make_c_tmp,
-    marlin_moe_permute_scales,
     marlin_permute_bias,
     marlin_repeat_scales_on_all_ranks,
+    sm70_marlin_moe_logical_scales,
     verify_marlin_supported,
 )
 from vllm.model_executor.parameter import (
@@ -181,7 +181,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 70
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -740,8 +740,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         # Alias for modular kernel
         layer.w2_weight = layer.w2_qweight
 
-        # Repack scales
-        marlin_w13_scales = marlin_moe_permute_scales(
+        # Prepare logical-N metadata for the SM70 Marlin kernels.
+        marlin_w13_scales = sm70_marlin_moe_logical_scales(
             s=layer.w13_scales,
             size_k=layer.intermediate_size_per_partition,
             size_n=layer.w13_scales.shape[2],
@@ -758,7 +758,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             )
 
         replace_parameter(layer, "w13_scales", marlin_w13_scales)
-        marlin_w2_scales = marlin_moe_permute_scales(
+        marlin_w2_scales = sm70_marlin_moe_logical_scales(
             s=layer.w2_scales,
             size_k=layer.w2_scales.shape[1]
             * (

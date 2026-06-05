@@ -11,8 +11,8 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_make_c_tmp,
     marlin_permute_bias,
-    marlin_permute_scales,
     should_use_atomic_add_reduce,
+    sm70_marlin_logical_scales,
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -134,7 +134,7 @@ def prepare_fp8_layer_for_marlin(
     replace_parameter(layer, "weight", marlin_qweight)
 
     # WEIGHT SCALES
-    # Permute scales
+    # Prepare logical-N metadata for the SM70 Marlin kernels.
     if "weight_scale" in dir(layer):
         scales = layer.weight_scale.to(layer.orig_dtype)
     elif "weight_scale_inv" in dir(layer):
@@ -182,7 +182,7 @@ def prepare_fp8_layer_for_marlin(
         # size_n may not divisible by block_size[0]
         scales = scales[:, :part_size_n]
 
-    marlin_scales = marlin_permute_scales(
+    marlin_scales = sm70_marlin_logical_scales(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
     if input_dtype != torch.float8_e4m3fn:
@@ -261,7 +261,7 @@ def prepare_fp8_moe_layer_for_marlin(
     w2_weight = repack_weight("w2", w2_weight)
 
     # WEIGHT SCALES
-    # Permute scales
+    # Prepare logical-N metadata for the SM70 Marlin kernels.
     group_size = -1 if weight_block_size is None else weight_block_size[1]
 
     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
@@ -302,7 +302,7 @@ def prepare_fp8_moe_layer_for_marlin(
             scales = scales[..., :size_n].contiguous()
 
         for i in range(e):
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scales[i], size_k=size_k, size_n=size_n, group_size=group_size
             )
             tensor_list.append(marlin_scales)
@@ -365,7 +365,7 @@ def marlin_quant_fp8_torch(weight, group_size, input_dtype=None):
         is_a_8bit=is_a_8bit,
     )
 
-    marlin_scales = marlin_permute_scales(
+    marlin_scales = sm70_marlin_logical_scales(
         s=scales.T,
         size_k=size_k,
         size_n=size_n,

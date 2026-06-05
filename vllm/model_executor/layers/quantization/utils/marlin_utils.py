@@ -53,7 +53,7 @@ def query_marlin_supported_quant_types(
                 -1 if capability_tuple is None else capability_tuple.to_int()
             )
 
-        if device_capability < 75:
+        if device_capability < 70:
             return []
 
     # - has_zp is True: return quant_types that has zero points
@@ -305,6 +305,14 @@ def marlin_permute_scales(
     return s
 
 
+def sm70_marlin_logical_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+) -> torch.Tensor:
+    """Return SM70 metadata in logical N-contiguous order."""
+    del size_k, group_size, is_a_8bit
+    return s.reshape((-1, size_n)).contiguous()
+
+
 def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
     origin_shape = s.shape
     _, scale_perm_single = get_scale_perms()
@@ -332,6 +340,14 @@ def marlin_moe_permute_scales(
     for e in range(num_experts):
         output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size, is_a_8bit)
     return output
+
+
+def sm70_marlin_moe_logical_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+) -> torch.Tensor:
+    """Return SM70 MoE metadata as [experts, groups, N] logical order."""
+    del size_k, group_size, is_a_8bit
+    return s.reshape((s.shape[0], -1, size_n)).contiguous()
 
 
 def marlin_zero_points(
@@ -417,6 +433,37 @@ def awq_to_marlin_zero_points_float(
     )
 
 
+def awq_to_sm70_marlin_zero_points_float(
+    q_zp_packed: torch.Tensor,
+    scales: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+    scale_size_k: int,
+    group_size: int,
+    is_a_8bit: bool = False,
+) -> torch.Tensor:
+    q_zp = unpack_cols(q_zp_packed, num_bits, size_k, size_n)
+
+    if num_bits == 4:
+        undo_interleave = numpy.argsort(numpy.array([0, 2, 4, 6, 1, 3, 5, 7]))
+    elif num_bits == 8:
+        undo_interleave = numpy.argsort(numpy.array([0, 2, 1, 3]))
+    else:
+        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    q_zp = q_zp.reshape((-1, len(undo_interleave)))[:, undo_interleave].ravel()
+    q_zp = q_zp.reshape((-1, size_n)).contiguous()
+    zp_float = (q_zp.float() * scales.contiguous().float()).to(scales.dtype)
+    return sm70_marlin_logical_scales(
+        zp_float,
+        size_k=scale_size_k,
+        size_n=size_n,
+        group_size=group_size,
+        is_a_8bit=is_a_8bit,
+    )
+
+
 def moe_awq_to_marlin_zero_points(
     q_zp_packed: torch.Tensor,
     size_k: int,
@@ -455,6 +502,36 @@ def moe_awq_to_marlin_zero_points_float(
     )
     for e in range(num_experts):
         output[e] = awq_to_marlin_zero_points_float(
+            q_zp_packed[e],
+            scales[e],
+            size_k,
+            size_n,
+            num_bits,
+            scale_size_k,
+            group_size,
+            is_a_8bit,
+        )
+    return output
+
+
+def moe_awq_to_sm70_marlin_zero_points_float(
+    q_zp_packed: torch.Tensor,
+    scales: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+    scale_size_k: int,
+    group_size: int,
+    is_a_8bit: bool = False,
+):
+    num_experts = q_zp_packed.shape[0]
+    output = torch.empty(
+        (num_experts, scales.shape[1], scales.shape[2]),
+        device=q_zp_packed.device,
+        dtype=scales.dtype,
+    )
+    for e in range(num_experts):
+        output[e] = awq_to_sm70_marlin_zero_points_float(
             q_zp_packed[e],
             scales[e],
             size_k,

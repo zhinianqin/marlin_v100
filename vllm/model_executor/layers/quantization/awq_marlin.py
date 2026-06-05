@@ -44,9 +44,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_act_int8_process_scales,
     marlin_make_c_tmp,
-    marlin_moe_permute_scales,
     marlin_permute_bias,
-    moe_awq_to_marlin_zero_points_float,
+    moe_awq_to_sm70_marlin_zero_points_float,
+    sm70_marlin_moe_logical_scales,
     verify_marlin_supported,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
@@ -208,7 +208,7 @@ class AWQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 70
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -665,7 +665,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         w2_scales = layer.w2_scales.data.contiguous()
 
         # Why does this take the intermediate size for size_k?
-        marlin_w13_scales = marlin_moe_permute_scales(
+        marlin_w13_scales = sm70_marlin_moe_logical_scales(
             s=w13_scales,
             size_k=layer.intermediate_size_per_partition,
             size_n=w13_scales.shape[2],
@@ -683,7 +683,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
 
         replace_parameter(layer, "w13_scales", marlin_w13_scales)
 
-        marlin_w2_scales = marlin_moe_permute_scales(
+        marlin_w2_scales = sm70_marlin_moe_logical_scales(
             s=w2_scales,
             size_k=layer.intermediate_size_per_partition,
             size_n=w2_scales.shape[2],
@@ -701,7 +701,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
 
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
-        marlin_w13_zp = moe_awq_to_marlin_zero_points_float(
+        marlin_w13_zp = moe_awq_to_sm70_marlin_zero_points_float(
             layer.w13_qzeros,
             w13_scales,
             size_k=layer.w13_qzeros.shape[1],
@@ -713,7 +713,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w13_qzeros", marlin_w13_zp)
 
-        marlin_w2_zp = moe_awq_to_marlin_zero_points_float(
+        marlin_w2_zp = moe_awq_to_sm70_marlin_zero_points_float(
             layer.w2_qzeros,
             w2_scales,
             size_k=layer.w2_qzeros.shape[1],

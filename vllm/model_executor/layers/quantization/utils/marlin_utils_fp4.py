@@ -11,9 +11,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_make_c_tmp,
     marlin_permute_bias,
-    marlin_permute_scales,
     marlin_quant_input,
     should_use_atomic_add_reduce,
+    sm70_marlin_logical_scales,
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -240,14 +240,14 @@ def prepare_fp4_layer_for_marlin(
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
     # WEIGHT SCALES
-    # Permute scales
+    # Prepare logical-N metadata for the SM70 Marlin kernels.
     weight_scale = layer.weight_scale.T.contiguous()
 
     if not is_nvfp4:
         weight_scale = weight_scale.view(torch.float8_e8m0fnu)
 
     weight_scale = weight_scale.to(param_dtype)
-    weight_scale = marlin_permute_scales(
+    weight_scale = sm70_marlin_logical_scales(
         s=weight_scale,
         size_k=part_size_k,
         size_n=part_size_n,
@@ -349,7 +349,7 @@ def prepare_nvfp4_moe_layer_for_marlin(
     w2 = repack_weight(w2, "w2")
 
     # WEIGHT SCALES
-    # Permute scales
+    # Prepare logical-N metadata for the SM70 Marlin kernels.
     def premute_scales(
         scales: torch.Tensor, g_scales: torch.Tensor, name: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -368,7 +368,7 @@ def prepare_nvfp4_moe_layer_for_marlin(
 
         for i in range(E):
             scale = scales[i].T
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
@@ -444,7 +444,7 @@ def prepare_moe_fp4_layer_for_marlin(
         setattr(layer, name, weight)
 
     # WEIGHT SCALES
-    # Permute scales
+    # Prepare logical-N metadata for the SM70 Marlin kernels.
     for name in ["w13", "w2"]:
         scales = getattr(layer, name + "_weight_scale")
         if not is_nvfp4:
@@ -467,7 +467,7 @@ def prepare_moe_fp4_layer_for_marlin(
         for i in range(e):
             scale = scales[i].T
 
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
@@ -584,7 +584,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")
 
-    # WEIGHT SCALES: Permute scales
+    # WEIGHT SCALES: prepare logical-N metadata for SM70.
     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
         scales = scales.view(torch.float8_e8m0fnu)
         scales = scales.to(param_dtype)
@@ -597,7 +597,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
         for i in range(e):
             scale = scales[i].T
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
@@ -671,7 +671,7 @@ def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
         is_a_8bit=is_a_8bit,
     )
 
-    marlin_scales = marlin_permute_scales(
+    marlin_scales = sm70_marlin_logical_scales(
         s=scales.T.to(weight.dtype),
         size_k=size_k,
         size_n=size_n,
@@ -734,7 +734,7 @@ def rand_marlin_weight_mxfp4_like(weight, group_size, input_dtype=None):
         is_a_8bit=is_a_8bit,
     )
 
-    marlin_scales = marlin_permute_scales(
+    marlin_scales = sm70_marlin_logical_scales(
         s=scales.T.to(weight.dtype),
         size_k=size_k,
         size_n=size_n,

@@ -13,10 +13,10 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_is_k_full,
     marlin_make_empty_g_idx,
     marlin_permute_bias,
-    marlin_permute_scales,
     marlin_sort_g_idx,
     marlin_zero_points,
     query_marlin_supported_quant_types,
+    sm70_marlin_logical_scales,
     unpack_cols,
 )
 from vllm.model_executor.layers.quantization.utils import replace_parameter
@@ -30,7 +30,7 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 class MarlinLinearKernel(MPLinearKernel):
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 70
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
@@ -111,7 +111,7 @@ class MarlinLinearKernel(MPLinearKernel):
         def transform_w_s(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = marlin_permute_scales(
+            x.data = sm70_marlin_logical_scales(
                 x.data.contiguous(),
                 size_k=c.partition_weight_shape[0],
                 size_n=c.partition_weight_shape[1],
@@ -178,7 +178,7 @@ class MarlinLinearKernel(MPLinearKernel):
                         unpacked_zp.to(torch.float32)
                         * logical_scales.to(torch.float32)
                     ).to(logical_scales.dtype)
-                    x.data = marlin_permute_scales(
+                    x.data = sm70_marlin_logical_scales(
                         zp_float.contiguous(),
                         size_k=c.partition_weight_shape[0],
                         size_n=c.partition_weight_shape[1],

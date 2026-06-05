@@ -75,7 +75,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_act_int8_process_scales,
     marlin_make_c_tmp,
-    marlin_moe_permute_scales,
+    sm70_marlin_moe_logical_scales,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_moe_fp4_layer_for_marlin,
@@ -1513,8 +1513,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         )
         replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
 
-        # Repack scales
-        marlin_w13_scales = marlin_moe_permute_scales(
+        # Prepare logical-N metadata for the SM70 Marlin kernels.
+        marlin_w13_scales = sm70_marlin_moe_logical_scales(
             s=layer.w13_weight_scale,
             size_k=layer.w13_weight_packed.shape[2],
             size_n=layer.w13_weight_scale.shape[2],
@@ -1531,7 +1531,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             )
         replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
 
-        marlin_w2_scales = marlin_moe_permute_scales(
+        marlin_w2_scales = sm70_marlin_moe_logical_scales(
             s=layer.w2_weight_scale,
             size_k=layer.w2_weight_scale.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),

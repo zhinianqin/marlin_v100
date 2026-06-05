@@ -480,22 +480,22 @@ def _patch_moe_post_load_mocks(
         import vllm.model_executor.layers.quantization.gptq_marlin as gptq_mod
 
         monkeypatch.setattr(gptq_mod.ops, "gptq_marlin_moe_repack", fake_repack)
-        monkeypatch.setattr(gptq_mod, "marlin_moe_permute_scales", fake_permute_scales)
+        monkeypatch.setattr(gptq_mod, "sm70_marlin_moe_logical_scales", fake_permute_scales)
     elif class_name == "awq_moe":
         import vllm.model_executor.layers.quantization.awq_marlin as awq_mod
 
         monkeypatch.setattr(awq_mod.ops, "awq_marlin_moe_repack", fake_repack)
-        monkeypatch.setattr(awq_mod, "marlin_moe_permute_scales", fake_permute_scales)
+        monkeypatch.setattr(awq_mod, "sm70_marlin_moe_logical_scales", fake_permute_scales)
         monkeypatch.setattr(
             awq_mod,
-            "moe_awq_to_marlin_zero_points_float",
+            "moe_awq_to_sm70_marlin_zero_points_float",
             fake_awq_float_zp,
         )
     elif class_name == "compressed_tensors_wna16_moe":
         import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe as ct_mod
 
         monkeypatch.setattr(ct_mod.ops, "gptq_marlin_moe_repack", fake_repack)
-        monkeypatch.setattr(ct_mod, "marlin_moe_permute_scales", fake_permute_scales)
+        monkeypatch.setattr(ct_mod, "sm70_marlin_moe_logical_scales", fake_permute_scales)
     else:
         raise AssertionError(f"Unhandled MoE class {class_name!r}")
 
@@ -525,12 +525,12 @@ def _install_all_moe_post_load_mocks(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm.model_executor.layers.quantization.gptq_marlin as gptq_mod
 
     monkeypatch.setattr(gptq_mod.ops, "gptq_marlin_moe_repack", fake_repack)
-    monkeypatch.setattr(gptq_mod, "marlin_moe_permute_scales", fake_permute_scales)
+    monkeypatch.setattr(gptq_mod, "sm70_marlin_moe_logical_scales", fake_permute_scales)
     monkeypatch.setattr(awq_mod.ops, "awq_marlin_moe_repack", fake_repack)
-    monkeypatch.setattr(awq_mod, "marlin_moe_permute_scales", fake_permute_scales)
-    monkeypatch.setattr(awq_mod, "moe_awq_to_marlin_zero_points_float", fake_awq_float_zp)
+    monkeypatch.setattr(awq_mod, "sm70_marlin_moe_logical_scales", fake_permute_scales)
+    monkeypatch.setattr(awq_mod, "moe_awq_to_sm70_marlin_zero_points_float", fake_awq_float_zp)
     monkeypatch.setattr(ct_mod.ops, "gptq_marlin_moe_repack", fake_repack)
-    monkeypatch.setattr(ct_mod, "marlin_moe_permute_scales", fake_permute_scales)
+    monkeypatch.setattr(ct_mod, "sm70_marlin_moe_logical_scales", fake_permute_scales)
 
 
 def _make_gptq_moe_matrix_case(
@@ -1067,7 +1067,7 @@ def test_gptq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     )
     monkeypatch.setattr(
         gptq_mod,
-        "marlin_moe_permute_scales",
+        "sm70_marlin_moe_logical_scales",
         lambda s, *args, **kwargs: s.detach().clone().contiguous(),
     )
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
@@ -1106,7 +1106,7 @@ def test_gptq_marlin_moe_method_class_uses_owner(
     )
     monkeypatch.setattr(
         gptq_mod,
-        "marlin_moe_permute_scales",
+        "sm70_marlin_moe_logical_scales",
         lambda s, *args, **kwargs: s.detach().clone().contiguous(),
     )
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
@@ -1151,7 +1151,7 @@ def test_awq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     )
     monkeypatch.setattr(
         awq_mod,
-        "marlin_moe_permute_scales",
+        "sm70_marlin_moe_logical_scales",
         lambda s, *args, **kwargs: s.detach().clone().contiguous(),
     )
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
@@ -1196,7 +1196,7 @@ def test_awq_marlin_moe_method_class_uses_owner(
     )
     monkeypatch.setattr(
         awq_mod,
-        "marlin_moe_permute_scales",
+        "sm70_marlin_moe_logical_scales",
         lambda s, *args, **kwargs: s.detach().clone().contiguous(),
     )
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
@@ -1239,7 +1239,7 @@ def test_compressed_tensors_wna16_marlin_moe_method_keeps_empty_c_tmp_and_apply_
     )
     monkeypatch.setattr(
         ct_mod,
-        "marlin_moe_permute_scales",
+        "sm70_marlin_moe_logical_scales",
         lambda s, *args, **kwargs: s.detach().clone().contiguous(),
     )
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
@@ -1282,7 +1282,7 @@ def test_compressed_tensors_wna16_marlin_moe_method_class_uses_owner(
     )
     monkeypatch.setattr(
         ct_mod,
-        "marlin_moe_permute_scales",
+        "sm70_marlin_moe_logical_scales",
         lambda s, *args, **kwargs: s.detach().clone().contiguous(),
     )
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
