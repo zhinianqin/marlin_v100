@@ -31,7 +31,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
-    marlin_make_c_tmp,
+    marlin_make_workspace_new,
     marlin_moe_intermediate_size,
     marlin_quant_input,
 )
@@ -45,29 +45,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
-
-
-def _marlin_moe_empty_c_tmp(
-    c_tmp: torch.Tensor | None,
-    c_tmp_owner: torch.nn.Module | None,
-    device: torch.device,
-) -> torch.Tensor:
-    if c_tmp_owner is not None:
-        c_tmp = getattr(c_tmp_owner, "c_tmp", c_tmp)
-
-    needs_empty = (
-        c_tmp is None
-        or c_tmp.device != device
-        or c_tmp.dtype != torch.float32
-        or not c_tmp.is_contiguous()
-        or c_tmp.numel() != 0
-    )
-    if needs_empty:
-        c_tmp = marlin_make_c_tmp(device)
-
-    if c_tmp_owner is not None:
-        c_tmp_owner.c_tmp = c_tmp
-    return c_tmp
 
 
 def _fused_marlin_moe(
@@ -103,8 +80,7 @@ def _fused_marlin_moe(
     w2_zeros: torch.Tensor | None = None,
     is_w1_zp_float: bool = False,
     is_w2_zp_float: bool = False,
-    c_tmp: torch.Tensor | None = None,
-    c_tmp_owner: torch.nn.Module | None = None,
+    workspace: torch.Tensor | None = None,
     intermediate_cache13: torch.Tensor | None = None,
     intermediate_cache2: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
@@ -115,11 +91,14 @@ def _fused_marlin_moe(
     M, K = hidden_states.size()
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
-    c_tmp = _marlin_moe_empty_c_tmp(
-        c_tmp=c_tmp,
-        c_tmp_owner=c_tmp_owner,
-        device=hidden_states.device,
-    )
+    if (
+        workspace is None
+        or workspace.device != hidden_states.device
+        or workspace.dtype != torch.int
+        or not workspace.is_contiguous()
+        or workspace.numel() != 0
+    ):
+        workspace = marlin_make_workspace_new(hidden_states.device, 4)
 
     if intermediate_cache13 is None:
         intermediate_cache13 = torch.empty(
@@ -162,7 +141,7 @@ def _fused_marlin_moe(
         w1_zeros,
         g_idx1,
         sort_indices1,
-        c_tmp,
+        workspace,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -176,7 +155,7 @@ def _fused_marlin_moe(
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=False,
+        use_fp32_reduce=True,
         is_zp_float=is_w1_zp_float,
     )
     activation_func(
@@ -214,7 +193,7 @@ def _fused_marlin_moe(
         w2_zeros,
         g_idx2,
         sort_indices2,
-        c_tmp,
+        workspace,
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -228,7 +207,7 @@ def _fused_marlin_moe(
         size_k=N,
         is_k_full=is_k_full,
         use_atomic_add=False,
-        use_fp32_reduce=False,
+        use_fp32_reduce=True,
         is_zp_float=is_w2_zp_float,
     )
 
@@ -266,8 +245,7 @@ def fused_marlin_moe(
     w2_zeros: torch.Tensor | None = None,
     is_w1_zp_float: bool = False,
     is_w2_zp_float: bool = False,
-    c_tmp: torch.Tensor | None = None,
-    c_tmp_owner: torch.nn.Module | None = None,
+    workspace: torch.Tensor | None = None,
     intermediate_cache13: torch.Tensor | None = None,
     intermediate_cache2: torch.Tensor | None = None,
     is_k_full: bool = True,
@@ -387,8 +365,7 @@ def fused_marlin_moe(
         w2_zeros=w2_zeros,
         is_w1_zp_float=is_w1_zp_float,
         is_w2_zp_float=is_w2_zp_float,
-        c_tmp=c_tmp,
-        c_tmp_owner=c_tmp_owner,
+        workspace=workspace,
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
         output=None,
@@ -429,8 +406,7 @@ def batched_fused_marlin_moe(
     w2_zeros: torch.Tensor | None = None,
     is_w1_zp_float: bool = False,
     is_w2_zp_float: bool = False,
-    c_tmp: torch.Tensor | None = None,
-    c_tmp_owner: torch.nn.Module | None = None,
+    workspace: torch.Tensor | None = None,
     intermediate_cache13: torch.Tensor | None = None,
     intermediate_cache2: torch.Tensor | None = None,
     is_k_full: bool = True,
@@ -556,8 +532,7 @@ def batched_fused_marlin_moe(
         w2_zeros=w2_zeros,
         is_w1_zp_float=is_w1_zp_float,
         is_w2_zp_float=is_w2_zp_float,
-        c_tmp=c_tmp,
-        c_tmp_owner=c_tmp_owner,
+        workspace=workspace,
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
         output=output.view(-1, K) if output is not None else output,

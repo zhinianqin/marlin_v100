@@ -12,7 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from tests.helpers import make_moe_routing_tensors
+from tests.helpers import make_moe_routing_tensors, marlin_make_workspace
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.quantization.awq_marlin import (
@@ -28,9 +28,6 @@ from vllm.model_executor.layers.quantization.gptq_marlin import (
 )
 from vllm.model_executor.layers.quantization.quark.quark_moe import (
     QuarkW8A8Fp8MoEMethod,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    marlin_make_c_tmp,
 )
 from vllm.scalar_type import scalar_types
 from tests.writeback_marlin_cases import (
@@ -73,7 +70,7 @@ def test_moe_writeback_class_inventory_has_test_coverage() -> None:
 
 @dataclass
 class _RecordedGemm:
-    c_tmp: torch.Tensor
+    workspace: torch.Tensor
     b_qzeros: torch.Tensor | None
     size_m: int
     size_n: int
@@ -366,7 +363,7 @@ def _install_fused_marlin_cpu_mocks(monkeypatch: pytest.MonkeyPatch) -> list[_Re
         b_qzeros: torch.Tensor | None,
         g_idx: torch.Tensor | None,
         perm: torch.Tensor | None,
-        c_tmp: torch.Tensor,
+        workspace: torch.Tensor,
         sorted_token_ids: torch.Tensor,
         expert_ids: torch.Tensor,
         num_tokens_past_padded: torch.Tensor,
@@ -411,7 +408,7 @@ def _install_fused_marlin_cpu_mocks(monkeypatch: pytest.MonkeyPatch) -> list[_Re
         )
         records.append(
             _RecordedGemm(
-                c_tmp=c_tmp,
+                workspace=workspace,
                 b_qzeros=b_qzeros,
                 size_m=size_m,
                 size_n=size_n,
@@ -733,7 +730,7 @@ def _moe_matrix_row(
     *,
     status: str,
     expected_is_zp_float: bool | None = None,
-    c_tmp_numel: int | None = None,
+    workspace_numel: int | None = None,
     reason: str = "",
 ) -> dict[str, object]:
     return {
@@ -750,20 +747,20 @@ def _moe_matrix_row(
         "routing_profile": case.shape.routing_profile,
         "status": status,
         "is_zp_float": expected_is_zp_float,
-        "c_tmp_numel": c_tmp_numel,
+        "workspace_numel": workspace_numel,
         "reason": reason,
     }
 
 
-def _assert_fresh_c_tmp(layer: torch.nn.Module) -> None:
-    assert hasattr(layer, "c_tmp")
-    assert layer.c_tmp.dtype == torch.float32
-    assert layer.c_tmp.is_contiguous()
-    assert layer.c_tmp.numel() == 0
-    assert not layer.c_tmp.requires_grad
+def _assert_fresh_workspace(layer: torch.nn.Module) -> None:
+    assert hasattr(layer, "workspace")
+    assert layer.workspace.dtype == torch.int
+    assert layer.workspace.is_contiguous()
+    assert layer.workspace.numel() == 0
+    assert not layer.workspace.requires_grad
 
 
-def _assert_apply_keeps_empty_c_tmp(
+def _assert_apply_keeps_empty_workspace(
     method: Any,
     layer: torch.nn.Module,
     records: list[_RecordedGemm],
@@ -780,14 +777,14 @@ def _assert_apply_keeps_empty_c_tmp(
     output = method.apply(layer, hidden_states, topk_weights, topk_ids, None)
 
     assert output.shape == hidden_states.shape
-    assert layer.c_tmp.dtype == torch.float32
-    assert layer.c_tmp.is_contiguous()
-    assert layer.c_tmp.numel() == 0
+    assert layer.workspace.dtype == torch.int
+    assert layer.workspace.is_contiguous()
+    assert layer.workspace.numel() == 0
     assert len(records) == 2
-    assert records[0].c_tmp is layer.c_tmp
-    assert records[1].c_tmp is layer.c_tmp
-    assert records[0].use_fp32_reduce is False
-    assert records[1].use_fp32_reduce is False
+    assert records[0].workspace is layer.workspace
+    assert records[1].workspace is layer.workspace
+    assert records[0].use_fp32_reduce is True
+    assert records[1].use_fp32_reduce is True
     assert records[0].is_zp_float is expected_zp_float
     assert records[1].is_zp_float is expected_zp_float
     if expected_zp_float:
@@ -796,18 +793,18 @@ def _assert_apply_keeps_empty_c_tmp(
         assert records[0].b_qzeros.dtype == torch.float16
         assert records[1].b_qzeros.dtype == torch.float16
 
-    first_c_tmp = layer.c_tmp
+    first_workspace = layer.workspace
     records.clear()
     smaller_hidden = torch.randn(1, hidden_size, dtype=torch.float16)
     smaller_weights = torch.ones(1, topk, dtype=torch.float32)
     smaller_ids = torch.tensor([[0, 1]], dtype=torch.int32)
     method.apply(layer, smaller_hidden, smaller_weights, smaller_ids, None)
-    assert layer.c_tmp is first_c_tmp
+    assert layer.workspace is first_workspace
     assert len(records) == 2
-    assert records[0].c_tmp is first_c_tmp
-    assert records[1].c_tmp is first_c_tmp
-    assert records[0].use_fp32_reduce is False
-    assert records[1].use_fp32_reduce is False
+    assert records[0].workspace is first_workspace
+    assert records[1].workspace is first_workspace
+    assert records[0].use_fp32_reduce is True
+    assert records[1].use_fp32_reduce is True
     assert records[0].is_zp_float is expected_zp_float
     assert records[1].is_zp_float is expected_zp_float
 
@@ -816,13 +813,13 @@ def _assert_apply_keeps_empty_c_tmp(
     larger_weights = torch.full((5, topk), 0.5, dtype=torch.float32)
     larger_ids = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0], [0, 1]], dtype=torch.int32)
     method.apply(layer, larger_hidden, larger_weights, larger_ids, None)
-    assert layer.c_tmp is first_c_tmp
-    assert layer.c_tmp.numel() == 0
+    assert layer.workspace is first_workspace
+    assert layer.workspace.numel() == 0
     assert len(records) == 2
-    assert records[0].c_tmp is layer.c_tmp
-    assert records[1].c_tmp is layer.c_tmp
-    assert records[0].use_fp32_reduce is False
-    assert records[1].use_fp32_reduce is False
+    assert records[0].workspace is layer.workspace
+    assert records[1].workspace is layer.workspace
+    assert records[0].use_fp32_reduce is True
+    assert records[1].use_fp32_reduce is True
     assert records[0].is_zp_float is expected_zp_float
     assert records[1].is_zp_float is expected_zp_float
 
@@ -853,7 +850,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
         key: Counter() for key in coverage
     }
     first_failure: dict[str, object] | None = None
-    max_c_tmp_numel = 0
+    max_workspace_numel = 0
 
     with _MOE_FULL_MATRIX_JSONL.open("w", encoding="utf-8") as jsonl:
         for index, matrix_case in enumerate(iter_moe_writeback_matrix(), start=1):
@@ -875,7 +872,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                 continue
 
             expected_zp_float: bool | None = None
-            c_tmp_numel: int | None = None
+            workspace_numel: int | None = None
             try:
                 records.clear()
                 method, layer, expected_zp_float = _prepare_moe_matrix_case(
@@ -905,10 +902,10 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                 assert len(records) == 2
 
                 stage1, stage2 = records
-                assert stage1.c_tmp is layer.c_tmp
-                assert stage2.c_tmp is layer.c_tmp
-                assert stage1.use_fp32_reduce is False
-                assert stage2.use_fp32_reduce is False
+                assert stage1.workspace is layer.workspace
+                assert stage2.workspace is layer.workspace
+                assert stage1.use_fp32_reduce is True
+                assert stage2.use_fp32_reduce is True
                 assert stage1.size_m == matrix_case.shape.tokens
                 assert stage1.size_k == matrix_case.shape.hidden
                 assert stage1.size_n == 2 * matrix_case.shape.intermediate
@@ -931,13 +928,13 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                     assert stage1.b_qzeros is None
                     assert stage2.b_qzeros is None
 
-                assert layer.c_tmp.dtype == torch.float32
-                assert layer.c_tmp.is_contiguous()
-                assert layer.c_tmp.numel() == 0
-                assert not layer.c_tmp.requires_grad
+                assert layer.workspace.dtype == torch.int
+                assert layer.workspace.is_contiguous()
+                assert layer.workspace.numel() == 0
+                assert not layer.workspace.requires_grad
 
-                c_tmp_numel = int(layer.c_tmp.numel())
-                max_c_tmp_numel = max(max_c_tmp_numel, c_tmp_numel)
+                workspace_numel = int(layer.workspace.numel())
+                max_workspace_numel = max(max_workspace_numel, workspace_numel)
                 status = "OK"
                 reason = ""
                 status_counts["OK"] += 1
@@ -962,7 +959,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                         matrix_case,
                         status=status,
                         expected_is_zp_float=expected_zp_float,
-                        c_tmp_numel=c_tmp_numel,
+                        workspace_numel=workspace_numel,
                         reason=reason,
                     )
 
@@ -973,7 +970,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
                         matrix_case,
                         status=status,
                         expected_is_zp_float=expected_zp_float,
-                        c_tmp_numel=c_tmp_numel,
+                        workspace_numel=workspace_numel,
                         reason=reason,
                     ),
                     sort_keys=True,
@@ -995,7 +992,7 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
         "ok_coverage": {
             key: _counter_to_json(counter) for key, counter in ok_coverage.items()
         },
-        "max_c_tmp_numel": max_c_tmp_numel,
+        "max_workspace_numel": max_workspace_numel,
         "first_failure": first_failure,
         "jsonl": str(_MOE_FULL_MATRIX_JSONL),
         "elapsed_seconds": round(elapsed, 3),
@@ -1013,12 +1010,12 @@ def test_moe_writeback_method_full_matrix_post_load_apply_path(
         )
 
 
-def test_fused_marlin_moe_keeps_empty_c_tmp(monkeypatch: pytest.MonkeyPatch):
+def test_fused_marlin_moe_keeps_empty_workspace(monkeypatch: pytest.MonkeyPatch):
     from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
 
     records = _install_fused_marlin_cpu_mocks(monkeypatch)
     owner = torch.nn.Module()
-    owner.c_tmp = marlin_make_c_tmp(torch.device("cpu"))
+    owner.workspace = marlin_make_workspace(torch.device("cpu"))
     hidden_states = torch.randn(2, 32, dtype=torch.float16)
     topk_weights = torch.full((2, 2), 0.5, dtype=torch.float32)
     topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
@@ -1038,24 +1035,23 @@ def test_fused_marlin_moe_keeps_empty_c_tmp(monkeypatch: pytest.MonkeyPatch):
         topk_weights,
         topk_ids,
         quant_type_id=scalar_types.uint4b8.id,
-        c_tmp=owner.c_tmp,
-        c_tmp_owner=owner,
+        workspace=owner.workspace,
     )
 
     assert output.shape == hidden_states.shape
-    assert owner.c_tmp.dtype == torch.float32
-    assert owner.c_tmp.is_contiguous()
-    assert owner.c_tmp.numel() == 0
+    assert owner.workspace.dtype == torch.int
+    assert owner.workspace.is_contiguous()
+    assert owner.workspace.numel() == 0
     assert len(records) == 2
-    assert records[0].c_tmp is owner.c_tmp
-    assert records[1].c_tmp is owner.c_tmp
-    assert records[0].use_fp32_reduce is False
-    assert records[1].use_fp32_reduce is False
+    assert records[0].workspace is owner.workspace
+    assert records[1].workspace is owner.workspace
+    assert records[0].use_fp32_reduce is True
+    assert records[1].use_fp32_reduce is True
     assert records[0].is_zp_float is False
     assert records[1].is_zp_float is False
 
 
-def test_gptq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
+def test_gptq_marlin_moe_method_keeps_empty_workspace_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.quantization.gptq_marlin as gptq_mod
@@ -1085,8 +1081,8 @@ def test_gptq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     method.is_k_full = True
     layer = _make_minimal_moe_layer(prefix="gptq")
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
-    _assert_apply_keeps_empty_c_tmp(method, layer, records)
+    _assert_fresh_workspace(layer)
+    _assert_apply_keeps_empty_workspace(method, layer, records)
 
 
 @pytest.mark.parametrize(
@@ -1121,8 +1117,8 @@ def test_gptq_marlin_moe_method_class_uses_owner(
         num_bits=method.quant_type.size_bits,
     )
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
-    _assert_apply_keeps_empty_c_tmp(
+    _assert_fresh_workspace(layer)
+    _assert_apply_keeps_empty_workspace(
         method,
         layer,
         records,
@@ -1137,7 +1133,7 @@ def test_gptq_marlin_moe_method_class_uses_owner(
         pytest.param(8, scalar_types.uint8, id="uint8_zp"),
     ),
 )
-def test_awq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
+def test_awq_marlin_moe_method_keeps_empty_workspace_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
     num_bits: int,
     expected_quant_type: Any,
@@ -1169,12 +1165,12 @@ def test_awq_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
     assert method.quant_type == expected_quant_type
     layer = _make_minimal_moe_layer(prefix="awq", num_bits=num_bits)
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
+    _assert_fresh_workspace(layer)
     assert layer.w13_qzeros.dtype == torch.float16
     assert layer.w2_qzeros.dtype == torch.float16
     assert layer.w13_qzeros.is_contiguous()
     assert layer.w2_qzeros.is_contiguous()
-    _assert_apply_keeps_empty_c_tmp(
+    _assert_apply_keeps_empty_workspace(
         method, layer, records, expected_zp_float=True
     )
 
@@ -1216,10 +1212,10 @@ def test_awq_marlin_moe_method_class_uses_owner(
     method.is_k_full = True
     layer = _make_minimal_moe_layer(prefix="awq", num_bits=num_bits)
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
+    _assert_fresh_workspace(layer)
     assert layer.w13_qzeros.dtype == torch.float16
     assert layer.w2_qzeros.dtype == torch.float16
-    _assert_apply_keeps_empty_c_tmp(
+    _assert_apply_keeps_empty_workspace(
         method,
         layer,
         records,
@@ -1227,7 +1223,7 @@ def test_awq_marlin_moe_method_class_uses_owner(
     )
 
 
-def test_compressed_tensors_wna16_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
+def test_compressed_tensors_wna16_marlin_moe_method_keeps_empty_workspace_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe as ct_mod
@@ -1261,8 +1257,8 @@ def test_compressed_tensors_wna16_marlin_moe_method_keeps_empty_c_tmp_and_apply_
     layer = _make_minimal_moe_layer(prefix="compressed_tensors")
     layer.marlin_state = SimpleNamespace()
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
-    _assert_apply_keeps_empty_c_tmp(method, layer, records)
+    _assert_fresh_workspace(layer)
+    _assert_apply_keeps_empty_workspace(method, layer, records)
 
 
 @pytest.mark.parametrize(
@@ -1310,8 +1306,8 @@ def test_compressed_tensors_wna16_marlin_moe_method_class_uses_owner(
     )
     layer.marlin_state = SimpleNamespace()
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
-    _assert_apply_keeps_empty_c_tmp(
+    _assert_fresh_workspace(layer)
+    _assert_apply_keeps_empty_workspace(
         method,
         layer,
         records,
@@ -1319,7 +1315,7 @@ def test_compressed_tensors_wna16_marlin_moe_method_class_uses_owner(
     )
 
 
-def test_quark_w8a8_fp8_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner(
+def test_quark_w8a8_fp8_marlin_moe_method_keeps_empty_workspace_and_apply_uses_owner(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import vllm.model_executor.layers.quantization.quark.quark_moe as quark_mod
@@ -1336,7 +1332,7 @@ def test_quark_w8a8_fp8_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner
         w2_weight_scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
-        layer.c_tmp = marlin_make_c_tmp(layer.w13_weight.device)
+        layer.workspace = marlin_make_workspace(layer.w13_weight.device)
         w13_packed = torch.empty(
             num_experts,
             hidden_size // 16,
@@ -1387,8 +1383,8 @@ def test_quark_w8a8_fp8_marlin_moe_method_keeps_empty_c_tmp_and_apply_uses_owner
         intermediate_size=intermediate_size,
     )
     method.process_weights_after_loading(layer)
-    _assert_fresh_c_tmp(layer)
-    _assert_apply_keeps_empty_c_tmp(
+    _assert_fresh_workspace(layer)
+    _assert_apply_keeps_empty_workspace(
         method,
         layer,
         records,

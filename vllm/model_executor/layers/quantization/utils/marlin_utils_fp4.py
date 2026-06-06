@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     get_marlin_input_dtype,
-    marlin_make_c_tmp,
+    marlin_make_workspace_new,
     marlin_permute_bias,
     marlin_quant_input,
     should_use_atomic_add_reduce,
@@ -149,7 +149,7 @@ def apply_fp4_marlin_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     weight_global_scale: torch.Tensor | None,
-    c_tmp: torch.Tensor,
+    workspace: torch.Tensor,
     size_n: int,
     size_k: int,
     bias: torch.Tensor | None = None,
@@ -188,7 +188,7 @@ def apply_fp4_marlin_linear(
         b_zeros=None,
         g_idx=None,
         perm=None,
-        c_tmp=c_tmp,
+        workspace=workspace,
         b_q_type=scalar_types.float4_e2m1f,
         size_m=reshaped_x.size(0),
         size_n=size_n,
@@ -221,7 +221,7 @@ def prepare_fp4_layer_for_marlin(
 
     device = layer.weight.device
 
-    layer.c_tmp = marlin_make_c_tmp(device)
+    layer.workspace = marlin_make_workspace_new(device)
 
     # WEIGHT
     # Repack weights to marlin format
@@ -315,7 +315,7 @@ def prepare_nvfp4_moe_layer_for_marlin(
     param_dtype = layer.params_dtype
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
 
-    layer.c_tmp = marlin_make_c_tmp(device)
+    layer.workspace = marlin_make_workspace_new(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     # WEIGHT
@@ -409,7 +409,7 @@ def prepare_moe_fp4_layer_for_marlin(
 
     device = layer.w13_weight.device
     param_dtype = layer.params_dtype
-    layer.c_tmp = marlin_make_c_tmp(device)
+    layer.workspace = marlin_make_workspace_new(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
 

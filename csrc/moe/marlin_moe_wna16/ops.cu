@@ -95,8 +95,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    std::optional<torch::Tensor> const& c_tmp_or_none,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
@@ -104,6 +103,18 @@ torch::Tensor moe_wna16_marlin_gemm(
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
     int64_t blocks_per_sm) {
+  if (g_idx_or_none.has_value()) {
+    TORCH_CHECK(g_idx_or_none.value().numel() == 0,
+                "SM70 Marlin does not support act_order g_idx.");
+  }
+  if (perm_or_none.has_value()) {
+    TORCH_CHECK(perm_or_none.value().numel() == 0,
+                "SM70 Marlin does not support act_order perm.");
+  }
+  (void)workspace;
+  (void)is_k_full;
+  (void)use_atomic_add;
+  (void)use_fp32_reduce;
   (void)thread_k;
   (void)thread_n;
   (void)blocks_per_sm;
@@ -183,13 +194,6 @@ torch::Tensor moe_wna16_marlin_gemm(
                   b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
               "SM70 Marlin MoE supports uint4, uint4b8, uint8, "
               "uint8b128, fp8_e4m3fn, nvfp4, and mxfp4 weights.");
-  TORCH_CHECK(!use_fp32_reduce,
-              "SM70 Marlin MoE requires use_fp32_reduce=false.");
-  if (c_tmp_or_none.has_value()) {
-    TORCH_CHECK(c_tmp_or_none.value().numel() == 0,
-                "SM70 Marlin MoE requires an empty c_tmp tensor because "
-                "split-K reduces directly into the output tensor.");
-  }
 
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
@@ -283,47 +287,13 @@ torch::Tensor moe_wna16_marlin_gemm(
               " is not size_n = ", size_n);
   num_groups = b_scales.size(1);
 
-  torch::Tensor g_idx, perm;
-  if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
-    g_idx = g_idx_or_none.value();
-    perm = perm_or_none.value();
-
-    TORCH_CHECK(g_idx.device().is_cuda(), "g_idx is not on GPU");
-    TORCH_CHECK(g_idx.is_contiguous(), "g_idx is not contiguous");
-    TORCH_CHECK(perm.device().is_cuda(), "perm is not on GPU");
-    TORCH_CHECK(perm.is_contiguous(), "perm is not contiguous");
-
-    // Verify g_idx and perm
-    TORCH_CHECK((g_idx.size(-1) == 0 && perm.size(-1) == 0) ||
-                    (g_idx.size(-1) == size_k && perm.size(-1) == size_k),
-                "Unexpected g_idx.size(-1) = ", g_idx.size(-1),
-                " and perm.size(-1) = ", perm.size(-1),
-                ", where size_k = ", size_k);
+  if (num_groups > 1) {
+    TORCH_CHECK(size_k % num_groups == 0, "size_k = ", size_k,
+                ", is not divisible by b_scales.size(1) = ",
+                b_scales.size(1));
+    group_size = size_k / num_groups;
   } else {
-    g_idx = torch::empty({0}, options);
-    perm = torch::empty({0}, options);
-  }
-  bool has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
-
-  if (has_act_order) {
-    if (is_k_full) {
-      TORCH_CHECK(num_groups > 1, "For act_order, num_groups must be > 1");
-      TORCH_CHECK(size_k % num_groups == 0, "size_k = ", size_k,
-                  ", is not divisible by num_groups = ", num_groups);
-      group_size = size_k / num_groups;
-    } else {
-      group_size = 0;
-    }
-
-  } else {
-    if (num_groups > 1) {
-      TORCH_CHECK(
-          size_k % num_groups == 0, "size_k = ", size_k,
-          ", is not divisible by b_scales.size(1) = ", b_scales.size(1));
-      group_size = size_k / num_groups;
-    } else {
-      group_size = -1;
-    }
+    group_size = -1;
   }
 
   torch::Tensor global_scale;
@@ -415,15 +385,8 @@ torch::Tensor moe_wna16_marlin_gemm(
         "scalar type of a must be the same with c for 16 bit activation");
   }
 
-  TORCH_CHECK(!has_act_order,
-              "act_order is not supported for the SM70 Marlin MoE path.");
   TORCH_CHECK(!has_bias,
               "SM70 Marlin MoE does not support bias.");
-  TORCH_CHECK(!use_atomic_add,
-              "SM70 Marlin MoE does not support atomic-add "
-              "output.");
-  TORCH_CHECK(is_k_full,
-              "SM70 Marlin MoE requires full-K inputs.");
 
   if (b_type == vllm::kU4) {
     TORCH_CHECK(has_zp && is_zp_float,

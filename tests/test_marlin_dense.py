@@ -14,7 +14,7 @@ from tests.helpers import (
     _REPACK_IMPL_CASES,
     assert_repack_layout_matches_reference,
     marlin_dense_reference,
-    marlin_make_c_tmp,
+    marlin_make_workspace,
     marlin_make_empty_g_idx,
     marlin_quantize,
     marlin_quantize_mxfp4,
@@ -358,10 +358,10 @@ def _run_dense_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     if act_order:
-        raise AssertionError("act_order accuracy coverage was replaced by explicit rejection tests")
+        raise AssertionError("act_order coverage uses explicit rejection tests")
 
     _require_marlin_cuda()
     assert_repack_layout_matches_reference(
@@ -389,7 +389,7 @@ def _run_dense_accuracy_case(
         marlin_make_empty_g_idx(a.device),
         g_idx,
         sort_indices,
-        c_tmp,
+        workspace,
         quant_type.id,
         a.shape[0],
         w.shape[1],
@@ -424,7 +424,7 @@ def _run_fp8_dense_accuracy_case(
     size_n: int = 256,
     rtol: float = 4e-2,
     atol: float = 2e-1,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -449,7 +449,7 @@ def _run_fp8_dense_accuracy_case(
         None,
         g_idx,
         sort_indices,
-        c_tmp,
+        workspace,
         scalar_types.float8_e4m3fn.id,
         a.shape[0],
         w.shape[1],
@@ -482,7 +482,7 @@ def _run_nvfp4_dense_accuracy_case(
     size_n: int = 256,
     rtol: float = 5e-2,
     atol: float = 2.5e-1,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -501,7 +501,7 @@ def _run_nvfp4_dense_accuracy_case(
         a.shape[0],
         w.shape[1],
         w.shape[0],
-        c_tmp=c_tmp,
+        workspace=workspace,
         global_scale=global_scale,
         g_idx=g_idx,
         perm=sort_indices,
@@ -526,7 +526,7 @@ def _run_mxfp4_dense_accuracy_case(
     size_n: int = 256,
     rtol: float = 5e-2,
     atol: float = 2.5e-1,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     torch.manual_seed(0)
@@ -543,7 +543,7 @@ def _run_mxfp4_dense_accuracy_case(
         a.shape[0],
         w.shape[1],
         w.shape[0],
-        c_tmp=c_tmp,
+        workspace=workspace,
         g_idx=g_idx,
         perm=sort_indices,
         is_k_full=True,
@@ -560,7 +560,7 @@ def _run_mxfp4_dense_accuracy_case(
     torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
 
 
-def _assert_dense_backend_rejects_act_order(
+def _assert_dense_backend_rejects_act_order_compat_args(
     quant_type,
     *,
     repack_impl: str | None = None,
@@ -575,7 +575,7 @@ def _assert_dense_backend_rejects_act_order(
         assert_repack_layout_matches_reference(
             repack_impl,
             quant_type=quant_type,
-            act_order=True,
+            act_order=False,
             group_size=group_size,
         )
     torch.manual_seed(0)
@@ -583,9 +583,10 @@ def _assert_dense_backend_rejects_act_order(
 
     a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
     w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
-    _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(w, quant_type, group_size, True)
-
-    with pytest.raises(RuntimeError, match="act_order is not supported"):
+    _, q_w, scales, _g_idx, _sort_indices, _ = marlin_quantize(
+        w, quant_type, group_size, False
+    )
+    with pytest.raises(RuntimeError, match="act_order"):
         ops.marlin_gemm(
             a,
             None,
@@ -595,16 +596,39 @@ def _assert_dense_backend_rejects_act_order(
             None,
             None,
             None,
-            g_idx,
-            sort_indices,
+            torch.zeros(w.shape[0], device="cuda", dtype=torch.int32),
+            None,
             None,
             quant_type.id,
             a.shape[0],
             w.shape[1],
             w.shape[0],
             is_k_full,
+            True,
+            True,
             False,
-            False,
+        )
+
+    with pytest.raises(RuntimeError, match="act_order"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            None,
+            torch.arange(w.shape[0], device="cuda", dtype=torch.int32),
+            None,
+            quant_type.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            is_k_full,
+            True,
+            True,
             False,
         )
 
@@ -619,9 +643,9 @@ def _run_dense_uint4_zp_accuracy_case(
     size_k: int = 256,
     size_n: int = 256,
     use_fp32_reduce: bool = False,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
-    if use_fp32_reduce or c_tmp is not None:
+    if use_fp32_reduce or workspace is not None:
         _run_dense_uint4_zp_raw_accuracy_case(
             repack_impl=repack_impl,
             group_size=group_size,
@@ -631,7 +655,7 @@ def _run_dense_uint4_zp_accuracy_case(
             size_k=size_k,
             size_n=size_n,
             use_fp32_reduce=use_fp32_reduce,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
         return
 
@@ -672,7 +696,7 @@ def _run_dense_uint4_zp_raw_accuracy_case(
     size_k: int = 256,
     size_n: int = 256,
     use_fp32_reduce: bool = False,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     assert_repack_layout_matches_reference(
@@ -700,7 +724,7 @@ def _run_dense_uint4_zp_raw_accuracy_case(
         zp,
         None,
         None,
-        c_tmp,
+        workspace,
         scalar_types.uint4.id,
         a.shape[0],
         w.shape[1],
@@ -729,9 +753,9 @@ def _run_dense_uint8_zp_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
-    if c_tmp is not None:
+    if workspace is not None:
         _run_dense_uint8_zp_raw_accuracy_case(
             repack_impl=repack_impl,
             group_size=group_size,
@@ -740,7 +764,7 @@ def _run_dense_uint8_zp_accuracy_case(
             size_m=size_m,
             size_k=size_k,
             size_n=size_n,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
         return
 
@@ -780,7 +804,7 @@ def _run_dense_uint8_zp_raw_accuracy_case(
     size_m: int = 16,
     size_k: int = 256,
     size_n: int = 256,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     _require_marlin_cuda()
     assert_repack_layout_matches_reference(
@@ -808,7 +832,7 @@ def _run_dense_uint8_zp_raw_accuracy_case(
         zp,
         None,
         None,
-        c_tmp,
+        workspace,
         scalar_types.uint8.id,
         a.shape[0],
         w.shape[1],
@@ -837,7 +861,7 @@ def _run_split_k_quant_accuracy_case(
     size_n: int = 256,
     rtol: float,
     atol: float,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     if quant_name == "uint4b8":
         _run_dense_accuracy_case(
@@ -851,7 +875,7 @@ def _run_split_k_quant_accuracy_case(
             size_m=size_m,
             size_k=size_k,
             size_n=size_n,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
     elif quant_name == "uint8":
         _run_dense_uint8_zp_accuracy_case(
@@ -862,7 +886,7 @@ def _run_split_k_quant_accuracy_case(
             size_m=size_m,
             size_k=size_k,
             size_n=size_n,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
     elif quant_name == "uint8b128":
         _run_dense_accuracy_case(
@@ -876,7 +900,7 @@ def _run_split_k_quant_accuracy_case(
             size_m=size_m,
             size_k=size_k,
             size_n=size_n,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
     elif quant_name == "fp8":
         _run_fp8_dense_accuracy_case(
@@ -886,7 +910,7 @@ def _run_split_k_quant_accuracy_case(
             size_n=size_n,
             rtol=rtol,
             atol=atol,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
     elif quant_name == "nvfp4":
         _run_nvfp4_dense_accuracy_case(
@@ -895,7 +919,7 @@ def _run_split_k_quant_accuracy_case(
             size_n=size_n,
             rtol=rtol,
             atol=atol,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
     elif quant_name == "mxfp4":
         _run_mxfp4_dense_accuracy_case(
@@ -904,7 +928,7 @@ def _run_split_k_quant_accuracy_case(
             size_n=size_n,
             rtol=rtol,
             atol=atol,
-            c_tmp=c_tmp,
+            workspace=workspace,
         )
     else:
         raise AssertionError(f"Unsupported split-K quant_name={quant_name}")
@@ -1000,7 +1024,7 @@ def test_marlin_dense_auto_split_k_quant_matches_reference(
     ("quant_name", "group_size", "size_k", "rtol", "atol"),
     _SPLIT_K_QUANT_CASES,
 )
-def test_marlin_dense_auto_split_k_quant_keeps_empty_c_tmp_matches_reference(
+def test_marlin_dense_auto_split_k_quant_keeps_empty_workspace_matches_reference(
     quant_name: str,
     group_size: int,
     size_k: int,
@@ -1009,7 +1033,7 @@ def test_marlin_dense_auto_split_k_quant_keeps_empty_c_tmp_matches_reference(
 ):
     if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
         pytest.skip(f"{quant_name} dense path is not supported in this build")
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"))
+    workspace = marlin_make_workspace(torch.device("cuda"))
     _run_split_k_quant_accuracy_case(
         quant_name,
         group_size=group_size,
@@ -1018,16 +1042,16 @@ def test_marlin_dense_auto_split_k_quant_keeps_empty_c_tmp_matches_reference(
         size_n=256,
         rtol=rtol,
         atol=atol,
-        c_tmp=c_tmp,
+        workspace=workspace,
     )
-    assert c_tmp.numel() == 0
+    assert workspace.numel() == 0
 
 
 @pytest.mark.parametrize(
     ("quant_name", "group_size", "_size_k", "rtol", "atol"),
     _SPLIT_K_QUANT_CASES,
 )
-def test_marlin_dense_no_split_quant_rejects_non_empty_c_tmp(
+def test_marlin_dense_no_split_quant_accepts_unused_workspace(
     quant_name: str,
     group_size: int,
     _size_k: int,
@@ -1036,18 +1060,17 @@ def test_marlin_dense_no_split_quant_rejects_non_empty_c_tmp(
 ):
     if quant_name not in _DENSE_SUPPORTED_QUANT_NAMES:
         pytest.skip(f"{quant_name} dense path is not supported in this build")
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 1)
-    with pytest.raises(RuntimeError, match="empty c_tmp"):
-        _run_split_k_quant_accuracy_case(
-            quant_name,
-            group_size=group_size,
-            size_m=16,
-            size_k=256,
-            size_n=256,
-            rtol=rtol,
-            atol=atol,
-            c_tmp=c_tmp,
-        )
+    workspace = marlin_make_workspace(torch.device("cuda"), 1)
+    _run_split_k_quant_accuracy_case(
+        quant_name,
+        group_size=group_size,
+        size_m=16,
+        size_k=256,
+        size_n=256,
+        rtol=rtol,
+        atol=atol,
+        workspace=workspace,
+    )
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
@@ -1066,8 +1089,10 @@ def test_marlin_dense_uint4b8_accuracy(group_size: int, repack_impl: str):
 
 @pytest.mark.parametrize("is_k_full", (True, False))
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_act_order_accuracy(is_k_full: bool, repack_impl: str):
-    _assert_dense_backend_rejects_act_order(
+def test_marlin_dense_uint4b8_rejects_act_order_compat_args(
+    is_k_full: bool, repack_impl: str
+):
+    _assert_dense_backend_rejects_act_order_compat_args(
         scalar_types.uint4b8,
         repack_impl=repack_impl,
         group_size=64,
@@ -1209,8 +1234,10 @@ def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
 
 
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
-def test_marlin_dense_uint4b8_sm70_act_order_group_switch_matches_reference(repack_impl: str):
-    _assert_dense_backend_rejects_act_order(
+def test_marlin_dense_uint4b8_sm70_rejects_act_order_group_switch_args(
+    repack_impl: str,
+):
+    _assert_dense_backend_rejects_act_order_compat_args(
         scalar_types.uint4b8,
         repack_impl=repack_impl,
         group_size=64,
@@ -1389,8 +1416,8 @@ def test_marlin_dense_uint4_zp_auto_split_k_large_k_smoke_matches_reference():
     )
 
 
-def test_marlin_dense_uint4_zp_auto_split_k_keeps_empty_c_tmp_matches_reference():
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"))
+def test_marlin_dense_uint4_zp_auto_split_k_keeps_empty_workspace_matches_reference():
+    workspace = marlin_make_workspace(torch.device("cuda"))
     _run_dense_uint4_zp_accuracy_case(
         repack_impl="gptq",
         group_size=128,
@@ -1399,91 +1426,86 @@ def test_marlin_dense_uint4_zp_auto_split_k_keeps_empty_c_tmp_matches_reference(
         size_m=16,
         size_k=4096,
         size_n=256,
-        c_tmp=c_tmp,
+        workspace=workspace,
     )
-    assert c_tmp.numel() == 0
+    assert workspace.numel() == 0
 
 
-def test_marlin_dense_uint4_zp_no_split_rejects_non_empty_c_tmp():
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 1)
-    with pytest.raises(RuntimeError, match="empty c_tmp"):
-        _run_dense_uint4_zp_accuracy_case(
-            repack_impl="gptq",
-            group_size=128,
-            rtol=5e-2,
-            atol=2.5e-1,
-            size_m=16,
-            size_k=256,
-            size_n=256,
-            c_tmp=c_tmp,
-        )
+def test_marlin_dense_uint4_zp_no_split_accepts_unused_workspace():
+    workspace = marlin_make_workspace(torch.device("cuda"), 1)
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=16,
+        size_k=256,
+        size_n=256,
+        workspace=workspace,
+    )
 
 
-def test_marlin_dense_uint4_zp_auto_split_k_rejects_fp32_reduce():
-    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=false"):
-        _run_dense_uint4_zp_accuracy_case(
-            repack_impl="gptq",
-            group_size=128,
-            rtol=5e-2,
-            atol=5e-1,
-            size_m=16,
-            size_k=4096,
-            size_n=256,
-            use_fp32_reduce=True,
-        )
+def test_marlin_dense_uint4_zp_auto_split_k_ignores_fp32_reduce():
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=5e-1,
+        size_m=16,
+        size_k=4096,
+        size_n=256,
+        use_fp32_reduce=True,
+    )
 
 
-def test_marlin_dense_uint4_zp_auto_split_k_rejects_non_empty_c_tmp():
-    c_tmp = marlin_make_c_tmp(torch.device("cuda"), 16 * 256 - 1)
-    with pytest.raises(RuntimeError, match="empty c_tmp"):
-        _run_dense_uint4_zp_accuracy_case(
-            repack_impl="gptq",
-            group_size=128,
-            rtol=5e-2,
-            atol=5e-1,
-            size_m=16,
-            size_k=4096,
-            size_n=256,
-            c_tmp=c_tmp,
-        )
+def test_marlin_dense_uint4_zp_auto_split_k_accepts_unused_workspace():
+    workspace = marlin_make_workspace(torch.device("cuda"), 16 * 256 - 1)
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=5e-1,
+        size_m=16,
+        size_k=4096,
+        size_n=256,
+        workspace=workspace,
+    )
 
 
 @pytest.mark.parametrize(
-    "make_c_tmp",
+    "make_workspace",
     (
         lambda device: torch.empty((16, 256), device=device, dtype=torch.float16),
         lambda device: torch.empty((16, 256), device=device, dtype=torch.float32).t(),
         lambda device: torch.empty((16, 256), dtype=torch.float32),
     ),
 )
-def test_marlin_dense_uint4_zp_auto_split_k_rejects_non_empty_c_tmp_variants(
-    make_c_tmp,
+def test_marlin_dense_uint4_zp_auto_split_k_accepts_unused_workspace_variants(
+    make_workspace,
 ):
-    with pytest.raises(RuntimeError, match="empty c_tmp"):
-        _run_dense_uint4_zp_accuracy_case(
-            repack_impl="gptq",
-            group_size=128,
-            rtol=5e-2,
-            atol=5e-1,
-            size_m=16,
-            size_k=4096,
-            size_n=256,
-            c_tmp=make_c_tmp(torch.device("cuda")),
-        )
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=5e-1,
+        size_m=16,
+        size_k=4096,
+        size_n=256,
+        workspace=make_workspace(torch.device("cuda")),
+    )
 
 
-def test_marlin_dense_uint4_zp_rejects_fp32_reduce_without_split_k():
-    with pytest.raises(RuntimeError, match="requires use_fp32_reduce=false"):
-        _run_dense_uint4_zp_accuracy_case(
-            repack_impl="gptq",
-            group_size=128,
-            rtol=5e-2,
-            atol=2.5e-1,
-            size_m=8,
-            size_k=256,
-            size_n=256,
-            use_fp32_reduce=True,
-        )
+def test_marlin_dense_uint4_zp_ignores_fp32_reduce_without_split_k():
+    _run_dense_uint4_zp_accuracy_case(
+        repack_impl="gptq",
+        group_size=128,
+        rtol=5e-2,
+        atol=2.5e-1,
+        size_m=8,
+        size_k=256,
+        size_n=256,
+        use_fp32_reduce=True,
+    )
 
 
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
@@ -1837,7 +1859,7 @@ def test_marlin_dense_uint4_zp_rejects_zeros_without_flag():
         )
 
 
-def test_marlin_dense_uint4_zp_rejects_act_order():
+def test_marlin_dense_uint4_zp_rejects_act_order_compat_args():
     _require_marlin_cuda()
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -1849,7 +1871,7 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
     g_idx = (torch.arange(size_k, device=a.device, dtype=torch.int32) // 64).contiguous()
     perm = torch.arange(size_k, device=a.device, dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match="act_order is not supported"):
+    with pytest.raises(RuntimeError, match="act_order"):
         ops.marlin_gemm(
             a,
             None,
@@ -1860,18 +1882,40 @@ def test_marlin_dense_uint4_zp_rejects_act_order():
             None,
             zp,
             g_idx,
+            None,
+            None,
+            scalar_types.uint4.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            False,
+            True,
+            True,
+            True,
+        )
+
+    with pytest.raises(RuntimeError, match="act_order"):
+        ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zp,
+            None,
             perm,
             None,
             scalar_types.uint4.id,
             a.shape[0],
             w.shape[1],
             w.shape[0],
+            False,
             True,
-            False,
-            False,
+            True,
             True,
         )
-
 
 if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
 
@@ -1889,15 +1933,17 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
         )
 
     @pytest.mark.parametrize("is_k_full", (True, False))
-    def test_marlin_dense_uint8b128_act_order_accuracy(is_k_full: bool):
-        _assert_dense_backend_rejects_act_order(
+    def test_marlin_dense_uint8b128_rejects_act_order_compat_args(
+        is_k_full: bool,
+    ):
+        _assert_dense_backend_rejects_act_order_compat_args(
             scalar_types.uint8b128,
             group_size=64,
             is_k_full=is_k_full,
         )
 
-    def test_marlin_dense_uint8b128_act_order_single_group_small_k_matches_reference():
-        _assert_dense_backend_rejects_act_order(
+    def test_marlin_dense_uint8b128_rejects_single_group_act_order_compat_args():
+        _assert_dense_backend_rejects_act_order_compat_args(
             scalar_types.uint8b128,
             group_size=128,
             is_k_full=False,
@@ -2090,7 +2136,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
             128,
             False,
         )
-        c_tmp = None
+        workspace = None
         common_args = (
             q_w,
             None,
@@ -2100,7 +2146,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
             None,
             g_idx,
             sort_indices,
-                c_tmp,
+                workspace,
             scalar_types.float8_e4m3fn.id,
             a.shape[0],
             w.shape[1],
@@ -2129,7 +2175,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float8_e4m3fn.id,
                 a.shape[0],
                 w.shape[1],
@@ -2144,7 +2190,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
         with pytest.raises(RuntimeError, match="SM70 build only supports float16 outputs"):
             ops.marlin_gemm(a, c_bf16, *common_args)
 
-        with pytest.raises(RuntimeError, match="act_order is not supported"):
+        with pytest.raises(RuntimeError, match="act_order"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2154,16 +2200,16 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 None,
                 None,
-                torch.zeros(w.shape[0], device="cuda", dtype=torch.int),
-                torch.arange(w.shape[0], device="cuda", dtype=torch.int),
-                c_tmp,
+                torch.zeros(w.shape[0], device="cuda", dtype=torch.int32),
+                torch.arange(w.shape[0], device="cuda", dtype=torch.int32),
+                workspace,
                 scalar_types.float8_e4m3fn.id,
                 a.shape[0],
                 w.shape[1],
                 w.shape[0],
+                False,
                 True,
-                False,
-                False,
+                True,
                 False,
             )
 
@@ -2179,7 +2225,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float8_e4m3fn.id,
                 a.shape[0],
                 w.shape[1],
@@ -2202,7 +2248,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float8_e4m3fn.id,
                 a.shape[0],
                 w.shape[1],
@@ -2226,7 +2272,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 zp,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float8_e4m3fn.id,
                 a.shape[0],
                 w.shape[1],
@@ -2249,7 +2295,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float8_e4m3fn.id,
                 a.shape[0],
                 w.shape[1],
@@ -2260,28 +2306,29 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 True,
             )
 
-        with pytest.raises(RuntimeError, match="requires full-K"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                None,
-                scales,
-                None,
-                None,
-                None,
-                g_idx,
-                sort_indices,
-                c_tmp,
-                scalar_types.float8_e4m3fn.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                False,
-                False,
-                False,
-                False,
-            )
+        output = ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float8_e4m3fn.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            False,
+            False,
+            False,
+            False,
+        )
+        assert output.shape == (a.shape[0], w.shape[1])
+        assert torch.isfinite(output).all()
 
 
 if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
@@ -2307,7 +2354,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
             marlin_quantize_nvfp4(w, 16)
         )
         fp16_scales = scales.to(torch.float32).to(torch.float16)
-        c_tmp = None
+        workspace = None
 
         with pytest.raises(RuntimeError, match="global_scale parameter must be passed"):
             ops.marlin_gemm(
@@ -2321,7 +2368,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2344,7 +2391,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2367,7 +2414,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2388,7 +2435,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         _weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
             marlin_quantize_nvfp4(w, 16)
         )
-        c_tmp = None
+        workspace = None
 
         with pytest.raises(RuntimeError, match="supports only group_size 16"):
             ops.marlin_gemm(
@@ -2402,7 +2449,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2413,7 +2460,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="act_order is not supported"):
+        with pytest.raises(RuntimeError, match="act_order"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2423,16 +2470,16 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 global_scale,
                 None,
-                torch.zeros(w.shape[0], device="cuda", dtype=torch.int),
-                torch.arange(w.shape[0], device="cuda", dtype=torch.int),
-                c_tmp,
+                torch.zeros(w.shape[0], device="cuda", dtype=torch.int32),
+                torch.arange(w.shape[0], device="cuda", dtype=torch.int32),
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
                 w.shape[0],
+                False,
                 True,
-                False,
-                False,
+                True,
                 False,
             )
 
@@ -2448,7 +2495,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2471,7 +2518,7 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 torch.zeros_like(scales),
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2482,28 +2529,29 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 True,
             )
 
-        with pytest.raises(RuntimeError, match="requires full-K"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                None,
-                scales,
-                None,
-                global_scale,
-                None,
-                g_idx,
-                sort_indices,
-                c_tmp,
-                scalar_types.float4_e2m1f.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                False,
-                False,
-                False,
-                False,
-            )
+        output = ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            global_scale,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            False,
+            False,
+            False,
+            False,
+        )
+        assert output.shape == (a.shape[0], w.shape[1])
+        assert torch.isfinite(output).all()
 
 
 if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
@@ -2529,7 +2577,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
             w,
             32,
         )
-        c_tmp = None
+        workspace = None
 
         with pytest.raises(RuntimeError, match="float8_e8m0fnu"):
             ops.marlin_gemm(
@@ -2543,7 +2591,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2566,7 +2614,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2592,7 +2640,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 nv_g_idx,
                 nv_sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2614,7 +2662,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
             w,
             32,
         )
-        c_tmp = None
+        workspace = None
         common_args = (
             q_w,
             None,
@@ -2624,7 +2672,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
             None,
             g_idx,
             sort_indices,
-                c_tmp,
+                workspace,
             scalar_types.float4_e2m1f.id,
             a.shape[0],
             w.shape[1],
@@ -2654,7 +2702,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2665,7 +2713,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="act_order is not supported"):
+        with pytest.raises(RuntimeError, match="act_order"):
             ops.marlin_gemm(
                 a,
                 None,
@@ -2675,16 +2723,16 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 None,
                 None,
-                torch.zeros(w.shape[0], device="cuda", dtype=torch.int),
-                torch.arange(w.shape[0], device="cuda", dtype=torch.int),
-                c_tmp,
+                torch.zeros(w.shape[0], device="cuda", dtype=torch.int32),
+                torch.arange(w.shape[0], device="cuda", dtype=torch.int32),
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
                 w.shape[0],
+                False,
                 True,
-                False,
-                False,
+                True,
                 False,
             )
 
@@ -2700,7 +2748,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2723,7 +2771,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 torch.zeros_like(scales),
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.float4_e2m1f.id,
                 a.shape[0],
                 w.shape[1],
@@ -2734,28 +2782,29 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 True,
             )
 
-        with pytest.raises(RuntimeError, match="requires full-K"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                None,
-                scales,
-                None,
-                None,
-                None,
-                g_idx,
-                sort_indices,
-                c_tmp,
-                scalar_types.float4_e2m1f.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                False,
-                False,
-                False,
-                False,
-            )
+        output = ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            False,
+            False,
+            False,
+            False,
+        )
+        assert output.shape == (a.shape[0], w.shape[1])
+        assert torch.isfinite(output).all()
 
     def test_marlin_dense_mxfp4_rejects_unsupported_k_and_n_shapes():
         _require_marlin_cuda()
@@ -2843,7 +2892,7 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes(repack
     _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
         w, scalar_types.uint4b8, 128, False
     )
-    c_tmp = None
+    workspace = None
 
     target_capability = source_target_capability()
     capability = torch.cuda.get_device_capability(device)
@@ -2860,7 +2909,7 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes(repack
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.uint4b8.id,
                 a.shape[0],
                 w.shape[1],
@@ -2886,7 +2935,7 @@ def test_marlin_dense_rejects_mismatched_capability_or_unsupported_dtypes(repack
             None,
             g_idx,
             sort_indices,
-                c_tmp,
+                workspace,
             scalar_types.uint4b8.id,
             a_bf16.shape[0],
             w.shape[1],
@@ -2916,7 +2965,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
         _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
             w, scalar_types.uint8b128, 128, False
         )
-        c_tmp = None
+        workspace = None
 
         target_capability = source_target_capability()
         capability = torch.cuda.get_device_capability(device)
@@ -2933,7 +2982,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                     None,
                     g_idx,
                     sort_indices,
-                    c_tmp,
+                    workspace,
                     scalar_types.uint8b128.id,
                     a.shape[0],
                     w.shape[1],
@@ -2959,7 +3008,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.uint8b128.id,
                 a_bf16.shape[0],
                 w.shape[1],
@@ -2987,7 +3036,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.uint8b128.id,
                 a_bf16.shape[0],
                 w.shape[1],
@@ -3015,7 +3064,7 @@ if "uint8b128" in _DENSE_SUPPORTED_QUANT_NAMES:
                 None,
                 g_idx,
                 sort_indices,
-                c_tmp,
+                workspace,
                 scalar_types.uint4b8.id,
                 a_bf16.shape[0],
                 w.shape[1],

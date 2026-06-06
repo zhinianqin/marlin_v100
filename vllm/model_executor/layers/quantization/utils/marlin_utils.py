@@ -29,10 +29,10 @@ GPTQ_MARLIN_MAX_PARALLEL = 16
 
 MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
-# SM70 Marlin reduces split-K partials directly into the fp16 output tensor.
-# The old fp32 c_tmp workspace path is intentionally disabled to avoid a
-# persistent M*N scratch allocation on each writeback class.
-USE_FP32_REDUCE_DEFAULT = False
+# In case there is a performance issue with Marlin, the variable below can be
+# changed to False, which allows Marlin to perform global reductions in fp16
+# precision (instead of fp32), and therefore, save on some memory movements.
+USE_FP32_REDUCE_DEFAULT = True
 
 
 # For binary size and compile time, we don't support the same types for with and
@@ -254,8 +254,11 @@ def marlin_moe_intermediate_size(w1_packed: torch.Tensor, w2_packed: torch.Tenso
     return w2_packed.size(1) * marlin_tile_size
 
 
-def marlin_make_c_tmp(device: torch.device) -> torch.Tensor:
-    return torch.empty(0, dtype=torch.float32, device=device, requires_grad=False)
+def marlin_make_workspace_new(
+    device: torch.device, max_blocks_per_sm: int = 1
+) -> torch.Tensor:
+    del max_blocks_per_sm
+    return torch.empty(0, dtype=torch.int, device=device, requires_grad=False)
 
 
 def marlin_is_k_full(act_order: bool, is_row_parallel: bool) -> bool:
@@ -641,7 +644,7 @@ def apply_gptq_marlin_linear(
     weight_zp: torch.Tensor,
     g_idx: torch.Tensor,
     g_idx_sort_indices: torch.Tensor,
-    c_tmp: torch.Tensor,
+    workspace: torch.Tensor,
     wtype: ScalarType,
     output_size_per_partition: int,
     input_size_per_partition: int,
@@ -688,7 +691,7 @@ def apply_gptq_marlin_linear(
         weight_zp,
         g_idx,
         g_idx_sort_indices,
-        c_tmp,
+        workspace,
         wtype,
         size_m=reshaped_x.shape[0],
         size_n=output_size_per_partition,
@@ -709,7 +712,7 @@ def apply_awq_marlin_linear(
     weight_zp: torch.Tensor,
     g_idx: torch.Tensor,
     g_idx_sort_indices: torch.Tensor,
-    c_tmp: torch.Tensor,
+    workspace: torch.Tensor,
     quant_type: ScalarType,
     output_size_per_partition: int,
     input_size_per_partition: int,
@@ -754,7 +757,7 @@ def apply_awq_marlin_linear(
         weight_zp,
         g_idx,
         g_idx_sort_indices,
-        c_tmp,
+        workspace,
         quant_type,
         size_m=reshaped_x.shape[0],
         size_n=output_size_per_partition,

@@ -12,6 +12,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_act_int8_process_scales,
     marlin_is_k_full,
     marlin_make_empty_g_idx,
+    marlin_make_workspace_new,
     marlin_permute_bias,
     marlin_sort_g_idx,
     marlin_zero_points,
@@ -83,9 +84,7 @@ class MarlinLinearKernel(MPLinearKernel):
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # Empty compatibility tensor. SM70 split-K reduces directly into the
-        # output tensor and must not allocate an fp32 c_tmp workspace.
-        self.c_tmp = torch.empty(0, dtype=torch.float32, device=device)
+        self.workspace = marlin_make_workspace_new(device)
         self.is_zp_float = False
 
         # Default names since marlin requires empty parameters for these,
@@ -226,12 +225,12 @@ class MarlinLinearKernel(MPLinearKernel):
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
         #  None for marlin.
         if (
-            self.c_tmp.device != x.device
-            or self.c_tmp.dtype != torch.float32
-            or not self.c_tmp.is_contiguous()
-            or self.c_tmp.numel() != 0
+            self.workspace.device != x.device
+            or self.workspace.dtype != torch.int
+            or not self.workspace.is_contiguous()
+            or self.workspace.numel() != 0
         ):
-            self.c_tmp = torch.empty(0, dtype=torch.float32, device=x.device)
+            self.workspace = marlin_make_workspace_new(x.device)
 
         return apply_gptq_marlin_linear(
             input=x,
@@ -240,7 +239,7 @@ class MarlinLinearKernel(MPLinearKernel):
             weight_zp=w_zp,  # type: ignore
             g_idx=w_gidx,  # type: ignore
             g_idx_sort_indices=layer.g_idx_sort_indices,
-            c_tmp=self.c_tmp,
+            workspace=self.workspace,
             wtype=c.weight_type,
             input_size_per_partition=c.partition_weight_shape[0],
             output_size_per_partition=c.partition_weight_shape[1],

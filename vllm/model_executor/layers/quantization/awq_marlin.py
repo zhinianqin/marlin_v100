@@ -43,7 +43,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_moe_marlin_supports_layer,
     get_marlin_input_dtype,
     marlin_act_int8_process_scales,
-    marlin_make_c_tmp,
+    marlin_make_workspace_new,
     marlin_permute_bias,
     moe_awq_to_sm70_marlin_zero_points_float,
     sm70_marlin_moe_logical_scales,
@@ -604,7 +604,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
         device = layer.w13_qweight.device
-        layer.c_tmp = marlin_make_c_tmp(device)
+        layer.workspace = marlin_make_workspace_new(device, 4)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
@@ -731,7 +731,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
             layer.w2_bias.data = marlin_permute_bias(layer.w2_bias)
 
-        layer.c_tmp = marlin_make_c_tmp(layer.w13_qweight.device)
+        layer.workspace = marlin_make_workspace_new(layer.w13_qweight.device, 4)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -849,8 +849,7 @@ class AWQMarlinMoEMethod(FusedMoEMethodBase):
             w2_zeros=layer.w2_qzeros,
             is_w1_zp_float=True,
             is_w2_zp_float=True,
-            c_tmp=layer.c_tmp,
-            c_tmp_owner=layer,
+            workspace=layer.workspace,
             input_dtype=self.input_dtype,
             inplace=not self.moe.disable_inplace,
         )

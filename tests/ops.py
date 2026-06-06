@@ -8,6 +8,21 @@ _dense_loaded = False
 _moe_loaded = False
 
 
+def _empty_workspace(device: torch.device) -> torch.Tensor:
+    return torch.empty(0, dtype=torch.int, device=device)
+
+
+def _with_workspace(args, kwargs):
+    args = list(args)
+    if len(args) > 10:
+        if args[10] is None:
+            args[10] = _empty_workspace(args[0].device)
+    elif kwargs.get("workspace") is None:
+        kwargs = dict(kwargs)
+        kwargs["workspace"] = _empty_workspace(args[0].device)
+    return tuple(args), kwargs
+
+
 def _load_dense() -> None:
     global _dense_loaded
     if not _dense_loaded:
@@ -25,6 +40,7 @@ def _load_moe() -> None:
 def marlin_gemm(*args, **kwargs) -> torch.Tensor:
     """Low-level dense binding without Python-side support-matrix validation."""
     _load_dense()
+    args, kwargs = _with_workspace(args, kwargs)
     return torch.ops._C.marlin_gemm(*args, **kwargs)
 
 
@@ -76,4 +92,5 @@ def batched_moe_align_block_size(*args, **kwargs) -> None:
 def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
     """Low-level MoE binding without Python-side support-matrix validation."""
     _load_moe()
+    args, kwargs = _with_workspace(args, kwargs)
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)

@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     get_marlin_input_dtype,
-    marlin_make_c_tmp,
+    marlin_make_workspace_new,
     marlin_permute_bias,
     should_use_atomic_add_reduce,
     sm70_marlin_logical_scales,
@@ -43,7 +43,7 @@ def apply_fp8_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    c_tmp: torch.Tensor,
+    workspace: torch.Tensor,
     size_n: int,
     size_k: int,
     bias: torch.Tensor | None,
@@ -77,7 +77,7 @@ def apply_fp8_marlin_linear(
         b_zeros=None,
         g_idx=None,
         perm=None,
-        c_tmp=c_tmp,
+        workspace=workspace,
         b_q_type=scalar_types.float8_e4m3fn,
         size_m=reshaped_x.size(0),
         size_n=size_n,
@@ -115,7 +115,7 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
 
-    layer.c_tmp = marlin_make_c_tmp(device)
+    layer.workspace = marlin_make_workspace_new(device)
 
     # WEIGHT
     # Repack weights to marlin format
@@ -208,8 +208,8 @@ def prepare_fp8_moe_layer_for_marlin(
     """
     Shuffle weights and scales into marlin format.
 
-    Note that this function has the side effect of adding a `c_tmp`
-    attribute to the layer. This `c_tmp` does not need to be
+    Note that this function has the side effect of adding a `workspace`
+    attribute to the layer. This `workspace` does not need to be
     registered as a Parameter as it is not used during weight reloading.
     """
 
@@ -230,9 +230,9 @@ def prepare_fp8_moe_layer_for_marlin(
     weight_block_size = getattr(layer, "weight_block_size", None)
 
     device = layer.w13_weight.device
-    # NOTE(rob): we do not need to register c_tmp as a param
+    # NOTE(rob): we do not need to register the workspace as a param
     # because it is not used as part of the weight reloading process.
-    layer.c_tmp = marlin_make_c_tmp(device)
+    layer.workspace = marlin_make_workspace_new(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     # WEIGHT

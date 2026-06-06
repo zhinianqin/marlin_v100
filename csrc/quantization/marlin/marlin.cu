@@ -74,11 +74,23 @@ torch::Tensor marlin_gemm(
     std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    std::optional<torch::Tensor> const& c_tmp_or_none,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
+  if (g_idx_or_none.has_value()) {
+    TORCH_CHECK(g_idx_or_none.value().numel() == 0,
+                "SM70 Marlin does not support act_order g_idx.");
+  }
+  if (perm_or_none.has_value()) {
+    TORCH_CHECK(perm_or_none.value().numel() == 0,
+                "SM70 Marlin does not support act_order perm.");
+  }
+  (void)workspace;
+  (void)is_k_full;
+  (void)use_atomic_add;
+  (void)use_fp32_reduce;
+
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -155,13 +167,6 @@ torch::Tensor marlin_gemm(
               "SM70 Marlin currently implements only uint4, "
               "uint4b8, uint8, uint8b128, fp8_e4m3fn, nvfp4, and "
               "mxfp4 dense weights.");
-  TORCH_CHECK(!use_fp32_reduce,
-              "SM70 Marlin requires use_fp32_reduce=false.");
-  if (c_tmp_or_none.has_value()) {
-    TORCH_CHECK(c_tmp_or_none.value().numel() == 0,
-                "SM70 Marlin requires an empty c_tmp tensor because split-K "
-                "reduces directly into the output tensor.");
-  }
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -253,47 +258,13 @@ torch::Tensor marlin_gemm(
               " is not size_n = ", size_n);
   num_groups = b_scales.size(0);
 
-  torch::Tensor g_idx, perm;
-  if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
-    g_idx = g_idx_or_none.value();
-    perm = perm_or_none.value();
-
-    TORCH_CHECK(g_idx.device().is_cuda(), "g_idx is not on GPU");
-    TORCH_CHECK(g_idx.is_contiguous(), "g_idx is not contiguous");
-    TORCH_CHECK(perm.device().is_cuda(), "perm is not on GPU");
-    TORCH_CHECK(perm.is_contiguous(), "perm is not contiguous");
-
-    // Verify g_idx and perm
-    TORCH_CHECK((g_idx.size(-1) == 0 && perm.size(-1) == 0) ||
-                    (g_idx.size(-1) == size_k && perm.size(-1) == size_k),
-                "Unexpected g_idx.size(-1) = ", g_idx.size(-1),
-                " and perm.size(-1) = ", perm.size(-1),
-                ", where size_k = ", size_k);
+  if (num_groups > 1) {
+    TORCH_CHECK(size_k % num_groups == 0, "size_k = ", size_k,
+                ", is not divisible by b_scales.size(0) = ",
+                b_scales.size(0));
+    group_size = size_k / num_groups;
   } else {
-    g_idx = torch::empty({0}, options);
-    perm = torch::empty({0}, options);
-  }
-  bool has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
-
-  if (has_act_order) {
-    if (is_k_full) {
-      TORCH_CHECK(num_groups > 1, "For act_order, num_groups must be > 1");
-      TORCH_CHECK(size_k % num_groups == 0, "size_k = ", size_k,
-                  ", is not divisible by num_groups = ", num_groups);
-      group_size = size_k / num_groups;
-    } else {
-      group_size = 0;
-    }
-
-  } else {
-    if (num_groups > 1) {
-      TORCH_CHECK(
-          size_k % num_groups == 0, "size_k = ", size_k,
-          ", is not divisible by b_scales.size(0) = ", b_scales.size(0));
-      group_size = size_k / num_groups;
-    } else {
-      group_size = -1;
-    }
+    group_size = -1;
   }
 
   torch::Tensor global_scale;
@@ -383,18 +354,12 @@ torch::Tensor marlin_gemm(
 
   TORCH_CHECK(b_q_weight.scalar_type() == at::ScalarType::Int,
               "SM70 Marlin expects int32 packed weights.");
-  TORCH_CHECK(!has_act_order,
-              "act_order is not supported for the SM70 Marlin path.");
   TORCH_CHECK(!has_bias,
               "SM70 Marlin does not support bias. TODO: add epilogue bias fusion.");
   TORCH_CHECK((b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) ||
                   global_scale.numel() == 0,
               "SM70 Marlin supports global_scale only for "
               "nvfp4 format.");
-  TORCH_CHECK(!use_atomic_add,
-              "SM70 Marlin does not support atomic-add output.");
-  TORCH_CHECK(is_k_full,
-              "SM70 Marlin requires full-K non act-order inputs.");
   TORCH_CHECK(size_k % 32 == 0,
               "SM70 Marlin requires size_k % 32 == 0.");
   TORCH_CHECK(size_n % 64 == 0,

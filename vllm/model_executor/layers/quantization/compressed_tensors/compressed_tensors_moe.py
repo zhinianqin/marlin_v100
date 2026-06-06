@@ -74,7 +74,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_moe_marlin_supports_layer,
     get_marlin_input_dtype,
     marlin_act_int8_process_scales,
-    marlin_make_c_tmp,
+    marlin_make_workspace_new,
     sm70_marlin_moe_logical_scales,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -1549,7 +1549,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             )
         replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
 
-        layer.c_tmp = marlin_make_c_tmp(device)
+        layer.workspace = marlin_make_workspace_new(device, 4)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1661,8 +1661,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
-            c_tmp=layer.c_tmp,
-            c_tmp_owner=layer,
+            workspace=layer.workspace,
             input_dtype=self.marlin_input_dtype,
             is_k_full=self.is_k_full,
             inplace=not self.moe.disable_inplace,

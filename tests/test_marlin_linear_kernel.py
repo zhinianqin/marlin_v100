@@ -142,7 +142,7 @@ def test_dense_writeback_class_inventory_has_test_coverage() -> None:
 
 @dataclass
 class _RecordedDenseGemm:
-    c_tmp: torch.Tensor
+    workspace: torch.Tensor
     size_m: int
     size_n: int
     size_k: int
@@ -192,9 +192,9 @@ def test_marlin_linear_kernel_u4_u8_zp_preprocess_and_apply(
     assert case.layer.qzeros.shape == (case.num_groups, size_n)
     assert case.layer.qzeros.is_contiguous()
     assert case.kernel.is_zp_float is True
-    assert case.kernel.c_tmp.dtype == torch.float32
-    assert case.kernel.c_tmp.device == activation.device
-    assert case.kernel.c_tmp.numel() == 0
+    assert case.kernel.workspace.dtype == torch.int
+    assert case.kernel.workspace.device == activation.device
+    assert case.kernel.workspace.numel() == 0
 
     assert case.output is not None
     assert case.reference is not None
@@ -264,7 +264,7 @@ def _install_dense_marlin_cpu_mocks(
 
     def fake_marlin_gemm(*args, **kwargs) -> torch.Tensor:
         a = kwargs.get("a", args[0] if len(args) > 0 else None)
-        c_tmp = kwargs.get("c_tmp", args[10] if len(args) > 10 else None)
+        workspace = kwargs.get("workspace", args[10] if len(args) > 10 else None)
         b_q_type = kwargs.get("b_q_type", args[11] if len(args) > 11 else None)
         size_m = kwargs.get("size_m", args[12] if len(args) > 12 else None)
         size_n = kwargs.get("size_n", args[13] if len(args) > 13 else None)
@@ -277,14 +277,14 @@ def _install_dense_marlin_cpu_mocks(
         )
 
         assert a is not None
-        assert c_tmp is not None
+        assert workspace is not None
         assert b_q_type is not None
         assert size_m is not None
         assert size_n is not None
         assert size_k is not None
         records.append(
             _RecordedDenseGemm(
-                c_tmp=c_tmp,
+                workspace=workspace,
                 size_m=size_m,
                 size_n=size_n,
                 size_k=size_k,
@@ -306,15 +306,15 @@ def _install_dense_marlin_cpu_mocks(
     return records
 
 
-def _assert_fresh_layer_c_tmp(layer: torch.nn.Module) -> None:
-    assert hasattr(layer, "c_tmp")
-    assert layer.c_tmp.dtype == torch.float32
-    assert layer.c_tmp.is_contiguous()
-    assert layer.c_tmp.numel() == 0
-    assert not layer.c_tmp.requires_grad
+def _assert_fresh_layer_workspace(layer: torch.nn.Module) -> None:
+    assert hasattr(layer, "workspace")
+    assert layer.workspace.dtype == torch.int
+    assert layer.workspace.is_contiguous()
+    assert layer.workspace.numel() == 0
+    assert not layer.workspace.requires_grad
 
 
-def _assert_layer_apply_keeps_empty_c_tmp(
+def _assert_layer_apply_keeps_empty_workspace(
     apply_fn: Any,
     layer: torch.nn.Module,
     records: list[_RecordedDenseGemm],
@@ -326,47 +326,47 @@ def _assert_layer_apply_keeps_empty_c_tmp(
     x = torch.randn(2, size_k, dtype=torch.float16)
     output = apply_fn(x)
     assert output.shape == (2, size_n)
-    assert layer.c_tmp.dtype == torch.float32
-    assert layer.c_tmp.is_contiguous()
-    assert layer.c_tmp.numel() == 0
+    assert layer.workspace.dtype == torch.int
+    assert layer.workspace.is_contiguous()
+    assert layer.workspace.numel() == 0
     assert len(records) == 1
-    assert records[0].c_tmp is layer.c_tmp
+    assert records[0].workspace is layer.workspace
     assert records[0].size_m == 2
     assert records[0].size_n == size_n
     assert records[0].size_k == size_k
-    assert records[0].use_fp32_reduce is False
+    assert records[0].use_fp32_reduce is True
     assert records[0].is_zp_float is False
 
-    first_c_tmp = layer.c_tmp
+    first_workspace = layer.workspace
     records.clear()
     output = apply_fn(torch.randn(1, size_k, dtype=torch.float16))
     assert output.shape == (1, size_n)
-    assert layer.c_tmp is first_c_tmp
+    assert layer.workspace is first_workspace
     assert len(records) == 1
-    assert records[0].c_tmp is first_c_tmp
-    assert records[0].use_fp32_reduce is False
+    assert records[0].workspace is first_workspace
+    assert records[0].use_fp32_reduce is True
     assert records[0].is_zp_float is False
 
     records.clear()
     output = apply_fn(torch.randn(5, size_k, dtype=torch.float16))
     assert output.shape == (5, size_n)
-    assert layer.c_tmp is first_c_tmp
-    assert layer.c_tmp.numel() == 0
+    assert layer.workspace is first_workspace
+    assert layer.workspace.numel() == 0
     assert len(records) == 1
-    assert records[0].c_tmp is layer.c_tmp
-    assert records[0].use_fp32_reduce is False
+    assert records[0].workspace is layer.workspace
+    assert records[0].use_fp32_reduce is True
     assert records[0].is_zp_float is False
 
 
-def _assert_fresh_kernel_c_tmp(kernel: Any) -> None:
-    assert hasattr(kernel, "c_tmp")
-    assert kernel.c_tmp.dtype == torch.float32
-    assert kernel.c_tmp.is_contiguous()
-    assert kernel.c_tmp.numel() == 0
-    assert not kernel.c_tmp.requires_grad
+def _assert_fresh_kernel_workspace(kernel: Any) -> None:
+    assert hasattr(kernel, "workspace")
+    assert kernel.workspace.dtype == torch.int
+    assert kernel.workspace.is_contiguous()
+    assert kernel.workspace.numel() == 0
+    assert not kernel.workspace.requires_grad
 
 
-def _assert_kernel_apply_keeps_empty_c_tmp(
+def _assert_kernel_apply_keeps_empty_workspace(
     apply_fn: Any,
     kernel: Any,
     records: list[_RecordedDenseGemm],
@@ -378,35 +378,35 @@ def _assert_kernel_apply_keeps_empty_c_tmp(
     records.clear()
     output = apply_fn(torch.randn(2, size_k, dtype=torch.float16))
     assert output.shape == (2, size_n)
-    assert kernel.c_tmp.dtype == torch.float32
-    assert kernel.c_tmp.is_contiguous()
-    assert kernel.c_tmp.numel() == 0
+    assert kernel.workspace.dtype == torch.int
+    assert kernel.workspace.is_contiguous()
+    assert kernel.workspace.numel() == 0
     assert len(records) == 1
-    assert records[0].c_tmp is kernel.c_tmp
+    assert records[0].workspace is kernel.workspace
     assert records[0].size_m == 2
     assert records[0].size_n == size_n
     assert records[0].size_k == size_k
-    assert records[0].use_fp32_reduce is False
+    assert records[0].use_fp32_reduce is True
     assert records[0].is_zp_float is expected_is_zp_float
 
-    first_c_tmp = kernel.c_tmp
+    first_workspace = kernel.workspace
     records.clear()
     output = apply_fn(torch.randn(1, size_k, dtype=torch.float16))
     assert output.shape == (1, size_n)
-    assert kernel.c_tmp is first_c_tmp
+    assert kernel.workspace is first_workspace
     assert len(records) == 1
-    assert records[0].c_tmp is first_c_tmp
-    assert records[0].use_fp32_reduce is False
+    assert records[0].workspace is first_workspace
+    assert records[0].use_fp32_reduce is True
     assert records[0].is_zp_float is expected_is_zp_float
 
     records.clear()
     output = apply_fn(torch.randn(5, size_k, dtype=torch.float16))
     assert output.shape == (5, size_n)
-    assert kernel.c_tmp is first_c_tmp
-    assert kernel.c_tmp.numel() == 0
+    assert kernel.workspace is first_workspace
+    assert kernel.workspace.numel() == 0
     assert len(records) == 1
-    assert records[0].c_tmp is kernel.c_tmp
-    assert records[0].use_fp32_reduce is False
+    assert records[0].workspace is kernel.workspace
+    assert records[0].use_fp32_reduce is True
     assert records[0].is_zp_float is expected_is_zp_float
 
 
@@ -584,7 +584,7 @@ def _make_awq_marlin_linear_method_case(
 
 @pytest.mark.parametrize("quant_name", ("uint4", "uint8"))
 @pytest.mark.parametrize("group_size", _GROUP_SIZES)
-def test_compressed_tensors_wna16_asymmetric_uses_marlin_kernel_zp_and_c_tmp(
+def test_compressed_tensors_wna16_asymmetric_uses_marlin_kernel_zp_and_workspace(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
     group_size: int,
@@ -605,9 +605,9 @@ def test_compressed_tensors_wna16_asymmetric_uses_marlin_kernel_zp_and_c_tmp(
     assert layer.weight_zero_point.shape == (num_groups, size_n)
     assert layer.weight_zero_point.is_contiguous()
     assert scheme.kernel.is_zp_float is True
-    _assert_fresh_kernel_c_tmp(scheme.kernel)
+    _assert_fresh_kernel_workspace(scheme.kernel)
 
-    _assert_kernel_apply_keeps_empty_c_tmp(
+    _assert_kernel_apply_keeps_empty_workspace(
         lambda x: scheme.apply_weights(layer, x, None),
         scheme.kernel,
         records,
@@ -643,7 +643,7 @@ def test_marlin_linear_kernel_scalar_support_matrix_includes_fp4() -> None:
         if is_dense_group_size_supported(quant_name, group_size, 128)
     ],
 )
-def test_marlin_linear_kernel_non_zp_quant_uses_c_tmp_and_false_zp_flag(
+def test_marlin_linear_kernel_non_zp_quant_uses_workspace_and_false_zp_flag(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
     group_size: int,
@@ -663,8 +663,8 @@ def test_marlin_linear_kernel_non_zp_quant_uses_c_tmp_and_false_zp_flag(
 
     assert getattr(case.kernel, "is_zp_float", None) is False
     assert case.layer.w_zp.numel() == 0
-    _assert_fresh_kernel_c_tmp(case.kernel)
-    _assert_kernel_apply_keeps_empty_c_tmp(
+    _assert_fresh_kernel_workspace(case.kernel)
+    _assert_kernel_apply_keeps_empty_workspace(
         lambda x: case.kernel.apply_weights(case.layer, x),
         case.kernel,
         records,
@@ -687,7 +687,7 @@ def test_marlin_linear_kernel_non_zp_quant_uses_c_tmp_and_false_zp_flag(
         if is_dense_group_size_supported(quant_name, group_size, 128)
     ],
 )
-def test_gptq_marlin_linear_method_class_path_uses_kernel_c_tmp(
+def test_gptq_marlin_linear_method_class_path_uses_kernel_workspace(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
     group_size: int,
@@ -704,8 +704,8 @@ def test_gptq_marlin_linear_method_class_path_uses_kernel_c_tmp(
 
     assert method.kernel.is_zp_float is False
     assert layer.qzeros.numel() == 0
-    _assert_fresh_kernel_c_tmp(method.kernel)
-    _assert_kernel_apply_keeps_empty_c_tmp(
+    _assert_fresh_kernel_workspace(method.kernel)
+    _assert_kernel_apply_keeps_empty_workspace(
         lambda x: method.apply(layer, x, None),
         method.kernel,
         records,
@@ -728,7 +728,7 @@ def test_gptq_marlin_linear_method_class_path_uses_kernel_c_tmp(
         if is_dense_group_size_supported(quant_name, group_size, 128)
     ],
 )
-def test_awq_marlin_linear_method_class_path_converts_zp_and_uses_kernel_c_tmp(
+def test_awq_marlin_linear_method_class_path_converts_zp_and_uses_kernel_workspace(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
     group_size: int,
@@ -747,8 +747,8 @@ def test_awq_marlin_linear_method_class_path_converts_zp_and_uses_kernel_c_tmp(
     assert layer.qzeros.shape == (num_groups, size_n)
     assert layer.qzeros.is_contiguous()
     assert method.kernel.is_zp_float is True
-    _assert_fresh_kernel_c_tmp(method.kernel)
-    _assert_kernel_apply_keeps_empty_c_tmp(
+    _assert_fresh_kernel_workspace(method.kernel)
+    _assert_kernel_apply_keeps_empty_workspace(
         lambda x: method.apply(layer, x, None),
         method.kernel,
         records,
@@ -767,7 +767,7 @@ def test_awq_marlin_linear_method_class_path_converts_zp_and_uses_kernel_c_tmp(
         if is_dense_group_size_supported(quant_name, group_size, 128)
     ],
 )
-def test_compressed_tensors_wna16_symmetric_uses_marlin_kernel_c_tmp(
+def test_compressed_tensors_wna16_symmetric_uses_marlin_kernel_workspace(
     monkeypatch: pytest.MonkeyPatch,
     quant_name: str,
     group_size: int,
@@ -785,8 +785,8 @@ def test_compressed_tensors_wna16_symmetric_uses_marlin_kernel_c_tmp(
     scheme.process_weights_after_loading(layer)
     assert scheme.kernel.is_zp_float is False
     assert getattr(layer, scheme.kernel.w_zp_name).numel() == 0
-    _assert_fresh_kernel_c_tmp(scheme.kernel)
-    _assert_kernel_apply_keeps_empty_c_tmp(
+    _assert_fresh_kernel_workspace(scheme.kernel)
+    _assert_kernel_apply_keeps_empty_workspace(
         lambda x: scheme.apply_weights(layer, x, None),
         scheme.kernel,
         records,
@@ -844,7 +844,7 @@ def _make_fp8_block_layer(*, size_k: int, size_n: int) -> torch.nn.Module:
     return layer
 
 
-def test_fp8_scaled_mm_kernel_persists_c_tmp_and_apply_uses_it(
+def test_fp8_scaled_mm_kernel_persists_workspace_and_apply_uses_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
@@ -872,8 +872,8 @@ def test_fp8_scaled_mm_kernel_persists_c_tmp_and_apply_uses_it(
     )
 
     kernel.process_weights_after_loading(layer)
-    _assert_fresh_layer_c_tmp(layer)
-    _assert_layer_apply_keeps_empty_c_tmp(
+    _assert_fresh_layer_workspace(layer)
+    _assert_layer_apply_keeps_empty_workspace(
         lambda x: kernel.apply_weights(layer, x),
         layer,
         records,
@@ -882,7 +882,7 @@ def test_fp8_scaled_mm_kernel_persists_c_tmp_and_apply_uses_it(
     )
 
 
-def test_compressed_tensors_w8a16_fp8_persists_c_tmp_and_apply_uses_it(
+def test_compressed_tensors_w8a16_fp8_persists_workspace_and_apply_uses_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from compressed_tensors.quantization import QuantizationStrategy
@@ -901,8 +901,8 @@ def test_compressed_tensors_w8a16_fp8_persists_c_tmp_and_apply_uses_it(
     )
 
     scheme.process_weights_after_loading(layer)
-    _assert_fresh_layer_c_tmp(layer)
-    _assert_layer_apply_keeps_empty_c_tmp(
+    _assert_fresh_layer_workspace(layer)
+    _assert_layer_apply_keeps_empty_workspace(
         lambda x: scheme.apply_weights(layer, x),
         layer,
         records,
@@ -975,7 +975,7 @@ def _make_mxfp4_layer(*, size_k: int = 64, size_n: int = 64) -> torch.nn.Module:
     return layer
 
 
-def test_compressed_tensors_w4a16_nvfp4_persists_c_tmp_and_apply_uses_it(
+def test_compressed_tensors_w4a16_nvfp4_persists_workspace_and_apply_uses_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_nvfp4 import (  # noqa: E501
@@ -989,8 +989,8 @@ def test_compressed_tensors_w4a16_nvfp4_persists_c_tmp_and_apply_uses_it(
     scheme = CompressedTensorsW4A16Fp4()
 
     scheme.process_weights_after_loading(layer)
-    _assert_fresh_layer_c_tmp(layer)
-    _assert_layer_apply_keeps_empty_c_tmp(
+    _assert_fresh_layer_workspace(layer)
+    _assert_layer_apply_keeps_empty_workspace(
         lambda x: scheme.apply_weights(layer, x),
         layer,
         records,
@@ -999,7 +999,7 @@ def test_compressed_tensors_w4a16_nvfp4_persists_c_tmp_and_apply_uses_it(
     )
 
 
-def test_compressed_tensors_w4a16_mxfp4_persists_c_tmp_and_apply_uses_it(
+def test_compressed_tensors_w4a16_mxfp4_persists_workspace_and_apply_uses_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_mxfp4 import (  # noqa: E501
@@ -1013,8 +1013,8 @@ def test_compressed_tensors_w4a16_mxfp4_persists_c_tmp_and_apply_uses_it(
     scheme = CompressedTensorsW4A16Mxfp4()
 
     scheme.process_weights_after_loading(layer)
-    _assert_fresh_layer_c_tmp(layer)
-    _assert_layer_apply_keeps_empty_c_tmp(
+    _assert_fresh_layer_workspace(layer)
+    _assert_layer_apply_keeps_empty_workspace(
         lambda x: scheme.apply_weights(layer, x),
         layer,
         records,
@@ -1023,7 +1023,7 @@ def test_compressed_tensors_w4a16_mxfp4_persists_c_tmp_and_apply_uses_it(
     )
 
 
-def test_nvfp4_utils_marlin_backend_reuses_layer_c_tmp(
+def test_nvfp4_utils_marlin_backend_reuses_layer_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
@@ -1040,8 +1040,8 @@ def test_nvfp4_utils_marlin_backend_reuses_layer_c_tmp(
     layer.weight = torch.nn.Parameter(layer.weight_packed.data, requires_grad=False)
     del layer.weight_packed
     convert_to_nvfp4_linear_kernel_format(NvFp4LinearBackend.MARLIN, layer)
-    _assert_fresh_layer_c_tmp(layer)
-    _assert_layer_apply_keeps_empty_c_tmp(
+    _assert_fresh_layer_workspace(layer)
+    _assert_layer_apply_keeps_empty_workspace(
         lambda x: apply_nvfp4_linear(NvFp4LinearBackend.MARLIN, layer, x),
         layer,
         records,
@@ -1273,7 +1273,7 @@ def _dense_matrix_row(
     *,
     status: str,
     expected_is_zp_float: bool | None = None,
-    c_tmp_numel: int | None = None,
+    workspace_numel: int | None = None,
     reason: str = "",
 ) -> dict[str, object]:
     return {
@@ -1287,7 +1287,7 @@ def _dense_matrix_row(
         "N": case.shape.size_n,
         "status": status,
         "is_zp_float": expected_is_zp_float,
-        "c_tmp_numel": c_tmp_numel,
+        "workspace_numel": workspace_numel,
         "reason": reason,
     }
 
@@ -1314,7 +1314,7 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
         "shape_id": Counter(),
     }
     first_failure: dict[str, object] | None = None
-    max_c_tmp_numel = 0
+    max_workspace_numel = 0
 
     with _DENSE_FULL_MATRIX_JSONL.open("w", encoding="utf-8") as jsonl:
         for index, matrix_case in enumerate(iter_dense_writeback_matrix(), start=1):
@@ -1330,7 +1330,7 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
                 continue
 
             expected_is_zp_float: bool | None = None
-            c_tmp_numel: int | None = None
+            workspace_numel: int | None = None
             try:
                 records.clear()
                 apply_fn, owner, expected_is_zp_float = _prepare_dense_matrix_case(
@@ -1351,16 +1351,16 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
                 assert records[0].size_m == matrix_case.shape.size_m
                 assert records[0].size_k == matrix_case.shape.size_k
                 assert records[0].size_n == matrix_case.shape.size_n
-                assert records[0].use_fp32_reduce is False
+                assert records[0].use_fp32_reduce is True
                 assert records[0].is_zp_float is expected_is_zp_float
 
-                assert hasattr(owner, "c_tmp")
-                assert owner.c_tmp.dtype == torch.float32
-                assert owner.c_tmp.is_contiguous()
-                assert owner.c_tmp.numel() == 0
-                assert records[0].c_tmp is owner.c_tmp
-                c_tmp_numel = int(owner.c_tmp.numel())
-                max_c_tmp_numel = max(max_c_tmp_numel, c_tmp_numel)
+                assert hasattr(owner, "workspace")
+                assert owner.workspace.dtype == torch.int
+                assert owner.workspace.is_contiguous()
+                assert owner.workspace.numel() == 0
+                assert records[0].workspace is owner.workspace
+                workspace_numel = int(owner.workspace.numel())
+                max_workspace_numel = max(max_workspace_numel, workspace_numel)
                 status = "OK"
                 reason = ""
                 status_counts["OK"] += 1
@@ -1377,7 +1377,7 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
                         matrix_case,
                         status=status,
                         expected_is_zp_float=expected_is_zp_float,
-                        c_tmp_numel=c_tmp_numel,
+                        workspace_numel=workspace_numel,
                         reason=reason,
                     )
 
@@ -1387,7 +1387,7 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
                         matrix_case,
                         status=status,
                         expected_is_zp_float=expected_is_zp_float,
-                        c_tmp_numel=c_tmp_numel,
+                        workspace_numel=workspace_numel,
                         reason=reason,
                     ),
                     sort_keys=True,
@@ -1409,7 +1409,7 @@ def test_dense_writeback_class_full_matrix_post_load_apply_path(
         "ok_coverage": {
             key: _counter_to_json(counter) for key, counter in ok_coverage.items()
         },
-        "max_c_tmp_numel": max_c_tmp_numel,
+        "max_workspace_numel": max_workspace_numel,
         "first_failure": first_failure,
         "jsonl": str(_DENSE_FULL_MATRIX_JSONL),
         "elapsed_seconds": round(elapsed, 3),

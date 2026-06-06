@@ -480,8 +480,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=layer.global_num_experts,
                 expert_map=layer.expert_map,
-                c_tmp=layer.c_tmp,
-                c_tmp_owner=layer,
+                workspace=layer.workspace,
                 inplace=not self.moe.disable_inplace,
             )
         else:

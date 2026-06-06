@@ -42,7 +42,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_moe_marlin_supports_layer,
     get_marlin_input_dtype,
     marlin_act_int8_process_scales,
-    marlin_make_c_tmp,
+    marlin_make_workspace_new,
     marlin_permute_bias,
     marlin_repeat_scales_on_all_ranks,
     sm70_marlin_moe_logical_scales,
@@ -656,7 +656,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
         device = layer.w13_qweight.device
-        layer.c_tmp = marlin_make_c_tmp(device)
+        layer.workspace = marlin_make_workspace_new(device, 4)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
@@ -787,7 +787,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
             layer.w2_bias.data = marlin_permute_bias(layer.w2_bias)
 
-        layer.c_tmp = marlin_make_c_tmp(layer.w13_qweight.device)
+        layer.workspace = marlin_make_workspace_new(layer.w13_qweight.device, 4)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -924,8 +924,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             g_idx2=layer.w2_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
-            c_tmp=layer.c_tmp,
-            c_tmp_owner=layer,
+            workspace=layer.workspace,
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
             inplace=not self.moe.disable_inplace,

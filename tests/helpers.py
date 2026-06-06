@@ -69,13 +69,13 @@ _SM70_ROW_GROUPS = (
 )
 
 
-def marlin_make_c_tmp(
+def marlin_make_workspace(
     device: torch.device,
     numel_or_shape: int | tuple[int, ...] = 0,
 ) -> torch.Tensor:
     if isinstance(numel_or_shape, tuple):
-        return torch.empty(numel_or_shape, dtype=torch.float32, device=device)
-    return torch.empty((numel_or_shape,), dtype=torch.float32, device=device)
+        return torch.empty(numel_or_shape, dtype=torch.int, device=device)
+    return torch.empty((numel_or_shape,), dtype=torch.int, device=device)
 
 
 def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
@@ -118,7 +118,7 @@ def run_marlin_gemm(
     size_m: int,
     size_n: int,
     size_k: int,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
     c: torch.Tensor | None = None,
     b_bias: torch.Tensor | None = None,
     a_scales: torch.Tensor | None = None,
@@ -133,6 +133,8 @@ def run_marlin_gemm(
 ) -> torch.Tensor:
     if is_zp_float is None:
         is_zp_float = b_zeros is not None
+    if workspace is None:
+        workspace = marlin_make_workspace(a.device)
     validate_dense_marlin_call(
         b_type_id=b_type_id,
         size_k=size_k,
@@ -152,7 +154,7 @@ def run_marlin_gemm(
         b_zeros,
         g_idx,
         perm,
-        c_tmp,
+        workspace,
         b_type_id,
         size_m,
         size_n,
@@ -199,7 +201,7 @@ def fused_marlin_moe(
     moe_block_size: int = 16,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
-    c_tmp: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
     global_scale1: torch.Tensor | None = None,
     global_scale2: torch.Tensor | None = None,
     g_idx1: torch.Tensor | None = None,
@@ -212,6 +214,8 @@ def fused_marlin_moe(
     is_w2_zp_float: bool = False,
     is_k_full: bool = True,
 ) -> torch.Tensor:
+    if workspace is None:
+        workspace = marlin_make_workspace(hidden_states.device)
     m, k = hidden_states.shape
     topk = topk_ids.shape[1]
     validate_moe_marlin_call(
@@ -250,7 +254,7 @@ def fused_marlin_moe(
         w1_zeros,
         g_idx1,
         sort_indices1,
-        c_tmp,
+        workspace,
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,
@@ -284,7 +288,7 @@ def fused_marlin_moe(
         w2_zeros,
         g_idx2,
         sort_indices2,
-        c_tmp,
+        workspace,
         sorted_ids,
         expert_ids,
         num_tokens_post_pad,

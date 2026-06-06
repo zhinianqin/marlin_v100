@@ -36,7 +36,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! b_q_weight, Tensor? b_bias_or_none,"
       "Tensor! b_scales, Tensor? a_scales, Tensor? global_scale, Tensor? "
       "b_zeros_or_none,"
-      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor? c_tmp_or_none,"
+      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
       "Tensor sorted_token_ids,"
       "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
       "Tensor! topk_weights, int moe_block_size, int top_k, "
