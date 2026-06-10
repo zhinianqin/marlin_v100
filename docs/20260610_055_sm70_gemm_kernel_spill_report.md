@@ -2,7 +2,7 @@
 
 Date: 2026-06-10
 
-Branch: `refactor/cutlass-sm70-marlin-v100`
+Branch: `experiment/sm70-hardcoded-geometry-benchmark-20260610`
 
 Commit: `1198212`
 
