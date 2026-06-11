@@ -25,12 +25,14 @@ namespace {
 
 constexpr int kFp8ValuesPerAccess = 8;
 
-template <typename Shape_, typename ThreadMap_, int GroupSize_>
+template <typename Shape_, typename ThreadMap_, int GroupSize_,
+          bool UseMetadataVectorWords_ = true>
 class Sm70MoeFp8IteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
+  static constexpr bool kUseMetadataVectorWords = UseMetadataVectorWords_;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
@@ -184,7 +186,7 @@ class Sm70MoeFp8IteratorB {
       int const cache_n =
           n_offset_ + thread_offset_.contiguous() +
           c * ThreadMap::Delta::kContiguous;
-      if constexpr (Shape::kN == 256) {
+      if constexpr (kUseMetadataVectorWords) {
         cache_metadata_vector_words(c, group, cache_n);
       } else {
         cache_metadata_lane_vectors(c, group, cache_n);
@@ -370,6 +372,7 @@ class Sm70MoeFp8IteratorB {
   }
 };
 
+template <bool UseMetadataVectorWords = true>
 struct Sm70MoeFp8GemmSpec {
   using ScaleElement = half;
   using ZeroElement = half;
@@ -379,14 +382,19 @@ struct Sm70MoeFp8GemmSpec {
   using IteratorA = Sm70MoeGatherIteratorA<Shape, ThreadMap>;
 
   template <typename Shape, typename ThreadMap, int GroupSize>
-  using IteratorB = Sm70MoeFp8IteratorB<Shape, ThreadMap, GroupSize>;
+  using IteratorB =
+      Sm70MoeFp8IteratorB<Shape, ThreadMap, GroupSize,
+                          UseMetadataVectorWords>;
 };
 
-template <int CtaM, int CtaN, int Warps, int GroupSize>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          bool UseMetadataVectorWords = true>
 using Sm70MoeFp8GemmTraits =
-    Sm70MarlinMoeGemmTraits<Sm70MoeFp8GemmSpec, CtaM, CtaN, Warps,
-                            GroupSize>;
+    Sm70MarlinMoeGemmTraits<
+        Sm70MoeFp8GemmSpec<UseMetadataVectorWords>, CtaM, CtaN, Warps,
+        GroupSize>;
 
+template <bool UseMetadataVectorWords = true>
 struct Sm70MoeFp8Launcher {
   torch::Tensor& a;
   torch::Tensor& c;
@@ -408,7 +416,8 @@ struct Sm70MoeFp8Launcher {
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
-    using Traits = Sm70MoeFp8GemmTraits<CtaM, CtaN, Warps, GroupSize>;
+    using Traits = Sm70MoeFp8GemmTraits<CtaM, CtaN, Warps, GroupSize,
+                                        UseMetadataVectorWords>;
     return launch_sm70_marlin_moe_gemm<Traits>(
         a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
         expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
@@ -442,7 +451,7 @@ torch::Tensor sm70_marlin_fp8_gemm(
   auto empty_half = torch::empty({0}, b_scales.options().dtype(at::kHalf));
   auto empty_float = torch::empty(
       {0}, torch::TensorOptions().dtype(at::kFloat).device(a.device()));
-  Sm70MoeFp8Launcher const launcher{
+  Sm70MoeFp8Launcher<> const launcher{
       a, c, b_q_weight, b_scales, empty_half, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
       mul_topk_weights, size_m, size_n, size_k, requested_split_k};

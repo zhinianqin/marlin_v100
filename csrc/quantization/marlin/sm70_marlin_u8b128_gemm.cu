@@ -45,12 +45,14 @@ namespace {
 
 constexpr int kU8B128ValuesPerAccess = 8;
 
-template <typename Shape_, typename ThreadMap_, int GroupSize_>
+template <typename Shape_, typename ThreadMap_, int GroupSize_,
+          bool UseMetadataVectorWords_ = true>
 class Sm70U8B128IteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
+  static constexpr bool kUseMetadataVectorWords = UseMetadataVectorWords_;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
@@ -217,7 +219,7 @@ class Sm70U8B128IteratorB {
       int const cache_n =
           n_offset_ + thread_offset_.contiguous() +
           c * ThreadMap::Delta::kContiguous;
-      if constexpr (Shape::kN == 256) {
+      if constexpr (kUseMetadataVectorWords) {
         cache_metadata_vector_words(c, group, cache_n);
       } else {
         cache_metadata_lane_vectors(c, group, cache_n);
@@ -395,16 +397,22 @@ class Sm70U8B128IteratorB {
   }
 };
 
+template <bool UseMetadataVectorWords = true>
 struct Sm70U8B128GemmSpec {
   template <typename Shape, typename ThreadMap, int GroupSize>
-  using IteratorB = Sm70U8B128IteratorB<Shape, ThreadMap, GroupSize>;
+  using IteratorB =
+      Sm70U8B128IteratorB<Shape, ThreadMap, GroupSize,
+                          UseMetadataVectorWords>;
 };
 
-template <int CtaM, int CtaN, int Warps, int GroupSize>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          bool UseMetadataVectorWords = true>
 using Sm70U8B128GemmTraits =
-    Sm70MarlinGemmTraits<Sm70U8B128GemmSpec, CtaM, CtaN, Warps, GroupSize>;
+    Sm70MarlinGemmTraits<Sm70U8B128GemmSpec<UseMetadataVectorWords>, CtaM,
+                         CtaN, Warps, GroupSize>;
 
-template <int CtaM, int CtaN, int Warps, int GroupSize>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          bool UseMetadataVectorWords = true>
 __global__ __launch_bounds__(Warps * 32, 1)
 void sm70_marlin_u8b128_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
@@ -412,7 +420,8 @@ void sm70_marlin_u8b128_gemm_kernel(
     cutlass::half_t const* __restrict__ b_scales,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
   using Traits =
-      Sm70U8B128GemmTraits<CtaM, CtaN, Warps, GroupSize>;
+      Sm70U8B128GemmTraits<CtaM, CtaN, Warps, GroupSize,
+                           UseMetadataVectorWords>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -460,14 +469,16 @@ void sm70_marlin_u8b128_gemm_kernel(
   epilogue(output_op, iterator_D, accumulators, iterator_C);
 }
 
-template <int CtaM, int CtaN, int Warps, int GroupSize>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          bool UseMetadataVectorWords = true>
 __global__ __launch_bounds__(Warps * 32, 1)
 void sm70_marlin_u8b128_gemm_splitk_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
     cutlass::half_t* __restrict__ c, int m, int n, int k, int lda, int requested_split_k) {
-  using Traits = Sm70U8B128GemmTraits<CtaM, CtaN, Warps, GroupSize>;
+  using Traits = Sm70U8B128GemmTraits<CtaM, CtaN, Warps, GroupSize,
+                                      UseMetadataVectorWords>;
   using Mma = typename Traits::Mma;
   using AtomicEpilogue = Sm70AtomicFp16Epilogue<Traits>;
 
@@ -521,15 +532,17 @@ void sm70_marlin_u8b128_gemm_splitk_kernel(
 
 }  // namespace
 
-template <int CtaM, int CtaN, int Warps, int GroupSize>
+template <int CtaM, int CtaN, int Warps, int GroupSize,
+          bool UseMetadataVectorWords = true>
 torch::Tensor launch_sm70_marlin_u8b128_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
     torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
     int requested_split_k) {
   auto kernel =
-      sm70_marlin_u8b128_gemm_kernel<CtaM, CtaN, Warps, GroupSize>;
+      sm70_marlin_u8b128_gemm_kernel<CtaM, CtaN, Warps, GroupSize,
+                                     UseMetadataVectorWords>;
   using SharedStorage = typename Sm70U8B128GemmTraits<
-      CtaM, CtaN, Warps, GroupSize>::SharedStorage;
+      CtaM, CtaN, Warps, GroupSize, UseMetadataVectorWords>::SharedStorage;
   size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
 
   dim3 block(Warps * 32);
@@ -554,7 +567,8 @@ torch::Tensor launch_sm70_marlin_u8b128_gemm(
               size_k, ", requested_split_k=", requested_split_k, ".");
 
   auto split_kernel =
-      sm70_marlin_u8b128_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize>;
+      sm70_marlin_u8b128_gemm_splitk_kernel<CtaM, CtaN, Warps, GroupSize,
+                                            UseMetadataVectorWords>;
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * size_n;
@@ -578,6 +592,7 @@ torch::Tensor launch_sm70_marlin_u8b128_gemm(
   return c;
 }
 
+template <bool UseMetadataVectorWords = true>
 struct Sm70U8B128Launcher {
   torch::Tensor& a;
   torch::Tensor& c;
@@ -590,7 +605,8 @@ struct Sm70U8B128Launcher {
 
   template <int CtaM, int CtaN, int Warps, int GroupSize>
   torch::Tensor operator()() const {
-    return launch_sm70_marlin_u8b128_gemm<CtaM, CtaN, Warps, GroupSize>(
+    return launch_sm70_marlin_u8b128_gemm<CtaM, CtaN, Warps, GroupSize,
+                                          UseMetadataVectorWords>(
         a, c, b_q_weight, b_scales, size_m, size_n, size_k, requested_split_k);
   }
 };
@@ -608,7 +624,7 @@ torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
   validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin U8B128", geometry, size_n);
   int const requested_split_k =
       sm70_marlin_dense_auto_requested_split_k(size_m, size_n, size_k, geometry);
-  Sm70U8B128Launcher const launcher{
+  Sm70U8B128Launcher<> const launcher{
       a, c, b_q_weight, b_scales, size_m, size_n, size_k, requested_split_k};
   return dispatch_sm70_marlin_geometry(launcher, geometry, group_size,
                                        "U8B128");
