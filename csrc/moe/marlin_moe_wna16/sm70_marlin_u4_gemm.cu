@@ -430,6 +430,7 @@ torch::Tensor sm70_marlin_u4_gemm(
 
   Sm70CtaGeometry const geometry =
       sm70_marlin_moe_u4_zp_auto_stage_cta_geometry(size_m, size_n,
+                                                    moe_block_size,
                                                     group_size);
   validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE U4", geometry);
   validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE U4", geometry,

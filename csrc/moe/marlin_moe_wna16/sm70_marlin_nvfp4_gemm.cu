@@ -388,7 +388,8 @@ torch::Tensor sm70_marlin_nvfp4_gemm(
   c10::cuda::CUDAGuard device_guard(a.device());
 
   Sm70CtaGeometry const geometry =
-      sm70_marlin_moe_auto_stage_cta_geometry(size_m, size_n);
+      sm70_marlin_moe_auto_stage_cta_geometry(size_m, size_n,
+                                              moe_block_size);
   validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE NVFP4", geometry);
   validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE NVFP4", geometry,
                                         size_n);

@@ -548,6 +548,7 @@ def moe_auto_cta(
     tokens: int = 0,
     quant_name: str | None = None,
     group_size: int | None = None,
+    moe_block_size: int | None = None,
 ) -> ResolvedCta | None:
     if size_n % 256 == 0:
         cta_n = 256
@@ -557,12 +558,21 @@ def moe_auto_cta(
         elif quant_name == "uint8" and group_size == -1 and tokens >= 1024:
             cta_m = 64
             warps = 8
+        elif moe_block_size is not None:
+            cta_m = 32 if moe_block_size <= 32 else 64
+            warps = 4
         else:
             cta_m = 64 if tokens >= 1024 else 32
             warps = 4
     elif size_n % 128 == 0:
         cta_n = 128
-        if tokens >= 4096:
+        if moe_block_size is not None and moe_block_size > 32:
+            cta_m = 64
+            warps = 8
+        elif moe_block_size is not None:
+            cta_m = 32
+            warps = 4
+        elif tokens >= 4096:
             cta_m = 64
             warps = 8
         else:
@@ -657,24 +667,36 @@ def dense_auto_split_k(shape: DenseShapeCase) -> int:
     )
 
 
+def moe_auto_block_size(shape: MoeShapeCase) -> int:
+    block_size_m = 64
+    for candidate in (8, 16, 32, 48, 64):
+        block_size_m = candidate
+        if shape.tokens * shape.topk / shape.experts / candidate < 0.9:
+            break
+    return block_size_m
+
+
 def moe_auto_stage_cta_geometry(
     shape: MoeShapeCase,
     *,
     quant_name: str | None = None,
     group_size: int | None = None,
 ) -> tuple[ResolvedCta | None, ResolvedCta | None]:
+    moe_block_size = moe_auto_block_size(shape)
     return (
         moe_auto_cta(
             2 * shape.intermediate,
             shape.tokens,
             quant_name=quant_name,
             group_size=group_size,
+            moe_block_size=moe_block_size,
         ),
         moe_auto_cta(
             shape.hidden,
             shape.tokens * shape.topk,
             quant_name=quant_name,
             group_size=group_size,
+            moe_block_size=moe_block_size,
         ),
     )
 

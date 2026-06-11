@@ -54,17 +54,18 @@ inline int sm70_marlin_moe_auto_cta_n(int64_t size_n) {
   return 0;
 }
 
-inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(int64_t tokens,
-                                                            int auto_cta_n) {
+inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(
+    int64_t moe_block_size, int auto_cta_n) {
+  bool const use_cta_m32 = moe_block_size <= 32;
   switch (auto_cta_n) {
     case 64:
       return {64, 64, 4};
     case 128:
-      return tokens >= 4096 ? Sm70CtaGeometry{64, 128, 8}
-                            : Sm70CtaGeometry{32, 128, 4};
+      return use_cta_m32 ? Sm70CtaGeometry{32, 128, 4}
+                         : Sm70CtaGeometry{64, 128, 8};
     case 256:
-      return tokens >= 1024 ? Sm70CtaGeometry{64, 256, 4}
-                            : Sm70CtaGeometry{32, 256, 4};
+      return use_cta_m32 ? Sm70CtaGeometry{32, 256, 4}
+                         : Sm70CtaGeometry{64, 256, 4};
     default:
       TORCH_CHECK(false, "Unsupported SM70 Marlin MoE auto CTA_N=",
                   auto_cta_n, ".");
@@ -73,39 +74,45 @@ inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(int64_
 }
 
 inline Sm70CtaGeometry sm70_marlin_moe_u4_zp_auto_stage_cta_geometry_from_cta_n(
-    int64_t tokens, int auto_cta_n, int64_t group_size) {
+    int64_t moe_block_size, int auto_cta_n, int64_t group_size) {
   if (auto_cta_n == 256 && group_size == -1) {
     return {32, 256, 4};
   }
-  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
+  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(moe_block_size,
+                                                            auto_cta_n);
 }
 
 inline Sm70CtaGeometry sm70_marlin_moe_u8_zp_auto_stage_cta_geometry_from_cta_n(
-    int64_t tokens, int auto_cta_n, int64_t group_size) {
+    int64_t tokens, int64_t moe_block_size, int auto_cta_n,
+    int64_t group_size) {
   if (auto_cta_n == 256 && group_size == -1 && tokens >= 1024) {
     return {64, 256, 8};
   }
-  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
+  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(moe_block_size,
+                                                            auto_cta_n);
 }
 
 inline Sm70CtaGeometry sm70_marlin_moe_auto_stage_cta_geometry(
-    int64_t tokens, int64_t size_n) {
+    int64_t /*tokens*/, int64_t size_n, int64_t moe_block_size) {
   int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
-  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(tokens, auto_cta_n);
+  return sm70_marlin_moe_auto_stage_cta_geometry_from_cta_n(moe_block_size,
+                                                            auto_cta_n);
 }
 
 inline Sm70CtaGeometry sm70_marlin_moe_u4_zp_auto_stage_cta_geometry(
-    int64_t tokens, int64_t size_n, int64_t group_size) {
+    int64_t /*tokens*/, int64_t size_n, int64_t moe_block_size,
+    int64_t group_size) {
   int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
   return sm70_marlin_moe_u4_zp_auto_stage_cta_geometry_from_cta_n(
-      tokens, auto_cta_n, group_size);
+      moe_block_size, auto_cta_n, group_size);
 }
 
 inline Sm70CtaGeometry sm70_marlin_moe_u8_zp_auto_stage_cta_geometry(
-    int64_t tokens, int64_t size_n, int64_t group_size) {
+    int64_t tokens, int64_t size_n, int64_t moe_block_size,
+    int64_t group_size) {
   int const auto_cta_n = sm70_marlin_moe_auto_cta_n(size_n);
   return sm70_marlin_moe_u8_zp_auto_stage_cta_geometry_from_cta_n(
-      tokens, auto_cta_n, group_size);
+      tokens, moe_block_size, auto_cta_n, group_size);
 }
 
 inline bool sm70_marlin_moe_cta_geometry_is_supported(
