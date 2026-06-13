@@ -27,6 +27,23 @@ from tests.helpers import (
     scalar_types,
     topk_softmax,
 )
+from tests.sm70_env_sweep import (
+    EXPLICIT_ENV_REJECTION_RE,
+    SM70_MOE_GEOMETRIES,
+    SM70_METADATA_CACHE_VALUES,
+    SM70_SPLIT_K_VALUES,
+    MoeDirectOpKey,
+    exhaustive_enabled,
+    exhaustive_index_is_past_limit,
+    exhaustive_index_is_selected,
+    iter_moe_env_combinations,
+    iter_moe_direct_op_keys,
+    iter_moe_focused_mnk_direct_op_keys,
+    moe_auto_block_size,
+    moe_env,
+    moe_stage_env_combo_is_legal,
+    set_moe_env,
+)
 
 _MOE_SUPPORTED_QUANT_NAMES = frozenset(
     supported_moe_quant_type_names(
@@ -41,6 +58,7 @@ _SM70_SUPPORTED_MOE_BLOCK_SIZES = (8, 16, 32, 48, 64)
 _SUPPORTED_MOE_BLOCK_SIZE_ERROR = (
     "moe_block_size=8, 16, 32, 48, or 64|unsupported moe_block_size="
 )
+_K_TILE_ALIGNMENT_ERROR = "requires K divisible by CTA_K=|is not divisible by tile_size"
 _FLOAT16_DTYPE_ERROR = (
     rf"{source_target_label()} build only supports float16 activations\."
     rf"|{source_target_label()} build only supports float16 outputs\."
@@ -66,6 +84,15 @@ _FORCED_THREAD_GEOMETRY_CASES = (
 _UNSUPPORTED_MOE_BLOCK_SIZE_CASES = (
     pytest.param(24, id="moe_block_24"),
 )
+_MOE_ENV_SWEEP_TOLERANCES = {
+    "uint4": (2e-1, 2.0),
+    "uint4b8": (7e-2, 5e-1),
+    "uint8": (7e-2, 5e-1),
+    "uint8b128": (7e-2, 5e-1),
+    "fp8": (7e-2, 5e-1),
+    "nvfp4": (2e-1, 2.0),
+    "mxfp4": (2e-1, 2.0),
+}
 
 def _require_moe_cuda() -> None:
     if not torch.cuda.is_available():
@@ -1085,6 +1112,673 @@ def _assert_stage1_kernel_rejects_unsupported_config(
         )
 
 
+def _make_moe_env_sweep_inputs(
+    key: MoeDirectOpKey,
+) -> dict[str, object]:
+    _require_moe_cuda()
+    torch.manual_seed(2000 + key.tokens + key.hidden + key.intermediate)
+    torch.cuda.manual_seed_all(2000 + key.tokens + key.hidden + key.intermediate)
+    quant_type = {
+        "uint4": scalar_types.uint4,
+        "uint4b8": scalar_types.uint4b8,
+        "uint8": scalar_types.uint8,
+        "uint8b128": scalar_types.uint8b128,
+        "fp8": scalar_types.float8_e4m3fn,
+        "nvfp4": scalar_types.float4_e2m1f,
+        "mxfp4": scalar_types.float4_e2m1f,
+    }[key.quant_name]
+    return _make_moe_accuracy_inputs(
+        quant_type,
+        repack_impl="gptq",
+        group_size=key.group_size,
+        act_order=False,
+        tokens=key.tokens,
+        hidden=key.hidden,
+        intermediate=key.intermediate,
+        experts=key.experts,
+        topk=key.topk,
+    )
+
+
+def _moe_quant_type_id(quant_name: str) -> int:
+    return {
+        "uint4": scalar_types.uint4,
+        "uint4b8": scalar_types.uint4b8,
+        "uint8": scalar_types.uint8,
+        "uint8b128": scalar_types.uint8b128,
+        "fp8": scalar_types.float8_e4m3fn,
+        "nvfp4": scalar_types.float4_e2m1f,
+        "mxfp4": scalar_types.float4_e2m1f,
+    }[quant_name].id
+
+
+def _make_moe_exact_mnk_env_sweep_inputs(
+    key: MoeDirectOpKey,
+) -> dict[str, object]:
+    if key.topk != 1:
+        raise AssertionError("exact-MNK MoE env sweep uses topk=1")
+    _require_moe_cuda()
+    torch.manual_seed(3000 + key.tokens + key.hidden + key.intermediate)
+    torch.cuda.manual_seed_all(3000 + key.tokens + key.hidden + key.intermediate)
+    quant_type = {
+        "uint4": scalar_types.uint4,
+        "uint4b8": scalar_types.uint4b8,
+        "uint8": scalar_types.uint8,
+        "uint8b128": scalar_types.uint8b128,
+        "fp8": scalar_types.float8_e4m3fn,
+        "nvfp4": scalar_types.float4_e2m1f,
+        "mxfp4": scalar_types.float4_e2m1f,
+    }[key.quant_name]
+
+    hidden_states = torch.randn(
+        (key.tokens, key.hidden), device="cuda", dtype=torch.float16
+    )
+    weights = torch.randn(
+        (key.experts, key.hidden, key.intermediate),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    weights = weights * (1.0 / (key.hidden ** 0.5))
+    topk_ids = torch.empty((key.tokens, 1), device="cuda", dtype=torch.int32)
+    for token_idx in range(key.tokens):
+        topk_ids[token_idx, 0] = token_idx % key.experts
+    topk_weights = torch.ones((key.tokens, 1), device="cuda", dtype=torch.float32)
+
+    if key.quant_name == "uint4":
+        q_weight, scales, zeros, dequant, g_idx, perm = (
+            marlin_quantize_experts_uint4_zp_with_metadata(weights, key.group_size)
+        )
+        global_scale = None
+    elif key.quant_name == "uint8":
+        q_weight, scales, zeros, dequant, g_idx, perm = (
+            marlin_quantize_experts_uint8_zp_with_metadata(weights, key.group_size)
+        )
+        global_scale = None
+    elif key.quant_name == "nvfp4":
+        q_weight, scales, global_scale, dequant, g_idx, perm = (
+            marlin_quantize_experts_nvfp4_with_metadata(weights, key.group_size)
+        )
+        zeros = None
+    elif key.quant_name == "mxfp4":
+        q_weight, scales, dequant, g_idx, perm = (
+            marlin_quantize_experts_mxfp4_with_metadata(weights, key.group_size)
+        )
+        zeros = None
+        global_scale = None
+    else:
+        q_weight, scales, dequant, g_idx, perm = marlin_quantize_experts_with_metadata(
+            weights, quant_type, key.group_size, False
+        )
+        zeros = None
+        global_scale = None
+
+    return {
+        "tokens": key.tokens,
+        "hidden": key.hidden,
+        "intermediate": key.intermediate,
+        "experts": key.experts,
+        "topk": key.topk,
+        "hidden_states": hidden_states,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "w1_q": q_weight,
+        "w1_scales": scales,
+        "w1_zeros": zeros,
+        "w1_global_scale": global_scale,
+        "w1_dequant": dequant,
+        "w1_g_idx": g_idx,
+        "w1_perm": perm,
+    }
+
+
+def _moe_exact_mnk_reference(inputs: dict[str, object]) -> torch.Tensor:
+    hidden_states = inputs["hidden_states"]
+    topk_ids = inputs["topk_ids"]
+    tokens = inputs["tokens"]
+    reference_rows = []
+    for token_idx in range(tokens):
+        expert = int(topk_ids[token_idx, 0].item())
+        reference_rows.append(
+            torch.matmul(
+                hidden_states[token_idx : token_idx + 1].to(torch.float32),
+                inputs["w1_dequant"][expert].to(torch.float32),
+            )[0]
+        )
+    return torch.stack(reference_rows, dim=0).to(torch.float16)
+
+
+def _run_moe_exact_mnk_env_combo(
+    key: MoeDirectOpKey,
+    inputs: dict[str, object],
+    *,
+    moe_block_size: int,
+    reference: torch.Tensor,
+    rtol: float,
+    atol: float,
+) -> torch.Tensor:
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        inputs["topk_ids"], block_size=moe_block_size, num_experts=inputs["experts"]
+    )
+    output = ops.moe_wna16_marlin_gemm(
+        inputs["hidden_states"],
+        torch.empty(
+            (key.tokens, key.intermediate),
+            device="cuda",
+            dtype=torch.float16,
+        ),
+        inputs["w1_q"],
+        None,
+        inputs["w1_scales"],
+        None,
+        inputs["w1_global_scale"],
+        inputs["w1_zeros"],
+        inputs["w1_g_idx"],
+        inputs["w1_perm"],
+        None,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        inputs["topk_weights"],
+        moe_block_size,
+        1,
+        False,
+        _moe_quant_type_id(key.quant_name),
+        key.tokens,
+        key.intermediate,
+        key.hidden,
+        True,
+        False,
+        False,
+        inputs["w1_zeros"] is not None,
+        -1,
+        -1,
+        -1,
+    )
+    assert output.shape == (key.tokens, key.intermediate)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+    return output
+
+
+def _moe_stage1_reference(inputs: dict[str, object]) -> torch.Tensor:
+    hidden_states = inputs["hidden_states"]
+    topk_ids = inputs["topk_ids"]
+    tokens = inputs["tokens"]
+    topk = inputs["topk"]
+    reference_gate_up = []
+    for token_idx in range(tokens):
+        for route_idx in range(topk):
+            expert = int(topk_ids[token_idx, route_idx].item())
+            reference_gate_up.append(
+                torch.matmul(
+                    hidden_states[token_idx : token_idx + 1].to(torch.float32),
+                    inputs["w1_dequant"][expert].to(torch.float32),
+                )[0]
+            )
+    return torch.stack(reference_gate_up, dim=0).to(torch.float16)
+
+
+def _moe_stage2_inputs_and_reference(
+    inputs: dict[str, object],
+    *,
+    moe_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = inputs["tokens"]
+    topk = inputs["topk"]
+    intermediate = inputs["intermediate"]
+    experts = inputs["experts"]
+    topk_ids = inputs["topk_ids"]
+    activation = torch.randn(
+        (tokens * topk, intermediate), device="cuda", dtype=torch.float16
+    )
+    stage2_ids = topk_ids.reshape(tokens * topk, 1).contiguous()
+    stage2_weights = torch.ones(
+        (tokens * topk, 1), device="cuda", dtype=torch.float32
+    )
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        stage2_ids,
+        block_size=moe_block_size,
+        num_experts=experts,
+    )
+    reference_rows = []
+    for row in range(tokens * topk):
+        expert = int(stage2_ids[row, 0].item())
+        reference_rows.append(
+            torch.matmul(
+                activation[row : row + 1].to(torch.float32),
+                inputs["w2_dequant"][expert].to(torch.float32),
+            )[0]
+        )
+    reference = torch.stack(reference_rows, dim=0).to(torch.float16)
+    return activation, stage2_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference
+
+
+def _run_moe_env_stage1_combo(
+    key: MoeDirectOpKey,
+    inputs: dict[str, object],
+    *,
+    moe_block_size: int,
+    reference: torch.Tensor,
+    rtol: float,
+    atol: float,
+) -> torch.Tensor:
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        inputs["topk_ids"], block_size=moe_block_size, num_experts=inputs["experts"]
+    )
+    output = ops.moe_wna16_marlin_gemm(
+        inputs["hidden_states"],
+        torch.empty(
+            (key.tokens * key.topk, 2 * key.intermediate),
+            device="cuda",
+            dtype=torch.float16,
+        ),
+        inputs["w1_q"],
+        None,
+        inputs["w1_scales"],
+        None,
+        inputs["w1_global_scale"],
+        inputs["w1_zeros"],
+        inputs["w1_g_idx"],
+        inputs["w1_perm"],
+        None,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        inputs["topk_weights"],
+        moe_block_size,
+        key.topk,
+        False,
+        _moe_quant_type_id(key.quant_name),
+        key.tokens,
+        2 * key.intermediate,
+        key.hidden,
+        True,
+        False,
+        False,
+        inputs["w1_zeros"] is not None,
+        -1,
+        -1,
+        -1,
+    )
+    assert output.shape == (key.tokens * key.topk, 2 * key.intermediate)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+    return output
+
+
+def _run_moe_env_stage2_combo(
+    key: MoeDirectOpKey,
+    inputs: dict[str, object],
+    *,
+    activation: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    moe_block_size: int,
+    reference: torch.Tensor,
+    rtol: float,
+    atol: float,
+) -> torch.Tensor:
+    output = ops.moe_wna16_marlin_gemm(
+        activation,
+        torch.empty((key.tokens * key.topk, key.hidden), device="cuda", dtype=torch.float16),
+        inputs["w2_q"],
+        None,
+        inputs["w2_scales"],
+        None,
+        inputs["w2_global_scale"],
+        inputs["w2_zeros"],
+        inputs["w2_g_idx"],
+        inputs["w2_perm"],
+        None,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        1,
+        False,
+        _moe_quant_type_id(key.quant_name),
+        key.tokens * key.topk,
+        key.hidden,
+        key.intermediate,
+        True,
+        False,
+        False,
+        inputs["w2_zeros"] is not None,
+        -1,
+        -1,
+        -1,
+    )
+    assert output.shape == (key.tokens * key.topk, key.hidden)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+    return output
+
+
+def _run_moe_invalid_env_smoke() -> None:
+    key = MoeDirectOpKey("uint4", 128, 2, 128, 128, 4, 2)
+    inputs = _make_moe_env_sweep_inputs(key)
+    reference = _moe_stage1_reference(inputs)
+    _run_moe_env_stage1_combo(
+        key,
+        inputs,
+        moe_block_size=16,
+        reference=reference,
+        rtol=2e-1,
+        atol=2.0,
+    )
+
+
+@pytest.mark.sm70_env_exhaustive
+def test_moe_wna16_direct_op_env_geometry_exhaustive_matches_reference():
+    if not exhaustive_enabled():
+        pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the full env sweep")
+    _require_moe_cuda()
+
+    total = 0
+    checked = 0
+    legal = 0
+    rejected = 0
+
+    for key in iter_moe_direct_op_keys():
+        prepared = None
+        stage1_reference = None
+        stage2_prepared = None
+        moe_block_size = moe_auto_block_size(key.tokens, key.topk, key.experts)
+        rtol, atol = _MOE_ENV_SWEEP_TOLERANCES[key.quant_name]
+        for stage in ("stage1", "stage2"):
+            for geometry, split_k, metadata_cache in iter_moe_env_combinations():
+                if exhaustive_index_is_past_limit(total):
+                    break
+                selected = exhaustive_index_is_selected(total)
+                total += 1
+                if not selected:
+                    continue
+
+                checked += 1
+                if prepared is None:
+                    prepared = _make_moe_env_sweep_inputs(key)
+                    stage1_reference = _moe_stage1_reference(prepared)
+                inputs = prepared
+                if stage == "stage1":
+                    is_legal = moe_stage_env_combo_is_legal(
+                        geometry,
+                        size_n=2 * key.intermediate,
+                        size_k=key.hidden,
+                    )
+                else:
+                    is_legal = moe_stage_env_combo_is_legal(
+                        geometry,
+                        size_n=key.hidden,
+                        size_k=key.intermediate,
+                    )
+                    if stage2_prepared is None:
+                        stage2_prepared = _moe_stage2_inputs_and_reference(
+                            inputs,
+                            moe_block_size=moe_block_size,
+                        )
+
+                try:
+                    with moe_env(geometry, split_k, metadata_cache):
+                        if is_legal:
+                            if stage == "stage1":
+                                assert stage1_reference is not None
+                                _run_moe_env_stage1_combo(
+                                    key,
+                                    inputs,
+                                    moe_block_size=moe_block_size,
+                                    reference=stage1_reference,
+                                    rtol=rtol,
+                                    atol=atol,
+                                )
+                            else:
+                                assert stage2_prepared is not None
+                                (
+                                    activation,
+                                    stage2_weights,
+                                    sorted_ids,
+                                    expert_ids,
+                                    num_tokens_post_pad,
+                                    stage2_reference,
+                                ) = stage2_prepared
+                                _run_moe_env_stage2_combo(
+                                    key,
+                                    inputs,
+                                    activation=activation,
+                                    topk_weights=stage2_weights,
+                                    sorted_ids=sorted_ids,
+                                    expert_ids=expert_ids,
+                                    num_tokens_post_pad=num_tokens_post_pad,
+                                    moe_block_size=moe_block_size,
+                                    reference=stage2_reference,
+                                    rtol=rtol,
+                                    atol=atol,
+                                )
+                            legal += 1
+                        else:
+                            with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
+                                if stage == "stage1":
+                                    assert stage1_reference is not None
+                                    _run_moe_env_stage1_combo(
+                                        key,
+                                        inputs,
+                                        moe_block_size=moe_block_size,
+                                        reference=stage1_reference,
+                                        rtol=rtol,
+                                        atol=atol,
+                                    )
+                                else:
+                                    assert stage2_prepared is not None
+                                    (
+                                        activation,
+                                        stage2_weights,
+                                        sorted_ids,
+                                        expert_ids,
+                                        num_tokens_post_pad,
+                                        stage2_reference,
+                                    ) = stage2_prepared
+                                    _run_moe_env_stage2_combo(
+                                        key,
+                                        inputs,
+                                        activation=activation,
+                                        topk_weights=stage2_weights,
+                                        sorted_ids=sorted_ids,
+                                        expert_ids=expert_ids,
+                                        num_tokens_post_pad=num_tokens_post_pad,
+                                        moe_block_size=moe_block_size,
+                                        reference=stage2_reference,
+                                        rtol=rtol,
+                                        atol=atol,
+                                    )
+                            rejected += 1
+                except Exception as exc:
+                    raise AssertionError(
+                        f"key={key}, stage={stage}, geometry={geometry.label}, "
+                        f"split_k={split_k}, metadata={metadata_cache}, "
+                        f"legal={is_legal}, error={exc}"
+                    ) from exc
+            if exhaustive_index_is_past_limit(total):
+                break
+        if exhaustive_index_is_past_limit(total):
+            break
+
+    assert checked > 0
+    assert legal + rejected == checked
+
+
+@pytest.mark.sm70_env_exhaustive
+def test_moe_wna16_direct_op_env_focused_mnk_matches_reference():
+    if not exhaustive_enabled():
+        pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the focused env sweep")
+    _require_moe_cuda()
+
+    total = 0
+    checked = 0
+    legal = 0
+    rejected = 0
+
+    for key in iter_moe_focused_mnk_direct_op_keys():
+        prepared = None
+        reference = None
+        moe_block_size = moe_auto_block_size(key.tokens, key.topk, key.experts)
+        rtol, atol = _MOE_ENV_SWEEP_TOLERANCES[key.quant_name]
+        for geometry, split_k, metadata_cache in iter_moe_env_combinations():
+            if exhaustive_index_is_past_limit(total):
+                break
+            selected = exhaustive_index_is_selected(total)
+            total += 1
+            if not selected:
+                continue
+
+            checked += 1
+            if prepared is None:
+                prepared = _make_moe_exact_mnk_env_sweep_inputs(key)
+                reference = _moe_exact_mnk_reference(prepared)
+            inputs = prepared
+            is_legal = moe_stage_env_combo_is_legal(
+                geometry,
+                size_n=key.intermediate,
+                size_k=key.hidden,
+            )
+
+            try:
+                with moe_env(geometry, split_k, metadata_cache):
+                    if is_legal:
+                        assert reference is not None
+                        _run_moe_exact_mnk_env_combo(
+                            key,
+                            inputs,
+                            moe_block_size=moe_block_size,
+                            reference=reference,
+                            rtol=rtol,
+                            atol=atol,
+                        )
+                        legal += 1
+                    else:
+                        with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
+                            assert reference is not None
+                            _run_moe_exact_mnk_env_combo(
+                                key,
+                                inputs,
+                                moe_block_size=moe_block_size,
+                                reference=reference,
+                                rtol=rtol,
+                                atol=atol,
+                            )
+                        rejected += 1
+            except Exception as exc:
+                raise AssertionError(
+                    f"key={key}, geometry={geometry.label}, split_k={split_k}, "
+                    f"metadata={metadata_cache}, legal={is_legal}, error={exc}"
+                ) from exc
+        if exhaustive_index_is_past_limit(total):
+            break
+
+    assert checked > 0
+    assert legal + rejected == checked
+
+
+@pytest.mark.parametrize(
+    ("geometry", "split_k", "metadata_cache", "match"),
+    (
+        pytest.param(
+            "32x256x32x4x32x64",
+            "1",
+            "vector_words",
+            "Invalid SM70_MARLIN_MOE_CTA_GEOMETRY",
+            id="bad_geometry_field_count",
+        ),
+        pytest.param(
+            "32x256x16x4x32x64x16",
+            "1",
+            "vector_words",
+            "Unsupported SM70 Marlin.*CTA geometry",
+            id="unsupported_geometry",
+        ),
+        pytest.param(
+            "128x64x32x4x32x64x32",
+            "1",
+            "vector_words",
+            "Unsupported SM70 Marlin MoE CTA geometry",
+            id="dense_only_cta_m_128",
+        ),
+        pytest.param(
+            "32x256x32x4x32x64x32",
+            "3",
+            "vector_words",
+            "Invalid SM70_MARLIN_MOE_SPLIT_K",
+            id="bad_split_k",
+        ),
+        pytest.param(
+            "32x256x32x4x32x64x32",
+            "1",
+            "paired_words",
+            "Invalid SM70_MARLIN_MOE_METADATA_CACHE",
+            id="bad_metadata",
+        ),
+    ),
+)
+def test_moe_wna16_direct_op_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+    geometry: str,
+    split_k: str,
+    metadata_cache: str,
+    match: str,
+):
+    _require_moe_cuda()
+    set_moe_env(
+        monkeypatch,
+        geometry=geometry,
+        split_k=split_k,
+        metadata_cache=metadata_cache,
+    )
+    with pytest.raises(RuntimeError, match=match):
+        _run_moe_invalid_env_smoke()
+
+
+@pytest.mark.parametrize("geometry", SM70_MOE_GEOMETRIES)
+@pytest.mark.parametrize("split_k", SM70_SPLIT_K_VALUES)
+@pytest.mark.parametrize("metadata_cache", SM70_METADATA_CACHE_VALUES)
+@pytest.mark.sm70_env_exhaustive
+def test_moe_wna16_direct_op_env_smoke_single_shape_matches_reference(
+    geometry,
+    split_k: int,
+    metadata_cache: str,
+):
+    if not exhaustive_enabled():
+        pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the env smoke sweep")
+    _require_moe_cuda()
+    key = MoeDirectOpKey("uint4", 128, 2, 128, 128, 4, 2)
+    inputs = _make_moe_env_sweep_inputs(key)
+    reference = _moe_stage1_reference(inputs)
+    with moe_env(geometry, split_k, metadata_cache):
+        if moe_stage_env_combo_is_legal(
+            geometry,
+            size_n=2 * key.intermediate,
+            size_k=key.hidden,
+        ):
+            _run_moe_env_stage1_combo(
+                key,
+                inputs,
+                moe_block_size=16,
+                reference=reference,
+                rtol=2e-1,
+                atol=2.0,
+            )
+        else:
+            with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
+                _run_moe_env_stage1_combo(
+                    key,
+                    inputs,
+                    moe_block_size=16,
+                    reference=reference,
+                    rtol=2e-1,
+                    atol=2.0,
+                )
+
+
 @pytest.mark.parametrize("moe_block_size", _SM70_SUPPORTED_MOE_BLOCK_SIZES)
 @pytest.mark.parametrize("repack_impl", _REPACK_IMPL_CASES)
 def test_moe_wna16_uint4b8_stage1_supported_moe_block_sizes_match_reference(
@@ -1488,7 +2182,7 @@ if "uint4" in _MOE_SUPPORTED_QUANT_NAMES:
         sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
             topk_ids, block_size=16, num_experts=experts
         )
-        with pytest.raises(RuntimeError, match="requires K divisible by 32"):
+        with pytest.raises(RuntimeError, match=_K_TILE_ALIGNMENT_ERROR):
             ops.moe_wna16_marlin_gemm(
                 hidden_states,
                 torch.empty((tokens * topk, 2 * intermediate), device="cuda", dtype=torch.float16),

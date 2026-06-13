@@ -18,7 +18,7 @@
 
 using marlin::sm70::load_qword_vector;
 using marlin::sm70::qword_from_vector;
-using marlin::sm70::u8_cta_n_qweight_offset_from_logical;
+using marlin::sm70::u8_packed_macro_n_qweight_offset_from_logical;
 
 namespace marlin_moe_wna16 {
 namespace {
@@ -26,19 +26,18 @@ namespace {
 constexpr int kU8ValuesPerAccess = 8;
 
 template <typename Shape_, typename ThreadMap_, int GroupSize_,
-          bool UseMetadataVectorWords_ = true>
+          int PackedMacroN_, bool UseMetadataVectorWords_ = true>
 class Sm70MoeU8ZpIteratorB {
  public:
   using Shape = Shape_;
   using ThreadMap = ThreadMap_;
   static int const kGroupSize = GroupSize_;
+  static int const kPackedMacroN = PackedMacroN_;
   static constexpr bool kUseMetadataVectorWords = UseMetadataVectorWords_;
   using Element = cutlass::half_t;
   using Fragment = cutlass::Array<
       Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
-  static_assert(Shape::kK == kCtaK,
-                "SM70 Marlin MoE U8 IteratorB expects CTA_K=32.");
-  static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
+    static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
                 "SM70 Marlin MoE U8 IteratorB expects CTA_N in {64, 128, 256}.");
   static_assert(ThreadMap::Iterations::kContiguous ==
                     Shape::kN / kQuantTileN,
@@ -49,11 +48,10 @@ class Sm70MoeU8ZpIteratorB {
   static_assert(ThreadMap::kElementsPerAccess == kU8ValuesPerAccess,
                 "SM70 Marlin MoE U8 IteratorB expects two packed U8 words per "
                 "access.");
-  static_assert(ThreadMap::Iterations::kStrided == 1 ||
-                    ThreadMap::Iterations::kStrided == 2,
-                "SM70 Marlin MoE U8-family IteratorB expects one or two strided "
+  static_assert(ThreadMap::Iterations::kStrided >= 1,
+                "SM70 Marlin MoE U8-family IteratorB expects one or more strided "
                 "iterations.");
-  static constexpr int kQweightWordStrideWords = Shape::kN / kQuantTileN;
+  static constexpr int kQweightWordStrideWords = kPackedMacroN / kQuantTileN;
 
   struct Params {
     int size_k;
@@ -156,7 +154,7 @@ class Sm70MoeU8ZpIteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u8_cta_n_qweight_offset_from_logical<Shape::kN>(
+    return u8_packed_macro_n_qweight_offset_from_logical<kPackedMacroN>(
         params.size_n, logical_k, logical_n);
   }
 
@@ -292,13 +290,18 @@ class Sm70MoeU8ZpIteratorB {
         frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
       }
     } else {
-      int const qweight_base = qweight_base_offset_;
-      constexpr int kStridedQweightDeltaWords =
-          64 * kQweightWordStrideWords;
+      int const logical_n_base = n_offset_ + thread_offset_.contiguous();
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+        int const logical_k_s =
+            k_offset_ + thread_offset_.strided() +
+            s * ThreadMap::Delta::kStrided;
+        if constexpr (kGroupSize != -1) {
+          cache_current_group_metadata(scale_group(logical_k_s));
+        }
         int const qweight_base_s =
-            qweight_base + s * kStridedQweightDeltaWords;
+            expert_qweight_base_offset() +
+            qweight_offset_from_logical(params_, logical_k_s, logical_n_base);
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
           uint4 const qwords0 =
               load_qword_vector<4>(qweight_ + qweight_base_s);
@@ -392,7 +395,8 @@ class Sm70MoeU8ZpIteratorB {
       return;
     }
 
-    if constexpr (kGroupSize != -1) {
+    if constexpr (kGroupSize != -1 &&
+                  ThreadMap::Iterations::kStrided == 1) {
       int const first_logical_k = k_offset_ + thread_offset_.strided();
       cache_current_group_metadata(scale_group(first_logical_k));
     }
@@ -410,18 +414,19 @@ struct Sm70MoeU8ZpGemmSpec {
   template <typename Shape, typename ThreadMap>
   using IteratorA = Sm70MoeGatherIteratorA<Shape, ThreadMap>;
 
-  template <typename Shape, typename ThreadMap, int GroupSize>
+  template <typename Shape, typename ThreadMap, int GroupSize, int PackedMacroN>
   using IteratorB =
-      Sm70MoeU8ZpIteratorB<Shape, ThreadMap, GroupSize,
+      Sm70MoeU8ZpIteratorB<Shape, ThreadMap, GroupSize, PackedMacroN,
                            UseMetadataVectorWords>;
 };
 
-template <int CtaM, int CtaN, int Warps, int GroupSize,
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
+          int WarpN, int WarpK, int GroupSize, int PackedMacroN,
           bool UseMetadataVectorWords = true>
 using Sm70MoeU8ZpGemmTraits =
     Sm70MarlinMoeGemmTraits<
-        Sm70MoeU8ZpGemmSpec<UseMetadataVectorWords>, CtaM, CtaN, Warps,
-        GroupSize>;
+        Sm70MoeU8ZpGemmSpec<UseMetadataVectorWords>, CtaM, CtaN, CtaK,
+        Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>;
 
 template <bool UseMetadataVectorWords = true>
 struct Sm70MoeU8Launcher {
@@ -443,9 +448,11 @@ struct Sm70MoeU8Launcher {
   int64_t size_k;
   int requested_split_k;
 
-  template <int CtaM, int CtaN, int Warps, int GroupSize>
+  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
+          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
   torch::Tensor operator()() const {
-    using Traits = Sm70MoeU8ZpGemmTraits<CtaM, CtaN, Warps, GroupSize,
+    using Traits = Sm70MoeU8ZpGemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
+                                         WarpN, WarpK, GroupSize, PackedMacroN,
                                          UseMetadataVectorWords>;
     return launch_sm70_marlin_moe_gemm<Traits>(
         a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
@@ -465,27 +472,32 @@ torch::Tensor sm70_marlin_u8_gemm(
     int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  Sm70CtaGeometry const geometry =
-      sm70_marlin_moe_u8_zp_auto_stage_cta_geometry(size_m, size_n,
-                                                    moe_block_size,
-                                                    group_size);
+  auto const params = sm70_marlin_moe_auto_stage_params(
+      "U8", group_size, moe_block_size, top_k, size_m, size_n, size_k);
+  Sm70CtaGeometry const geometry = params.geometry;
   validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE U8", geometry);
   validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE U8", geometry,
                                         size_n);
-  TORCH_CHECK(size_k % kCtaK == 0,
-              "SM70 Marlin MoE U8 requires K divisible by 32. Got K=",
-              size_k, ".");
+  TORCH_CHECK(size_k % geometry.cta_k == 0,
+              "SM70 Marlin MoE U8 requires K divisible by CTA_K=",
+              geometry.cta_k, ". Got K=", size_k, ".");
 
-  int const requested_split_k = sm70_marlin_moe_auto_stage_requested_split_k(
-      size_m, size_n, size_k, top_k, geometry);
   auto empty_float = torch::empty(
       {0}, torch::TensorOptions().dtype(at::kFloat).device(a.device()));
-  Sm70MoeU8Launcher<> const launcher{
+  if (params.use_metadata_vector_words) {
+    Sm70MoeU8Launcher<true> const launcher{
+        a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
+        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
+    return dispatch_sm70_marlin_moe_geometry(launcher, geometry, params.packed_macro_n, group_size,
+        "U8");
+  }
+  Sm70MoeU8Launcher<false> const launcher{
       a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-      mul_topk_weights, size_m, size_n, size_k, requested_split_k};
-  return dispatch_sm70_marlin_moe_geometry(launcher, geometry, group_size,
-                                           "U8");
+      mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
+  return dispatch_sm70_marlin_moe_geometry(launcher, geometry, params.packed_macro_n, group_size,
+      "U8");
 }
 
 }  // namespace marlin_moe_wna16

@@ -27,6 +27,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "sm70_cutlass_matmul_probe(Tensor a, Tensor b, int cta_m, int cta_n, "
       "int cta_k, int warps, int stages, int a_path, int b_path) -> Tensor");
+
+  ops.def(
+      "sm70_cutlass_matmul_explicit_warp_probe(Tensor a, Tensor b, "
+      "int cta_m, int cta_n, int cta_k, int warps, "
+      "int warp_m, int warp_n, int warp_k) -> Tensor");
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

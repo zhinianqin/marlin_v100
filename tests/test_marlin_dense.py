@@ -26,6 +26,22 @@ from tests.helpers import (
     run_marlin_linear_kernel_case,
     scalar_types,
 )
+from tests.sm70_env_sweep import (
+    EXPLICIT_ENV_REJECTION_RE,
+    SM70_GEOMETRIES,
+    SM70_METADATA_CACHE_VALUES,
+    SM70_SPLIT_K_VALUES,
+    DenseDirectOpKey,
+    dense_env,
+    dense_env_combo_is_legal,
+    exhaustive_enabled,
+    exhaustive_index_is_past_limit,
+    exhaustive_index_is_selected,
+    iter_dense_direct_op_keys,
+    iter_dense_focused_mnk_direct_op_keys,
+    iter_env_combinations,
+    set_dense_env,
+)
 
 _DENSE_SUPPORTED_QUANT_NAMES = frozenset(
     supported_dense_quant_type_names(
@@ -48,6 +64,9 @@ _FLOAT16_DTYPE_ERROR = (
     rf"|{source_target_label()} build only supports float16 scales\."
 )
 _N_TILE_ALIGNMENT_ERROR = "requires size_n divisible by 64"
+_K_TILE_ALIGNMENT_ERROR = (
+    "requires size_k % 32 == 0|requires K divisible by CTA_K="
+)
 _SPLIT_K_QUANT_CASES = (
     ("uint4b8", 128, 4096, 5e-2, 5e-1),
     ("uint8", 32, 4096, 5e-2, 5e-1),
@@ -65,6 +84,15 @@ _AUTO_CTA_N_QUANT_CASES = (
     ("nvfp4", 16, 5e-2, 2.5e-1),
     ("mxfp4", 32, 5e-2, 2.5e-1),
 )
+_DENSE_ENV_SWEEP_TOLERANCES = {
+    "uint4": (5e-2, 3.5e-1),
+    "uint4b8": (5e-2, 3.5e-1),
+    "uint8": (5e-2, 3.5e-1),
+    "uint8b128": (4e-2, 3.5e-1),
+    "fp8": (4e-2, 4e-1),
+    "nvfp4": (5e-2, 5e-1),
+    "mxfp4": (5e-2, 5e-1),
+}
 
 
 def _require_marlin_cuda() -> None:
@@ -87,6 +115,7 @@ def test_marlin_dense_symbols_available():
         "awq_marlin_repack",
         "marlin_int4_fp8_preprocess",
         "sm70_cutlass_matmul_probe",
+        "sm70_cutlass_matmul_explicit_warp_probe",
     ]
     for name in expected:
         assert hasattr(ops, name)
@@ -138,6 +167,52 @@ def test_sm70_cutlass_matmul_probe_threadblock_path_matches_torch_mm():
 
     assert output.shape == reference.shape
     torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    ("cta_m", "cta_n", "cta_k", "warps", "warp_m", "warp_n", "warp_k"),
+    [
+        (64, 64, 32, 4, 32, 32, 32),
+    ],
+)
+def test_sm70_cutlass_explicit_warp_probe_matches_torch_mm(
+    cta_m: int,
+    cta_n: int,
+    cta_k: int,
+    warps: int,
+    warp_m: int,
+    warp_n: int,
+    warp_k: int,
+):
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    m = cta_m * 2
+    n = cta_n * 2
+    k = cta_k * 4
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+
+    output = ops.sm70_cutlass_matmul_explicit_warp_probe(
+        a, b, cta_m, cta_n, cta_k, warps, warp_m, warp_n, warp_k
+    )
+    reference = torch.mm(a, b)
+
+    assert output.shape == reference.shape
+    torch.testing.assert_close(output, reference, rtol=5e-2, atol=5e-2)
+
+
+def test_sm70_cutlass_explicit_warp_probe_rejects_warpk16_without_phase_helper():
+    _require_marlin_cuda()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    a = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    b = torch.randn((128, 128), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="WarpK=16 is rejected"):
+        ops.sm70_cutlass_matmul_explicit_warp_probe(
+            a, b, 32, 64, 32, 4, 32, 32, 16
+        )
 
 
 @pytest.mark.parametrize(
@@ -966,6 +1041,452 @@ def _run_auto_cta_n_quant_accuracy_case(
         )
 
 
+def _make_dense_env_sweep_case(
+    key: DenseDirectOpKey,
+) -> tuple[tuple, torch.Tensor, torch.Tensor, float, float]:
+    _require_marlin_cuda()
+    torch.manual_seed(1000 + key.size_m + key.size_n + key.size_k)
+    torch.cuda.manual_seed_all(1000 + key.size_m + key.size_n + key.size_k)
+
+    a = torch.randn((key.size_m, key.size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((key.size_k, key.size_n), device="cuda", dtype=torch.float16)
+    workspace = marlin_make_workspace(torch.device("cuda"))
+    c = torch.empty((key.size_m, key.size_n), device="cuda", dtype=torch.float16)
+    rtol, atol = _DENSE_ENV_SWEEP_TOLERANCES[key.quant_name]
+
+    if key.quant_name == "uint4":
+        _w, q_w, scales, zp, dequantized = marlin_quantize_uint4_zp(
+            w, key.group_size
+        )
+        reference = torch.matmul(
+            a.to(torch.float32), dequantized.to(torch.float32)
+        ).to(torch.float16)
+        args = (
+            a,
+            c,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zp,
+            None,
+            None,
+            workspace,
+            scalar_types.uint4.id,
+            key.size_m,
+            key.size_n,
+            key.size_k,
+            True,
+            False,
+            False,
+            True,
+        )
+        return args, c, reference, rtol, atol
+
+    if key.quant_name == "uint8":
+        _w, q_w, scales, zp, dequantized = marlin_quantize_uint8_zp(
+            w, key.group_size
+        )
+        reference = torch.matmul(
+            a.to(torch.float32), dequantized.to(torch.float32)
+        ).to(torch.float16)
+        args = (
+            a,
+            c,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            zp,
+            None,
+            None,
+            workspace,
+            scalar_types.uint8.id,
+            key.size_m,
+            key.size_n,
+            key.size_k,
+            True,
+            False,
+            False,
+            True,
+        )
+        return args, c, reference, rtol, atol
+
+    if key.quant_name in {"uint4b8", "uint8b128"}:
+        quant_type = (
+            scalar_types.uint4b8
+            if key.quant_name == "uint4b8"
+            else scalar_types.uint8b128
+        )
+        _w, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+            w, quant_type, key.group_size, False
+        )
+        reference = marlin_dense_reference(
+            a,
+            q_w,
+            scales,
+            size_k=key.size_k,
+            size_n=key.size_n,
+            group_size=key.group_size,
+            quant_type=quant_type,
+            perm=sort_indices,
+        ).to(torch.float16)
+        args = (
+            a,
+            c,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            marlin_make_empty_g_idx(a.device),
+            g_idx,
+            sort_indices,
+            workspace,
+            quant_type.id,
+            key.size_m,
+            key.size_n,
+            key.size_k,
+            True,
+            False,
+            False,
+            False,
+        )
+        return args, c, reference, rtol, atol
+
+    if key.quant_name == "fp8":
+        _w, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+            w, scalar_types.float8_e4m3fn, key.group_size, False
+        )
+        reference = marlin_dense_reference(
+            a,
+            q_w,
+            scales,
+            size_k=key.size_k,
+            size_n=key.size_n,
+            group_size=key.group_size,
+            quant_type=scalar_types.float8_e4m3fn,
+        ).to(torch.float16)
+        args = (
+            a,
+            c,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float8_e4m3fn.id,
+            key.size_m,
+            key.size_n,
+            key.size_k,
+            True,
+            False,
+            False,
+            False,
+        )
+        return args, c, reference, rtol, atol
+
+    if key.quant_name == "nvfp4":
+        weight_ref, q_w, scales, global_scale, g_idx, sort_indices, _ = (
+            marlin_quantize_nvfp4(w, key.group_size)
+        )
+        reference = torch.matmul(
+            a.to(torch.float32), weight_ref.to(torch.float32)
+        ).to(torch.float16)
+        args = (
+            a,
+            c,
+            q_w,
+            None,
+            scales,
+            None,
+            global_scale,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            key.size_m,
+            key.size_n,
+            key.size_k,
+            True,
+            False,
+            False,
+            False,
+        )
+        return args, c, reference, rtol, atol
+
+    if key.quant_name == "mxfp4":
+        weight_ref, q_w, scales, g_idx, sort_indices, _ = marlin_quantize_mxfp4(
+            w, key.group_size
+        )
+        reference = torch.matmul(
+            a.to(torch.float32), weight_ref.to(torch.float32)
+        ).to(torch.float16)
+        args = (
+            a,
+            c,
+            q_w,
+            None,
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            key.size_m,
+            key.size_n,
+            key.size_k,
+            True,
+            False,
+            False,
+            False,
+        )
+        return args, c, reference, rtol, atol
+
+    raise AssertionError(f"Unsupported dense env sweep quant={key.quant_name!r}")
+
+
+def _assert_dense_env_sweep_combo_matches_reference(
+    key: DenseDirectOpKey,
+    args: tuple,
+    output: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    output.zero_()
+    result = ops.marlin_gemm(*args)
+    assert result is output
+    assert result.shape == (key.size_m, key.size_n)
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result, reference, rtol=rtol, atol=atol)
+
+
+def _run_dense_invalid_env_smoke() -> None:
+    key = DenseDirectOpKey("uint4b8", 128, 8, 256, 256)
+    args, _output, _reference, _rtol, _atol = _make_dense_env_sweep_case(key)
+    ops.marlin_gemm(*args)
+
+
+@pytest.mark.sm70_env_exhaustive
+def test_marlin_dense_direct_op_env_geometry_exhaustive_matches_reference():
+    if not exhaustive_enabled():
+        pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the full env sweep")
+    _require_marlin_cuda()
+
+    total = 0
+    checked = 0
+    legal = 0
+    rejected = 0
+    first_failure: str | None = None
+
+    for key in iter_dense_direct_op_keys():
+        prepared: tuple[tuple, torch.Tensor, torch.Tensor, float, float] | None = None
+        for geometry, split_k, metadata_cache in iter_env_combinations():
+            if exhaustive_index_is_past_limit(total):
+                break
+            selected = exhaustive_index_is_selected(total)
+            total += 1
+            if not selected:
+                continue
+
+            checked += 1
+            if prepared is None:
+                prepared = _make_dense_env_sweep_case(key)
+            args, output, reference, rtol, atol = prepared
+            is_legal = dense_env_combo_is_legal(
+                geometry,
+                split_k,
+                size_n=key.size_n,
+                size_k=key.size_k,
+            )
+            try:
+                with dense_env(geometry, split_k, metadata_cache):
+                    if is_legal:
+                        _assert_dense_env_sweep_combo_matches_reference(
+                            key,
+                            args,
+                            output,
+                            reference,
+                            rtol=rtol,
+                            atol=atol,
+                        )
+                        legal += 1
+                    else:
+                        with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
+                            ops.marlin_gemm(*args)
+                        rejected += 1
+            except Exception as exc:
+                first_failure = (
+                    f"key={key}, geometry={geometry.label}, split_k={split_k}, "
+                    f"metadata={metadata_cache}, legal={is_legal}, error={exc}"
+                )
+                raise
+        if exhaustive_index_is_past_limit(total):
+            break
+
+    assert checked > 0
+    assert legal + rejected == checked
+    assert first_failure is None
+
+
+@pytest.mark.sm70_env_exhaustive
+def test_marlin_dense_direct_op_env_focused_mnk_matches_reference():
+    if not exhaustive_enabled():
+        pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the focused env sweep")
+    _require_marlin_cuda()
+
+    total = 0
+    checked = 0
+    legal = 0
+    rejected = 0
+    first_failure: str | None = None
+
+    for key in iter_dense_focused_mnk_direct_op_keys():
+        prepared: tuple[tuple, torch.Tensor, torch.Tensor, float, float] | None = None
+        for geometry, split_k, metadata_cache in iter_env_combinations():
+            if exhaustive_index_is_past_limit(total):
+                break
+            selected = exhaustive_index_is_selected(total)
+            total += 1
+            if not selected:
+                continue
+
+            checked += 1
+            if prepared is None:
+                prepared = _make_dense_env_sweep_case(key)
+            args, output, reference, rtol, atol = prepared
+            is_legal = dense_env_combo_is_legal(
+                geometry,
+                split_k,
+                size_n=key.size_n,
+                size_k=key.size_k,
+            )
+            try:
+                with dense_env(geometry, split_k, metadata_cache):
+                    if is_legal:
+                        _assert_dense_env_sweep_combo_matches_reference(
+                            key,
+                            args,
+                            output,
+                            reference,
+                            rtol=rtol,
+                            atol=atol,
+                        )
+                        legal += 1
+                    else:
+                        with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
+                            ops.marlin_gemm(*args)
+                        rejected += 1
+            except Exception as exc:
+                first_failure = (
+                    f"key={key}, geometry={geometry.label}, split_k={split_k}, "
+                    f"metadata={metadata_cache}, legal={is_legal}, error={exc}"
+                )
+                raise
+        if exhaustive_index_is_past_limit(total):
+            break
+
+    assert checked > 0
+    assert legal + rejected == checked
+    assert first_failure is None
+
+
+@pytest.mark.parametrize(
+    ("geometry", "split_k", "metadata_cache", "match"),
+    (
+        pytest.param(
+            "32x256x32x4x32x64",
+            "1",
+            "vector_words",
+            "Invalid SM70_MARLIN_DENSE_CTA_GEOMETRY",
+            id="bad_geometry_field_count",
+        ),
+        pytest.param(
+            "32x256x16x4x32x64x16",
+            "1",
+            "vector_words",
+            "Unsupported SM70 Marlin CTA geometry",
+            id="unsupported_geometry",
+        ),
+        pytest.param(
+            "32x256x32x4x32x64x32",
+            "3",
+            "vector_words",
+            "Invalid SM70_MARLIN_DENSE_SPLIT_K",
+            id="bad_split_k",
+        ),
+        pytest.param(
+            "32x256x32x4x32x64x32",
+            "1",
+            "paired_words",
+            "Invalid SM70_MARLIN_DENSE_METADATA_CACHE",
+            id="bad_metadata",
+        ),
+    ),
+)
+def test_marlin_dense_direct_op_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+    geometry: str,
+    split_k: str,
+    metadata_cache: str,
+    match: str,
+):
+    _require_marlin_cuda()
+    set_dense_env(
+        monkeypatch,
+        geometry=geometry,
+        split_k=split_k,
+        metadata_cache=metadata_cache,
+    )
+    with pytest.raises(RuntimeError, match=match):
+        _run_dense_invalid_env_smoke()
+
+
+@pytest.mark.parametrize("geometry", SM70_GEOMETRIES)
+@pytest.mark.parametrize("split_k", SM70_SPLIT_K_VALUES)
+@pytest.mark.parametrize("metadata_cache", SM70_METADATA_CACHE_VALUES)
+@pytest.mark.sm70_env_exhaustive
+def test_marlin_dense_direct_op_env_smoke_single_shape_matches_reference(
+    geometry,
+    split_k: int,
+    metadata_cache: str,
+):
+    if not exhaustive_enabled():
+        pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the env smoke sweep")
+    _require_marlin_cuda()
+    key = DenseDirectOpKey("uint4b8", 128, 8, 256, 256)
+    args, output, reference, rtol, atol = _make_dense_env_sweep_case(key)
+    with dense_env(geometry, split_k, metadata_cache):
+        if dense_env_combo_is_legal(
+            geometry,
+            split_k,
+            size_n=key.size_n,
+            size_k=key.size_k,
+        ):
+            _assert_dense_env_sweep_combo_matches_reference(
+                key,
+                args,
+                output,
+                reference,
+                rtol=rtol,
+                atol=atol,
+            )
+        else:
+            with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
+                ops.marlin_gemm(*args)
+
+
 @pytest.mark.parametrize(
     ("quant_name", "group_size", "rtol", "atol"),
     _AUTO_CTA_N_QUANT_CASES,
@@ -1160,7 +1681,7 @@ def test_marlin_dense_uint4b8_partial_n_auto_cta_matches_reference(
 def test_marlin_dense_uint4b8_residue_k_single_group_rejects_k_tile_alignment_contract(
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+    with pytest.raises(RuntimeError, match=_K_TILE_ALIGNMENT_ERROR):
         _run_dense_accuracy_case(
             scalar_types.uint4b8,
             repack_impl=repack_impl,
@@ -1179,7 +1700,7 @@ def test_marlin_dense_uint4b8_residue_k_single_group_rejects_k_tile_alignment_co
 def test_marlin_dense_uint4b8_residue_k_and_n_single_group_rejects_k_tile_alignment_contract(
     repack_impl: str,
 ):
-    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+    with pytest.raises(RuntimeError, match=_K_TILE_ALIGNMENT_ERROR):
         _run_dense_accuracy_case(
             scalar_types.uint4b8,
             repack_impl=repack_impl,
@@ -1209,7 +1730,7 @@ def test_marlin_dense_uint4b8_residue_k_rejects_multi_group_metadata():
     )
     scales = torch.ones((3, size_n), device="cuda", dtype=torch.float16)
 
-    with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+    with pytest.raises(RuntimeError, match=_K_TILE_ALIGNMENT_ERROR):
         ops.marlin_gemm(
             a,
             None,
@@ -2072,7 +2593,7 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
             -1,
             False,
         )
-        with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+        with pytest.raises(RuntimeError, match=_K_TILE_ALIGNMENT_ERROR):
             ops.marlin_gemm(
                 a_bad_k,
                 None,
@@ -2822,7 +3343,7 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
         scales_bad_k = torch.ones((1, size_n), device="cuda", dtype=torch.float32).to(
             torch.float8_e8m0fnu
         )
-        with pytest.raises(RuntimeError, match="requires size_k % 32 == 0"):
+        with pytest.raises(RuntimeError, match=_K_TILE_ALIGNMENT_ERROR):
             ops.marlin_gemm(
                 a_bad_k,
                 None,

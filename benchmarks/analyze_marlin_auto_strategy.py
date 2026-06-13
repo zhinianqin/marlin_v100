@@ -86,7 +86,10 @@ def split_label(value: str) -> str:
 def cta_label(cta: ResolvedCta | None) -> str:
     if cta is None:
         return "n/a"
-    return f"{cta.cta_m}x{cta.cta_n}x{cta.warps}"
+    return (
+        f"{cta.cta_m}x{cta.cta_n}x{cta.cta_k}x{cta.warps}x"
+        f"{cta.warp_m}x{cta.warp_n}x{cta.warp_k}"
+    )
 
 
 def historical_dense_auto_cta_label(shape: DenseShapeCase) -> str:
@@ -95,11 +98,11 @@ def historical_dense_auto_cta_label(shape: DenseShapeCase) -> str:
 
 def historical_moe_stage_cta(size_n: int) -> ResolvedCta | None:
     if size_n % 256 == 0:
-        return ResolvedCta(32, 256, 4)
+        return ResolvedCta(32, 256, 32, 4, 32, 64, 32)
     if size_n % 128 == 0:
-        return ResolvedCta(32, 128, 4)
+        return ResolvedCta(32, 128, 32, 4, 32, 32, 32)
     if size_n % 64 == 0:
-        return ResolvedCta(64, 64, 4)
+        return ResolvedCta(64, 64, 32, 4, 32, 32, 32)
     return None
 
 
@@ -378,12 +381,14 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             "split_k": "unset is normalized to 1",
             "dense_cta_auto": (
                 "20260603 cta=auto is mapped through the historical dense "
-                "CTA_M/CTA_N/warps auto geometry."
+                "CTA_M/CTA_N/CTA_K/warps/WarpM/WarpN/WarpK auto geometry."
             ),
             "moe_cta_auto": (
                 "20260603 cta=auto is mapped through the historical MoE "
-                "default stage geometry: CTA_N=64 -> 64x64x4, "
-                "CTA_N=128 -> 32x128x4, CTA_N=256 -> 32x256x4."
+                "default stage geometry: "
+                "CTA_N=64 -> 64x64x32x4x32x32x32, "
+                "CTA_N=128 -> 32x128x32x4x32x32x32, "
+                "CTA_N=256 -> 32x256x32x4x32x64x32."
             ),
             "rank": (
                 "Rank is computed within the normalized 20260603 full matrix "

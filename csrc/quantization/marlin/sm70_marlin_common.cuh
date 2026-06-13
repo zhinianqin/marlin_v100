@@ -5,7 +5,9 @@
 #include <cuda_runtime_api.h>
 #include <torch/library.h>
 
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 
 #include "cutlass/gemm/gemm.h"
 
@@ -26,115 +28,246 @@ inline size_t configure_sm70_dynamic_smem(Kernel kernel) {
   return smem_bytes;
 }
 
-template <int CtaM, int CtaN, int Warps>
-struct Sm70WarpShape;
+constexpr int sm70_const_min(int lhs, int rhs) {
+  return lhs < rhs ? lhs : rhs;
+}
 
-template <>
-struct Sm70WarpShape<32, 128, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
+constexpr bool sm70_marlin_basic_geometry_values_supported(
+    int cta_m, int cta_n, int cta_k, int warps, int warp_m, int warp_n,
+    int warp_k) {
+  return (cta_m == 32 || cta_m == 64 || cta_m == 128 || cta_m == 256) &&
+         (cta_n == 64 || cta_n == 128 || cta_n == 256) &&
+         (cta_k == 16 || cta_k == 32 || cta_k == 64 || cta_k == 128) &&
+         (warps == 4 || warps == 8) &&
+         (warp_m == 32 || warp_m == 64) &&
+         (warp_n == 32 || warp_n == 64) &&
+         (warp_k == 16 || warp_k == 32);
+}
 
-template <>
-struct Sm70WarpShape<32, 256, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
-};
+constexpr bool sm70_marlin_warp_decomposition_supported(
+    int cta_m, int cta_n, int cta_k, int warps, int warp_m, int warp_n,
+    int warp_k) {
+  if (!sm70_marlin_basic_geometry_values_supported(
+          cta_m, cta_n, cta_k, warps, warp_m, warp_n, warp_k)) {
+    return false;
+  }
+  if (cta_m % warp_m != 0 || cta_n % warp_n != 0 ||
+      cta_k % warp_k != 0) {
+    return false;
+  }
+  return (cta_m / warp_m) * (cta_n / warp_n) * (cta_k / warp_k) == warps;
+}
 
-template <>
-struct Sm70WarpShape<64, 64, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
+constexpr bool sm70_marlin_pitchlinear_threadmap_supported(
+    int shape_contiguous, int shape_strided, int threads,
+    int warp_thread_contiguous, int warp_thread_strided,
+    int elements_per_access) {
+  if (shape_contiguous % elements_per_access != 0) {
+    return false;
+  }
+  int const shape_access_contiguous =
+      shape_contiguous / elements_per_access;
+  int const shape_access_strided = shape_strided;
+  if (shape_access_contiguous % warp_thread_contiguous != 0 ||
+      shape_access_strided % warp_thread_strided != 0) {
+    return false;
+  }
+  int const warp_access_contiguous =
+      shape_access_contiguous / warp_thread_contiguous;
+  int const warp_access_strided =
+      shape_access_strided / warp_thread_strided;
+  int const warp_count = threads / 32;
+  if (warp_access_strided <= 0 || warp_count <= 0) {
+    return false;
+  }
+  int const warps_strided =
+      warp_access_strided >= warp_count ? warp_count : warp_access_strided;
+  if (warps_strided <= 0) {
+    return false;
+  }
+  int const warps_contiguous =
+      warp_count > warp_access_strided ? warp_count / warps_strided : 1;
+  if (warps_contiguous <= 0) {
+    return false;
+  }
+  int const iterations_contiguous =
+      warp_access_contiguous / warps_contiguous;
+  int const iterations_strided = warp_access_strided / warps_strided;
+  return iterations_contiguous > 0 && iterations_strided > 0;
+}
 
-template <>
-struct Sm70WarpShape<64, 128, 4> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
-};
+constexpr bool sm70_marlin_b_threadmap_matches_quant_iterator(
+    int cta_n, int cta_k, int threads) {
+  constexpr int kElementsPerAccess = 8;
+  constexpr int kWarpThreadContiguous = 8;
+  constexpr int kWarpThreadStrided = 4;
+  if (!sm70_marlin_pitchlinear_threadmap_supported(
+          cta_n, cta_k, threads, kWarpThreadContiguous,
+          kWarpThreadStrided, kElementsPerAccess)) {
+    return false;
+  }
+  int const shape_access_contiguous = cta_n / kElementsPerAccess;
+  int const shape_access_strided = cta_k;
+  int const warp_access_contiguous =
+      shape_access_contiguous / kWarpThreadContiguous;
+  int const warp_access_strided =
+      shape_access_strided / kWarpThreadStrided;
+  int const warp_count = threads / 32;
+  int const warps_strided =
+      warp_access_strided >= warp_count ? warp_count : warp_access_strided;
+  int const warps_contiguous =
+      warp_count > warp_access_strided ? warp_count / warps_strided : 1;
+  int const iterations_contiguous =
+      warp_access_contiguous / warps_contiguous;
+  int const delta_contiguous =
+      kWarpThreadContiguous * kElementsPerAccess;
+  return iterations_contiguous == cta_n / kQuantTileN &&
+         delta_contiguous == kQuantTileN;
+}
 
-template <>
-struct Sm70WarpShape<64, 128, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
+constexpr bool sm70_marlin_volta_epilogue_supported(
+    int cta_m, int cta_n, int warps, int warp_m) {
+  constexpr int kShapeRow = 4;
+  constexpr int kShapeGroup = 4;
+  constexpr int kElementsPerAccess = 8;
+  constexpr int kElementBits = 16;
+  constexpr int kWarpSize = 32;
+  int const shape_cluster = cta_m / warp_m;
+  if (shape_cluster <= 0) {
+    return false;
+  }
+  int const warps_remaining_for_groups =
+      shape_cluster > warps ? 1 : warps / shape_cluster;
+  if (warps_remaining_for_groups <= 0) {
+    return false;
+  }
+  int const warps_remaining_for_rows =
+      kShapeGroup > warps_remaining_for_groups
+          ? 1
+          : warps_remaining_for_groups / kShapeGroup;
+  if (warps_remaining_for_rows <= 0) {
+    return false;
+  }
 
-template <>
-struct Sm70WarpShape<64, 256, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
+  if (kShapeRow <= warps_remaining_for_rows) {
+    return cta_n / kElementsPerAccess / kWarpSize > 0;
+  }
 
-template <>
-struct Sm70WarpShape<64, 256, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 64, 32>;
-};
+  int const row_shape = kShapeRow / warps_remaining_for_rows;
+  if (row_shape <= 0) {
+    return false;
+  }
+  int const shape_width = cta_n / kElementsPerAccess;
+  int const target_memory_access_width =
+      256 / (kElementsPerAccess * kElementBits / 8);
+  int const target_access_rows = kWarpSize / target_memory_access_width;
+  int const access_width =
+      target_access_rows > row_shape
+          ? kWarpSize / row_shape
+          : sm70_const_min(
+                shape_width,
+                sm70_const_min(kWarpSize, target_memory_access_width));
+  if (access_width <= 0) {
+    return false;
+  }
+  int const access_rows =
+      target_access_rows > row_shape
+          ? row_shape
+          : sm70_const_min(kShapeRow, kWarpSize / access_width);
+  if (access_rows <= 0) {
+    return false;
+  }
+  return row_shape / access_rows > 0 && shape_width / access_width > 0;
+}
 
-template <>
-struct Sm70WarpShape<128, 64, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
-};
+constexpr bool sm70_marlin_cta_geometry_is_supported_constexpr(
+    int cta_m, int cta_n, int cta_k, int warps, int warp_m, int warp_n,
+    int warp_k) {
+  if (!sm70_marlin_warp_decomposition_supported(
+          cta_m, cta_n, cta_k, warps, warp_m, warp_n, warp_k)) {
+    return false;
+  }
+  int const threads = warps * 32;
+  // Current SM70 Marlin uses CUTLASS' Volta row-major/row-major
+  // DefaultMmaCore. Its A/B thread maps are fixed to 128-bit half loads.
+  // CTA_K=16 is a mathematical GEMM shape but does not provide enough
+  // contiguous A accesses for that thread map.
+  if (!sm70_marlin_pitchlinear_threadmap_supported(
+          cta_k, cta_m, threads, 4, 8, 8)) {
+    return false;
+  }
+  if (!sm70_marlin_b_threadmap_matches_quant_iterator(cta_n, cta_k,
+                                                      threads)) {
+    return false;
+  }
+  return sm70_marlin_volta_epilogue_supported(cta_m, cta_n, warps, warp_m);
+}
 
-template <>
-struct Sm70WarpShape<128, 64, 8> {
-  using Type = cutlass::gemm::GemmShape<32, 32, 32>;
-};
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK>
+struct Sm70WarpShape {
+  static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
+                "SM70 Marlin supports CTA_M in {32, 64, 128, 256}.");
+  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
+                "SM70 Marlin supports CTA_N in {64, 128, 256}.");
+  static_assert(CtaK == 16 || CtaK == 32 || CtaK == 64 || CtaK == 128,
+                "SM70 Marlin supports CTA_K in {16, 32, 64, 128}.");
+  static_assert(Warps == 4 || Warps == 8,
+                "SM70 Marlin supports 4 or 8 warps.");
+  static_assert(WarpM == 32 || WarpM == 64,
+                "SM70 Marlin supports Warp_M in {32, 64}.");
+  static_assert(WarpN == 32 || WarpN == 64,
+                "SM70 Marlin supports Warp_N in {32, 64}.");
+  static_assert(WarpK == 16 || WarpK == 32,
+                "SM70 Marlin supports Warp_K in {16, 32}.");
+  static_assert(CtaM % WarpM == 0,
+                "SM70 Marlin requires CTA_M divisible by Warp_M.");
+  static_assert(CtaN % WarpN == 0,
+                "SM70 Marlin requires CTA_N divisible by Warp_N.");
+  static_assert(CtaK % WarpK == 0,
+                "SM70 Marlin requires CTA_K divisible by Warp_K.");
+  static_assert((CtaM / WarpM) * (CtaN / WarpN) * (CtaK / WarpK) == Warps,
+                "SM70 Marlin explicit warp shape must decompose the CTA into "
+                "the requested warp count.");
+  static_assert(sm70_marlin_cta_geometry_is_supported_constexpr(
+                    CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK),
+                "SM70 Marlin CTA geometry is not supported by the current "
+                "CUTLASS Volta thread maps, epilogue, and quantized B "
+                "iterator contract.");
 
-template <>
-struct Sm70WarpShape<128, 128, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70WarpShape<128, 128, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
-};
-
-template <>
-struct Sm70WarpShape<128, 256, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70WarpShape<256, 64, 4> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
-};
-
-template <>
-struct Sm70WarpShape<256, 64, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 32, 32>;
-};
-
-template <>
-struct Sm70WarpShape<256, 128, 8> {
-  using Type = cutlass::gemm::GemmShape<64, 64, 32>;
+  using Type = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
 };
 
 struct Sm70CtaGeometry {
   int cta_m;
   int cta_n;
+  int cta_k;
   int warps;
+  int warp_m;
+  int warp_n;
+  int warp_k;
+};
+
+struct Sm70MarlinAutoParams {
+  Sm70CtaGeometry geometry;
+  int requested_split_k;
+  bool use_metadata_vector_words;
+  int packed_macro_n;
 };
 
 inline constexpr char const* kSupportedSm70MarlinCtaGeometries =
-    "32x128x4, 32x256x4, 64x64x4, 64x128x4, 64x128x8, "
-    "64x256x4, 64x256x8, 128x64x4, 128x64x8, 128x128x4, "
-    "128x128x8, 128x256x8, 256x64x4, 256x64x8, and 256x128x8";
+    "{CTA_M}x{CTA_N}x{CTA_K}x{Warps}x{WarpM}x{WarpN}x{WarpK} "
+    "with CTA_M in {32,64,128,256}, CTA_N in {64,128,256}, "
+    "CTA_K in {16,32,64,128}, Warps in {4,8}, WarpM in {32,64}, "
+    "WarpN in {32,64}, WarpK in {16,32}, a valid CTA/warp "
+    "decomposition, current CUTLASS Volta thread-map support, and "
+    "phase-aware SM70 Marlin warp-K offset support.";
 
 inline bool sm70_marlin_cta_geometry_is_supported(
     Sm70CtaGeometry geometry) {
-  int const cta_m = geometry.cta_m;
-  int const cta_n = geometry.cta_n;
-  int const warps = geometry.warps;
-  return (cta_m == 32 && cta_n == 128 && warps == 4) ||
-         (cta_m == 32 && cta_n == 256 && warps == 4) ||
-         (cta_m == 64 && cta_n == 64 && warps == 4) ||
-         (cta_m == 64 && cta_n == 128 && warps == 4) ||
-         (cta_m == 64 && cta_n == 128 && warps == 8) ||
-         (cta_m == 64 && cta_n == 256 && warps == 4) ||
-         (cta_m == 64 && cta_n == 256 && warps == 8) ||
-         (cta_m == 128 && cta_n == 64 && warps == 4) ||
-         (cta_m == 128 && cta_n == 64 && warps == 8) ||
-         (cta_m == 128 && cta_n == 128 && warps == 4) ||
-         (cta_m == 128 && cta_n == 128 && warps == 8) ||
-         (cta_m == 128 && cta_n == 256 && warps == 8) ||
-         (cta_m == 256 && cta_n == 64 && warps == 4) ||
-         (cta_m == 256 && cta_n == 64 && warps == 8) ||
-         (cta_m == 256 && cta_n == 128 && warps == 8);
+  return sm70_marlin_cta_geometry_is_supported_constexpr(
+      geometry.cta_m, geometry.cta_n, geometry.cta_k, geometry.warps,
+      geometry.warp_m, geometry.warp_n, geometry.warp_k);
 }
 
 inline int sm70_marlin_dense_auto_cta_n(int64_t size_n) {
@@ -152,84 +285,171 @@ inline int sm70_marlin_dense_auto_cta_n(int64_t size_n) {
   return 0;
 }
 
-inline int sm70_marlin_dense_auto_cta_m(int64_t size_m, int auto_cta_n) {
-  if (auto_cta_n == 64) {
-    if (size_m >= 256) {
-      return 256;
-    }
-    if (size_m >= 128) {
-      return 128;
-    }
-    return 64;
-  }
-  if (auto_cta_n == 128) {
-    if (size_m >= 256) {
-      return 256;
-    }
-    if (size_m >= 128) {
-      return 128;
-    }
-    if (size_m >= 64) {
-      return 64;
-    }
-    return 32;
-  }
-  if (auto_cta_n == 256) {
-    if (size_m >= 128) {
-      return 128;
-    }
-    if (size_m >= 64) {
-      return 64;
-    }
-    return 32;
-  }
-  TORCH_CHECK(false, "SM70 Marlin auto CTA_M requires CTA_N in {64, 128, 256}. "
-                     "Got CTA_N = ", auto_cta_n, ".");
-  return 0;
+inline bool sm70_marlin_packed_macro_n_is_supported(int packed_macro_n) {
+  return packed_macro_n == 64 || packed_macro_n == 128 || packed_macro_n == 256;
 }
 
-inline int sm70_marlin_dense_auto_warps_for_cta(int auto_cta_m, int auto_cta_n) {
-  if (auto_cta_n == 64) {
-    if (auto_cta_m == 64) {
-      return 4;
-    }
-    if (auto_cta_m == 128 || auto_cta_m == 256) {
-      return 8;
-    }
-  } else if (auto_cta_n == 128) {
-    if (auto_cta_m == 32) {
-      return 4;
-    }
-    if (auto_cta_m == 64 || auto_cta_m == 128 || auto_cta_m == 256) {
-      return 8;
-    }
-  } else if (auto_cta_n == 256) {
-    if (auto_cta_m == 32) {
-      return 4;
-    }
-    if (auto_cta_m == 64 || auto_cta_m == 128) {
-      return 8;
-    }
+inline Sm70CtaGeometry sm70_marlin_generic_fallback_geometry_from_cta_n(
+    int auto_cta_n) {
+  switch (auto_cta_n) {
+    case 64:
+      return {64, 64, 32, 4, 32, 32, 32};
+    case 128:
+      return {32, 128, 32, 4, 32, 32, 32};
+    case 256:
+      return {32, 256, 32, 4, 32, 64, 32};
+    default:
+      TORCH_CHECK(false, "Unsupported SM70 Marlin auto CTA_N=", auto_cta_n,
+                  ".");
   }
-  TORCH_CHECK(false, "SM70 Marlin auto CTA default warps has no supported "
-                     "geometry for CTA_M=", auto_cta_m,
-                     ", CTA_N=", auto_cta_n, ".");
-  return 0;
+  return {0, 0, 0, 0, 0, 0, 0};
 }
 
 inline Sm70CtaGeometry sm70_marlin_dense_auto_cta_geometry(int64_t size_m,
-                                                        int64_t size_n) {
+                                                          int64_t size_n) {
+  (void)size_m;
   int const auto_cta_n = sm70_marlin_dense_auto_cta_n(size_n);
-  int const auto_cta_m = sm70_marlin_dense_auto_cta_m(size_m, auto_cta_n);
-  return {auto_cta_m, auto_cta_n,
-          sm70_marlin_dense_auto_warps_for_cta(auto_cta_m, auto_cta_n)};
+  return sm70_marlin_generic_fallback_geometry_from_cta_n(auto_cta_n);
+}
+
+inline bool sm70_marlin_parse_int_component(char const*& cursor, int& value) {
+  char* end = nullptr;
+  long parsed = std::strtol(cursor, &end, 10);
+  if (end == cursor) {
+    return false;
+  }
+  value = static_cast<int>(parsed);
+  cursor = end;
+  return true;
+}
+
+inline bool sm70_marlin_parse_geometry_env_value(char const* value,
+                                                 Sm70CtaGeometry& geometry) {
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  char const* cursor = value;
+  int fields[7] = {0, 0, 0, 0, 0, 0, 0};
+  for (int i = 0; i < 7; ++i) {
+    if (!sm70_marlin_parse_int_component(cursor, fields[i])) {
+      return false;
+    }
+    if (i < 6) {
+      if (*cursor != 'x') {
+        return false;
+      }
+      ++cursor;
+    }
+  }
+  if (*cursor != '\0') {
+    return false;
+  }
+  geometry = {fields[0], fields[1], fields[2], fields[3],
+              fields[4], fields[5], fields[6]};
+  return true;
+}
+
+inline bool sm70_marlin_try_get_geometry_env(char const* env_name,
+                                             Sm70CtaGeometry& geometry) {
+  char const* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  TORCH_CHECK(sm70_marlin_parse_geometry_env_value(value, geometry),
+              "Invalid ", env_name, " value '", value,
+              "'. Expected {CTA_M}x{CTA_N}x{CTA_K}x{Warps}x{WarpM}x{WarpN}x{WarpK}.");
+  return true;
+}
+
+inline bool sm70_marlin_try_get_split_k_env(char const* env_name,
+                                            int& requested_split_k) {
+  char const* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  char const* cursor = value;
+  int parsed = 0;
+  TORCH_CHECK(sm70_marlin_parse_int_component(cursor, parsed) &&
+                  *cursor == '\0' &&
+                  (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8),
+              "Invalid ", env_name, " value '", value,
+              "'. Expected one of 1, 2, 4, or 8.");
+  requested_split_k = parsed;
+  return true;
+}
+
+inline bool sm70_marlin_try_get_metadata_env(
+    char const* env_name, bool& use_metadata_vector_words) {
+  char const* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  if (std::strcmp(value, "vector_words") == 0) {
+    use_metadata_vector_words = true;
+    return true;
+  }
+  if (std::strcmp(value, "lane_vectors") == 0) {
+    use_metadata_vector_words = false;
+    return true;
+  }
+  TORCH_CHECK(false, "Invalid ", env_name, " value '", value,
+              "'. Expected vector_words or lane_vectors.");
+  return false;
+}
+
+inline void validate_sm70_marlin_packed_macro_n(char const* op_name,
+                                                Sm70CtaGeometry geometry,
+                                                int packed_macro_n) {
+  TORCH_CHECK(sm70_marlin_packed_macro_n_is_supported(packed_macro_n),
+              "Unsupported SM70 Marlin packed macro-N for ", op_name, ": ",
+              packed_macro_n, ".");
+  TORCH_CHECK(packed_macro_n % geometry.cta_n == 0,
+              "SM70 Marlin ", op_name,
+              " requires PackedMacroN divisible by CTA_N. Got PackedMacroN=",
+              packed_macro_n, ", CTA_N=", geometry.cta_n, ".");
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_env_and_fallback(
+    char const* op_name, char const* geometry_env_name,
+    char const* split_k_env_name, char const* metadata_env_name,
+    int64_t size_n) {
+  int const packed_macro_n = sm70_marlin_dense_auto_cta_n(size_n);
+  Sm70MarlinAutoParams params{
+      sm70_marlin_generic_fallback_geometry_from_cta_n(packed_macro_n),
+      1,
+      true,
+      packed_macro_n};
+  sm70_marlin_try_get_geometry_env(geometry_env_name, params.geometry);
+  sm70_marlin_try_get_split_k_env(split_k_env_name, params.requested_split_k);
+  sm70_marlin_try_get_metadata_env(metadata_env_name,
+                                   params.use_metadata_vector_words);
+  TORCH_CHECK(sm70_marlin_cta_geometry_is_supported(params.geometry),
+              "Unsupported SM70 Marlin CTA geometry for ", op_name, ": ",
+              params.geometry.cta_m, "x", params.geometry.cta_n, "x",
+              params.geometry.cta_k, "x", params.geometry.warps, "x",
+              params.geometry.warp_m, "x", params.geometry.warp_n, "x",
+              params.geometry.warp_k, ". Supported geometries are ",
+              kSupportedSm70MarlinCtaGeometries, ".");
+  validate_sm70_marlin_packed_macro_n(op_name, params.geometry, packed_macro_n);
+  return params;
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_dense_auto_params(
+    char const* /*quant_format*/, int64_t /*group_size*/, int64_t /*size_m*/,
+    int64_t size_n, int64_t /*size_k*/) {
+  return sm70_marlin_auto_params_from_env_and_fallback(
+      "Dense", "SM70_MARLIN_DENSE_CTA_GEOMETRY",
+      "SM70_MARLIN_DENSE_SPLIT_K", "SM70_MARLIN_DENSE_METADATA_CACHE",
+      size_n);
 }
 
 inline void validate_sm70_marlin_dense_cta_geometry_supported(char const* op_name,
                                                               Sm70CtaGeometry geometry) {
   TORCH_CHECK(sm70_marlin_cta_geometry_is_supported(geometry),
               "Unsupported SM70 Marlin CTA geometry for ", op_name, ": ",
-              geometry.cta_m, "x", geometry.cta_n, "x", geometry.warps,
+              geometry.cta_m, "x", geometry.cta_n, "x", geometry.cta_k,
+              "x", geometry.warps, "x", geometry.warp_m, "x",
+              geometry.warp_n, "x", geometry.warp_k,
               ". Supported geometries are ",
               kSupportedSm70MarlinCtaGeometries, ".");
 }
@@ -241,7 +461,9 @@ inline void validate_sm70_marlin_dense_cta_n_alignment(char const* op_name,
       size_n % geometry.cta_n == 0 && size_n % kQuantTileN == 0,
       "SM70 Marlin requires size_n divisible by both CTA_N and 64 for ",
       op_name, " with CTA geometry ", geometry.cta_m, "x", geometry.cta_n,
-      "x", geometry.warps, ". Got size_n = ", size_n, ".");
+      "x", geometry.cta_k, "x", geometry.warps, "x", geometry.warp_m,
+      "x", geometry.warp_n, "x", geometry.warp_k, ". Got size_n = ",
+      size_n, ".");
 }
 
 }  // namespace marlin::sm70

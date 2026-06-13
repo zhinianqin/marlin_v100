@@ -28,7 +28,11 @@ class MoeShapeCase:
 class ResolvedCta:
     cta_m: int
     cta_n: int
+    cta_k: int
     warps: int
+    warp_m: int
+    warp_n: int
+    warp_k: int
 
 
 @dataclass(frozen=True)
@@ -521,26 +525,11 @@ def dense_auto_cta(size_m: int, size_n: int) -> ResolvedCta | None:
         return None
 
     if cta_n == 64:
-        cta_m = 256 if size_m >= 256 else 128 if size_m >= 128 else 64
-    elif cta_n == 128:
-        if size_m >= 256:
-            cta_m = 256
-        elif size_m >= 128:
-            cta_m = 128
-        elif size_m >= 64:
-            cta_m = 64
-        else:
-            cta_m = 32
+        return ResolvedCta(64, 64, 32, 4, 32, 32, 32)
+    if cta_n == 128:
+        return ResolvedCta(32, 128, 32, 4, 32, 32, 32)
     else:
-        cta_m = 128 if size_m >= 128 else 64 if size_m >= 64 else 32
-
-    if cta_n == 64:
-        warps = 4 if cta_m == 64 else 8
-    elif cta_n == 128:
-        warps = 4 if cta_m == 32 else 8
-    else:
-        warps = 4 if cta_m == 32 else 8
-    return ResolvedCta(cta_m, cta_n, warps)
+        return ResolvedCta(32, 256, 32, 4, 32, 64, 32)
 
 
 def moe_auto_cta(
@@ -550,41 +539,14 @@ def moe_auto_cta(
     group_size: int | None = None,
     moe_block_size: int | None = None,
 ) -> ResolvedCta | None:
+    del tokens, quant_name, group_size, moe_block_size
     if size_n % 256 == 0:
-        cta_n = 256
-        if quant_name == "uint4" and group_size == -1:
-            cta_m = 32
-            warps = 4
-        elif quant_name == "uint8" and group_size == -1 and tokens >= 1024:
-            cta_m = 64
-            warps = 8
-        elif moe_block_size is not None:
-            cta_m = 32 if moe_block_size <= 32 else 64
-            warps = 4
-        else:
-            cta_m = 64 if tokens >= 1024 else 32
-            warps = 4
-    elif size_n % 128 == 0:
-        cta_n = 128
-        if moe_block_size is not None and moe_block_size > 32:
-            cta_m = 64
-            warps = 8
-        elif moe_block_size is not None:
-            cta_m = 32
-            warps = 4
-        elif tokens >= 4096:
-            cta_m = 64
-            warps = 8
-        else:
-            cta_m = 32
-            warps = 4
-    elif size_n % 64 == 0:
-        cta_n = 64
-        cta_m = 64
-        warps = 4
-    else:
-        return None
-    return ResolvedCta(cta_m, cta_n, warps)
+        return ResolvedCta(32, 256, 32, 4, 32, 64, 32)
+    if size_n % 128 == 0:
+        return ResolvedCta(32, 128, 32, 4, 32, 32, 32)
+    if size_n % 64 == 0:
+        return ResolvedCta(64, 64, 32, 4, 32, 32, 32)
+    return None
 
 
 def _split_k_from_tiles(size_k: int, cta_tiles: int, *, k_pressure_path: bool) -> int:
@@ -612,59 +574,7 @@ def dense_auto_cta_geometry(shape: DenseShapeCase) -> ResolvedCta | None:
 
 
 def dense_auto_split_k(shape: DenseShapeCase) -> int:
-    cta = dense_auto_cta_geometry(shape)
-    if cta is None:
-        return 1
-    if shape.size_k < 4096 or shape.size_k % 32 != 0:
-        return 1
-
-    if shape.size_k == 4096:
-        if shape.size_n == 1024:
-            if shape.size_m >= 2048:
-                return 1
-            if shape.size_m >= 1024:
-                return 2
-            if shape.size_m >= 64:
-                return 8
-            if shape.size_m >= 24:
-                return 4
-            return 8
-
-        if shape.size_n >= 8192:
-            if shape.size_m >= 48:
-                return 1
-            if shape.size_m >= 16:
-                return 2
-            return 8 if shape.size_m == 1 else 2
-
-        if shape.size_n >= 4096:
-            if shape.size_m >= 1024:
-                return 1
-            if shape.size_m >= 48:
-                return 4
-            return 8 if shape.size_m <= 16 else 4
-
-    if shape.size_k >= 8192 and shape.size_n <= 256:
-        if shape.size_m >= 4096:
-            return 2
-        if shape.size_m >= 2048:
-            return 4
-        return 8
-
-    if shape.size_k >= 8192 and shape.size_n >= 4096:
-        if shape.size_m >= 1024:
-            return 1
-        if shape.size_m >= 48:
-            return 4
-        return 8
-
-    m_tiles = (shape.size_m + cta.cta_m - 1) // cta.cta_m
-    n_tiles = max(1, shape.size_n // cta.cta_n)
-    return _split_k_from_tiles(
-        shape.size_k,
-        m_tiles * n_tiles,
-        k_pressure_path=shape.size_k >= 8192 and shape.size_n <= 256,
-    )
+    return 1
 
 
 def moe_auto_block_size(shape: MoeShapeCase) -> int:
@@ -705,10 +615,22 @@ def moe_auto_cta_geometry(shape: MoeShapeCase) -> ResolvedCta | None:
     stage1, stage2 = moe_auto_stage_cta_geometry(shape)
     if stage1 is None or stage2 is None:
         return None
-    if (stage1.cta_m, stage1.cta_n, stage1.warps) == (
+    if (
+        stage1.cta_m,
+        stage1.cta_n,
+        stage1.cta_k,
+        stage1.warps,
+        stage1.warp_m,
+        stage1.warp_n,
+        stage1.warp_k,
+    ) == (
         stage2.cta_m,
         stage2.cta_n,
+        stage2.cta_k,
         stage2.warps,
+        stage2.warp_m,
+        stage2.warp_n,
+        stage2.warp_k,
     ):
         return stage1
     return None
@@ -717,7 +639,10 @@ def moe_auto_cta_geometry(shape: MoeShapeCase) -> ResolvedCta | None:
 def auto_cta_geometry_label(cta: ResolvedCta | None) -> str:
     if cta is None:
         return "n/a"
-    return f"{cta.cta_m}x{cta.cta_n}x{cta.warps}"
+    return (
+        f"{cta.cta_m}x{cta.cta_n}x{cta.cta_k}x{cta.warps}x"
+        f"{cta.warp_m}x{cta.warp_n}x{cta.warp_k}"
+    )
 
 
 def dense_auto_cta_geometry_label(shape: DenseShapeCase) -> str:
@@ -754,37 +679,7 @@ def moe_auto_stage_split_k(
     quant_name: str | None = None,
     group_size: int | None = None,
 ) -> tuple[int, int]:
-    stage1, stage2 = moe_auto_stage_cta_geometry(
-        shape,
-        quant_name=quant_name,
-        group_size=group_size,
-    )
-    if stage1 is None or stage2 is None:
-        return (1, 1)
-
-    def _stage_split(size_n: int, size_k: int, cta: ResolvedCta) -> int:
-        effective_m = shape.tokens * shape.topk
-        m_tiles = (effective_m + cta.cta_m - 1) // cta.cta_m
-        n_tiles = max(1, size_n // cta.cta_n)
-        cta_tiles = m_tiles * n_tiles
-        if size_k % 32 != 0:
-            return 1
-        if size_k == 2048:
-            return 2 if cta_tiles <= 64 else 1
-        if size_k < 4096:
-            return 1
-        if cta_tiles <= 16:
-            return 8
-        if cta_tiles <= 32:
-            return 4
-        if cta_tiles <= 128:
-            return 2
-        return 1
-
-    return (
-        _stage_split(2 * shape.intermediate, shape.hidden, stage1),
-        _stage_split(shape.hidden, shape.intermediate, stage2),
-    )
+    return (1, 1)
 
 
 def moe_auto_split_k_label(shape: MoeShapeCase) -> str:

@@ -890,6 +890,180 @@ at::Tensor run_sm70_cutlass_threadblock_gemm(const at::Tensor& a,
   return out;
 }
 
+void validate_sm70_cutlass_explicit_warp_probe_inputs(
+    const at::Tensor& a, const at::Tensor& b, int64_t cta_m, int64_t cta_n,
+    int64_t cta_k, int64_t warps, int64_t warp_m, int64_t warp_n,
+    int64_t warp_k) {
+  validate_sm70_cutlass_matmul_probe_inputs(
+      a, b, cta_m, cta_n, cta_k, warps, 2, kAPathCutlassThreadblock,
+      kBPathCuteShared);
+  TORCH_CHECK(warp_m == 32 || warp_m == 64,
+              "sm70_cutlass_matmul_explicit_warp_probe: warp_m must be 32 or 64");
+  TORCH_CHECK(warp_n == 32 || warp_n == 64,
+              "sm70_cutlass_matmul_explicit_warp_probe: warp_n must be 32 or 64");
+  TORCH_CHECK(warp_k == 16 || warp_k == 32,
+              "sm70_cutlass_matmul_explicit_warp_probe: warp_k must be 16 or 32");
+  TORCH_CHECK(warp_k != 16,
+              "sm70_cutlass_matmul_explicit_warp_probe: WarpK=16 is rejected "
+              "for this stock CUTLASS diagnostic probe because it does not use "
+              "the production SM70 Marlin phase-aware K-offset helper");
+  TORCH_CHECK(cta_m % warp_m == 0 && cta_n % warp_n == 0 &&
+                  cta_k % warp_k == 0,
+              "sm70_cutlass_matmul_explicit_warp_probe: CTA shape must be "
+              "divisible by explicit warp shape");
+  TORCH_CHECK((cta_m / warp_m) * (cta_n / warp_n) * (cta_k / warp_k) == warps,
+              "sm70_cutlass_matmul_explicit_warp_probe: explicit warp shape "
+              "must decompose the CTA into the requested warp count");
+}
+
+template <int CTA_M, int CTA_N, int CTA_K, int Warps, int WarpM, int WarpN,
+          int WarpK>
+struct Sm70ExplicitWarpThreadblockGemmTraits {
+  using ElementA = cutlass::half_t;
+  using ElementB = cutlass::half_t;
+  using ElementOutput = cutlass::half_t;
+  using ElementAccumulator = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::RowMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using ThreadblockShape = cutlass::gemm::GemmShape<CTA_M, CTA_N, CTA_K>;
+  using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
+  using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
+  static_assert((CTA_M / WarpM) * (CTA_N / WarpN) * (CTA_K / WarpK) == Warps,
+                "Explicit warp shape must decompose the CTA into Warps.");
+  using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
+      ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
+      ElementB, LayoutB, ElementAccumulator, LayoutC,
+      cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
+  static_assert(MmaCore::kThreads == Warps * 32,
+                "SM70 explicit warp probe launch threads must match CUTLASS warp count.");
+  using OutputOp = cutlass::epilogue::thread::LinearCombination<
+      ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value,
+      ElementAccumulator, ElementAccumulator>;
+  using Mma = typename cutlass::gemm::threadblock::DefaultMma<
+      ElementA, LayoutA, 128 / cutlass::sizeof_bits<ElementA>::value,
+      ElementB, LayoutB, 128 / cutlass::sizeof_bits<ElementB>::value,
+      ElementAccumulator, LayoutC, cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm70, ThreadblockShape, WarpShape, InstructionShape, 2,
+      cutlass::arch::OpMultiplyAdd, false,
+      cutlass::gemm::SharedMemoryClearOption::kNone>::ThreadblockMma;
+  using ExpectedSmemLayoutA =
+      cutlass::layout::RowMajorVoltaTensorOpMultiplicandCrosswise<
+          cutlass::sizeof_bits<ElementA>::value, ThreadblockShape::kK>;
+  using ExpectedSmemLayoutB =
+      cutlass::layout::RowMajorVoltaTensorOpMultiplicandBCongruous<
+          cutlass::sizeof_bits<ElementB>::value>;
+  using ActualSmemLayoutA = typename Mma::SmemIteratorA::Layout;
+  using ActualSmemLayoutB = typename Mma::SmemIteratorB::Layout;
+  static_assert(std::is_same<ActualSmemLayoutA, ExpectedSmemLayoutA>::value,
+                "SM70 explicit warp probe A operand must use Volta row-major "
+                "crosswise shared-memory layout.");
+  static_assert(std::is_same<ActualSmemLayoutB, ExpectedSmemLayoutB>::value,
+                "SM70 explicit warp probe B operand must use Volta B-congruous "
+                "shared-memory layout.");
+  static int const kPartitionsK = ThreadblockShape::kK / WarpShape::kK;
+  using Epilogue =
+      typename cutlass::epilogue::threadblock::DefaultEpilogueVoltaTensorOp<
+          ThreadblockShape, typename Mma::Operator, kPartitionsK, OutputOp,
+          OutputOp::kCount>::Epilogue;
+
+  union SharedStorage {
+    typename Mma::SharedStorage main_loop;
+    typename Epilogue::SharedStorage epilogue;
+  };
+};
+
+template <int CTA_M, int CTA_N, int CTA_K, int Warps, int WarpM, int WarpN,
+          int WarpK>
+__global__ __launch_bounds__(Warps * 32, 1)
+void sm70_cutlass_explicit_warp_gemm_kernel(
+    const cutlass::half_t* __restrict__ a,
+    const cutlass::half_t* __restrict__ b,
+    cutlass::half_t* __restrict__ c, int m, int n, int k) {
+  using Traits = Sm70ExplicitWarpThreadblockGemmTraits<
+      CTA_M, CTA_N, CTA_K, Warps, WarpM, WarpN, WarpK>;
+  using Mma = typename Traits::Mma;
+  using Epilogue = typename Traits::Epilogue;
+
+  extern __shared__ char smem[];
+  auto& shared_storage =
+      *reinterpret_cast<typename Traits::SharedStorage*>(smem);
+
+  int thread_idx = threadIdx.x;
+  int warp_idx = cutlass::canonical_warp_idx_sync();
+  int lane_idx = threadIdx.x % 32;
+
+  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CTA_M, 0};
+  cutlass::MatrixCoord tb_offset_B{0, int(blockIdx.y) * CTA_N};
+  cutlass::MatrixCoord tb_offset_C{int(blockIdx.x) * CTA_M,
+                                   int(blockIdx.y) * CTA_N};
+
+  typename Traits::LayoutA layout_a(k);
+  typename Traits::LayoutB layout_b(n);
+  typename Traits::LayoutC layout_c(n);
+
+  typename Mma::IteratorA iterator_A(
+      typename Mma::IteratorA::Params(layout_a),
+      const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
+      tb_offset_A);
+  typename Mma::IteratorB iterator_B(
+      typename Mma::IteratorB::Params(layout_b),
+      const_cast<cutlass::half_t*>(b), cutlass::MatrixCoord(k, n), thread_idx,
+      tb_offset_B);
+
+  Mma mma(shared_storage.main_loop, thread_idx, warp_idx, lane_idx);
+  typename Mma::FragmentC accumulators;
+  accumulators.clear();
+
+  int gemm_k_iterations = (k + CTA_K - 1) / CTA_K;
+  mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
+
+  typename Traits::OutputOp output_op({1.0f, 0.0f});
+  typename Epilogue::OutputTileIterator iterator_C(
+      typename Epilogue::OutputTileIterator::Params(layout_c),
+      c, cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
+  typename Epilogue::OutputTileIterator iterator_D(
+      typename Epilogue::OutputTileIterator::Params(layout_c),
+      c, cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
+
+  Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
+  epilogue(output_op, iterator_D, accumulators, iterator_C);
+}
+
+template <int CTA_M, int CTA_N, int CTA_K, int Warps, int WarpM, int WarpN,
+          int WarpK>
+at::Tensor run_sm70_cutlass_explicit_warp_gemm(const at::Tensor& a,
+                                               const at::Tensor& b) {
+  c10::cuda::CUDAGuard device_guard(a.device());
+  at::Tensor out = at::empty({a.size(0), b.size(1)}, a.options());
+
+  using Traits = Sm70ExplicitWarpThreadblockGemmTraits<
+      CTA_M, CTA_N, CTA_K, Warps, WarpM, WarpN, WarpK>;
+  constexpr int kThreads = Warps * 32;
+  auto kernel = sm70_cutlass_explicit_warp_gemm_kernel<
+      CTA_M, CTA_N, CTA_K, Warps, WarpM, WarpN, WarpK>;
+  size_t smem_bytes = sizeof(typename Traits::SharedStorage);
+  if (smem_bytes >= (48u << 10)) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)));
+  }
+
+  dim3 grid(static_cast<unsigned>((a.size(0) + CTA_M - 1) / CTA_M),
+            static_cast<unsigned>(b.size(1) / CTA_N));
+  dim3 block(kThreads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+
+  kernel<<<grid, block, smem_bytes, stream>>>(
+      reinterpret_cast<const cutlass::half_t*>(a.data_ptr<at::Half>()),
+      reinterpret_cast<const cutlass::half_t*>(b.data_ptr<at::Half>()),
+      reinterpret_cast<cutlass::half_t*>(out.data_ptr<at::Half>()),
+      static_cast<int>(a.size(0)), static_cast<int>(b.size(1)),
+      static_cast<int>(a.size(1)));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 #define DISPATCH_CUTE(CM, CN, CK, W)                                      \
   if (cta_m == CM && cta_n == CN && cta_k == CK && warps == W) {          \
     return run_sm70_cute_gemm<CM, CN, CK, W>(a, b);                       \
@@ -1003,8 +1177,37 @@ at::Tensor sm70_cutlass_matmul_probe(const at::Tensor& a, const at::Tensor& b,
   return dispatch_sm70_cute_gemm(a, b, cta_m, cta_n, cta_k, warps);
 }
 
+#define DISPATCH_EXPLICIT_WARP(CM, CN, CK, W, WM, WN, WK)                 \
+  if (cta_m == CM && cta_n == CN && cta_k == CK && warps == W &&          \
+      warp_m == WM && warp_n == WN && warp_k == WK) {                    \
+    return run_sm70_cutlass_explicit_warp_gemm<CM, CN, CK, W, WM, WN,     \
+                                               WK>(a, b);                 \
+  }
+
+at::Tensor sm70_cutlass_matmul_explicit_warp_probe(
+    const at::Tensor& a, const at::Tensor& b, int64_t cta_m, int64_t cta_n,
+    int64_t cta_k, int64_t warps, int64_t warp_m, int64_t warp_n,
+    int64_t warp_k) {
+  validate_sm70_cutlass_explicit_warp_probe_inputs(
+      a, b, cta_m, cta_n, cta_k, warps, warp_m, warp_n, warp_k);
+
+  DISPATCH_EXPLICIT_WARP(64, 64, 32, 4, 32, 32, 32)
+
+  TORCH_CHECK(false,
+              "sm70_cutlass_matmul_explicit_warp_probe: unsupported explicit "
+              "warp config cta_m=", cta_m, ", cta_n=", cta_n,
+              ", cta_k=", cta_k, ", warps=", warps, ", warp_m=", warp_m,
+              ", warp_n=", warp_n, ", warp_k=", warp_k,
+              ". This diagnostic probe currently instantiates "
+              "64x64x32x4x32x32x32.");
+}
+
+#undef DISPATCH_EXPLICIT_WARP
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
   m.impl("sm70_cutlass_matmul_probe", &sm70_cutlass_matmul_probe);
+  m.impl("sm70_cutlass_matmul_explicit_warp_probe",
+         &sm70_cutlass_matmul_explicit_warp_probe);
 }

@@ -17,17 +17,26 @@
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 #include "quantization/marlin/sm70_marlin_common.cuh"
+#include "quantization/marlin/sm70_marlin_mma.cuh"
 
 namespace marlin::sm70 {
 
-template <typename Spec, int CtaM, int CtaN, int Warps, int GroupSize>
+template <typename Spec, int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
+          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
 struct Sm70MarlinGemmTraits {
   static_assert(CtaM == 32 || CtaM == 64 || CtaM == 128 || CtaM == 256,
                 "SM70 Marlin supports CTA_M in {32, 64, 128, 256}.");
   static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
                 "SM70 Marlin supports CTA_N in {64, 128, 256}.");
+  static_assert(CtaK == 16 || CtaK == 32 || CtaK == 64 || CtaK == 128,
+                "SM70 Marlin supports CTA_K in {16, 32, 64, 128}.");
   static_assert(Warps == 4 || Warps == 8,
                 "SM70 Marlin supports 4 or 8 warps.");
+  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
+                    PackedMacroN == 256,
+                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  static_assert(PackedMacroN % CtaN == 0,
+                "SM70 Marlin packed macro-N must be divisible by CTA_N.");
   using ElementA = cutlass::half_t;
   using ElementB = cutlass::half_t;
   using ElementOutput = cutlass::half_t;
@@ -35,8 +44,9 @@ struct Sm70MarlinGemmTraits {
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
-  using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, kCtaK>;
-  using WarpShape = typename Sm70WarpShape<CtaM, CtaN, Warps>::Type;
+  using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
+  using WarpShape =
+      typename Sm70WarpShape<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK>::Type;
   static_assert(WarpShape::kM <= 64 && WarpShape::kN <= 64,
                 "SM70 Marlin keeps per-warp M/N no larger than 64.");
   using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
@@ -51,8 +61,9 @@ struct Sm70MarlinGemmTraits {
       ElementA, LayoutA, 1, typename MmaCore::IteratorThreadMapA,
       128 / cutlass::sizeof_bits<ElementA>::value>;
   using IteratorB = typename Spec::template IteratorB<
-      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize>;
-  using Mma = cutlass::gemm::threadblock::MmaPipelined<
+      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
+      PackedMacroN>;
+  using Mma = Sm70MarlinMmaPipelined<
       ThreadblockShape, IteratorA, typename MmaCore::SmemIteratorA, IteratorB,
       typename MmaCore::SmemIteratorB, ElementAccumulator, LayoutC,
       typename MmaCore::MmaPolicy>;
@@ -84,19 +95,24 @@ inline dim3 sm70_marlin_cta_grid(int64_t size_m, int64_t size_n, int cta_m,
               static_cast<unsigned>(size_n / cta_n));
 }
 
-template <int CtaM, int CtaN, int Warps, typename Launcher>
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int PackedMacroN, typename Launcher>
 torch::Tensor dispatch_sm70_marlin_group_size(Launcher const& launcher,
                                               int64_t group_size,
                                               char const* quant_name) {
   switch (group_size) {
     case -1:
-      return launcher.template operator()<CtaM, CtaN, Warps, -1>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
+                                          WarpN, WarpK, -1, PackedMacroN>();
     case 32:
-      return launcher.template operator()<CtaM, CtaN, Warps, 32>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
+                                          WarpN, WarpK, 32, PackedMacroN>();
     case 64:
-      return launcher.template operator()<CtaM, CtaN, Warps, 64>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
+                                          WarpN, WarpK, 64, PackedMacroN>();
     case 128:
-      return launcher.template operator()<CtaM, CtaN, Warps, 128>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
+                                          WarpN, WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false, "SM70 Marlin ", quant_name,
                   " supports only group_size -1, 32, 64, or 128. Got ",
@@ -105,14 +121,17 @@ torch::Tensor dispatch_sm70_marlin_group_size(Launcher const& launcher,
   return torch::Tensor();
 }
 
-template <int CtaM, int CtaN, int Warps, typename Launcher>
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int PackedMacroN, typename Launcher>
 torch::Tensor dispatch_sm70_marlin_fp8_group_size(Launcher const& launcher,
                                                   int64_t group_size) {
   switch (group_size) {
     case -1:
-      return launcher.template operator()<CtaM, CtaN, Warps, -1>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
+                                          WarpN, WarpK, -1, PackedMacroN>();
     case 128:
-      return launcher.template operator()<CtaM, CtaN, Warps, 128>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
+                                          WarpN, WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false,
                   "SM70 Marlin FP8 supports only group_size -1 or 128. Got ",
@@ -122,78 +141,165 @@ torch::Tensor dispatch_sm70_marlin_fp8_group_size(Launcher const& launcher,
 }
 
 template <typename Launcher>
-torch::Tensor dispatch_sm70_marlin_geometry(Launcher const& launcher,
-                                            Sm70CtaGeometry geometry,
-                                            int64_t group_size,
-                                            char const* quant_name) {
-#define DISPATCH_SM70_GEOMETRY(CM, CN, W)                              \
-  if (geometry.cta_m == CM && geometry.cta_n == CN &&                     \
-      geometry.warps == W) {                                              \
-    return dispatch_sm70_marlin_group_size<CM, CN, W>(launcher,            \
-                                                       group_size,         \
-                                                       quant_name);        \
+torch::Tensor dispatch_sm70_marlin_cta_geometry(Launcher const& launcher,
+                                                Sm70CtaGeometry geometry,
+                                                int packed_macro_n,
+                                                char const* quant_name) {
+#define DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, PMN)       \
+  if (packed_macro_n == PMN) {                                             \
+    return launcher.template operator()<CM, CN, CK, W, WM, WN, WK, PMN>(); \
   }
 
-  DISPATCH_SM70_GEOMETRY(32, 128, 4)
-  DISPATCH_SM70_GEOMETRY(32, 256, 4)
-  DISPATCH_SM70_GEOMETRY(64, 64, 4)
-  DISPATCH_SM70_GEOMETRY(64, 128, 4)
-  DISPATCH_SM70_GEOMETRY(64, 128, 8)
-  DISPATCH_SM70_GEOMETRY(64, 256, 4)
-  DISPATCH_SM70_GEOMETRY(64, 256, 8)
-  DISPATCH_SM70_GEOMETRY(128, 64, 4)
-  DISPATCH_SM70_GEOMETRY(128, 64, 8)
-  DISPATCH_SM70_GEOMETRY(128, 128, 4)
-  DISPATCH_SM70_GEOMETRY(128, 128, 8)
-  DISPATCH_SM70_GEOMETRY(128, 256, 8)
-  DISPATCH_SM70_GEOMETRY(256, 64, 4)
-  DISPATCH_SM70_GEOMETRY(256, 64, 8)
-  DISPATCH_SM70_GEOMETRY(256, 128, 8)
+#define DISPATCH_SM70_GEOMETRY(CM, CN, CK, W, WM, WN, WK)                  \
+  if (geometry.cta_m == CM && geometry.cta_n == CN &&                      \
+      geometry.cta_k == CK && geometry.warps == W &&                       \
+      geometry.warp_m == WM && geometry.warp_n == WN &&                    \
+      geometry.warp_k == WK) {                                             \
+    if constexpr (CN == 64) {                                              \
+      DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, 64)          \
+      DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, 128)         \
+      DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, 256)         \
+    } else if constexpr (CN == 128) {                                      \
+      DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, 128)         \
+      DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, 256)         \
+    } else {                                                               \
+      DISPATCH_SM70_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, 256)         \
+    }                                                                      \
+  }
 
+#define FOR_EACH_SM70_GEOMETRY(M)                                         \
+  M(32, 64, 32, 4, 32, 32, 16)                                            \
+  M(32, 64, 64, 4, 32, 32, 32)                                            \
+  M(32, 64, 64, 4, 32, 64, 16)                                            \
+  M(32, 64, 128, 4, 32, 64, 32)                                           \
+  M(32, 128, 32, 4, 32, 32, 32)                                           \
+  M(32, 128, 32, 4, 32, 64, 16)                                           \
+  M(32, 128, 64, 4, 32, 64, 32)                                           \
+  M(32, 128, 64, 8, 32, 32, 32)                                           \
+  M(32, 128, 64, 8, 32, 64, 16)                                           \
+  M(32, 128, 128, 8, 32, 64, 32)                                          \
+  M(32, 256, 32, 4, 32, 64, 32)                                           \
+  M(32, 256, 64, 8, 32, 64, 32)                                           \
+  M(64, 64, 32, 4, 32, 32, 32)                                            \
+  M(64, 64, 32, 4, 32, 64, 16)                                            \
+  M(64, 64, 32, 4, 64, 32, 16)                                            \
+  M(64, 64, 32, 8, 32, 32, 16)                                            \
+  M(64, 64, 64, 4, 32, 64, 32)                                            \
+  M(64, 64, 64, 4, 64, 32, 32)                                            \
+  M(64, 64, 64, 4, 64, 64, 16)                                            \
+  M(64, 64, 64, 8, 32, 32, 32)                                            \
+  M(64, 64, 64, 8, 32, 64, 16)                                            \
+  M(64, 64, 128, 4, 64, 64, 32)                                           \
+  M(64, 64, 128, 8, 32, 64, 32)                                           \
+  M(64, 128, 32, 4, 32, 64, 32)                                           \
+  M(64, 128, 32, 4, 64, 32, 32)                                           \
+  M(64, 128, 32, 4, 64, 64, 16)                                           \
+  M(64, 128, 32, 8, 32, 32, 32)                                           \
+  M(64, 128, 32, 8, 32, 64, 16)                                           \
+  M(64, 128, 32, 8, 64, 32, 16)                                           \
+  M(64, 128, 64, 4, 64, 64, 32)                                           \
+  M(64, 128, 64, 8, 32, 64, 32)                                           \
+  M(64, 128, 64, 8, 64, 32, 32)                                           \
+  M(64, 128, 64, 8, 64, 64, 16)                                           \
+  M(64, 128, 128, 8, 64, 64, 32)                                          \
+  M(64, 256, 32, 4, 64, 64, 32)                                           \
+  M(64, 256, 32, 8, 32, 64, 32)                                           \
+  M(64, 256, 32, 8, 64, 32, 32)                                           \
+  M(64, 256, 32, 8, 64, 64, 16)                                           \
+  M(64, 256, 64, 8, 64, 64, 32)                                           \
+  M(128, 64, 32, 4, 32, 64, 32)                                           \
+  M(128, 64, 32, 4, 64, 32, 32)                                           \
+  M(128, 64, 32, 4, 64, 64, 16)                                           \
+  M(128, 64, 32, 8, 32, 32, 32)                                           \
+  M(128, 64, 32, 8, 32, 64, 16)                                           \
+  M(128, 64, 32, 8, 64, 32, 16)                                           \
+  M(128, 64, 64, 4, 64, 64, 32)                                           \
+  M(128, 64, 64, 8, 32, 64, 32)                                           \
+  M(128, 64, 64, 8, 64, 32, 32)                                           \
+  M(128, 64, 64, 8, 64, 64, 16)                                           \
+  M(128, 64, 128, 8, 64, 64, 32)                                          \
+  M(128, 128, 32, 4, 64, 64, 32)                                          \
+  M(128, 128, 32, 8, 32, 64, 32)                                          \
+  M(128, 128, 32, 8, 64, 32, 32)                                          \
+  M(128, 128, 32, 8, 64, 64, 16)                                          \
+  M(128, 128, 64, 8, 64, 64, 32)                                          \
+  M(128, 256, 32, 8, 64, 64, 32)                                          \
+  M(256, 64, 32, 4, 64, 64, 32)                                           \
+  M(256, 64, 32, 8, 32, 64, 32)                                           \
+  M(256, 64, 32, 8, 64, 32, 32)                                           \
+  M(256, 64, 32, 8, 64, 64, 16)                                           \
+  M(256, 64, 64, 8, 64, 64, 32)                                           \
+  M(256, 128, 32, 8, 64, 64, 32)
+
+  FOR_EACH_SM70_GEOMETRY(DISPATCH_SM70_GEOMETRY)
+
+#undef FOR_EACH_SM70_GEOMETRY
 #undef DISPATCH_SM70_GEOMETRY
+#undef DISPATCH_SM70_PACKED_MACRO_N
 
   TORCH_CHECK(false, "Unreachable SM70 Marlin ", quant_name,
               " CTA geometry dispatch.");
 }
 
 template <typename Launcher>
-torch::Tensor dispatch_sm70_marlin_fp8_geometry(Launcher const& launcher,
-                                                Sm70CtaGeometry geometry,
-                                                int64_t group_size) {
-#define DISPATCH_SM70_FP8_GEOMETRY(CM, CN, W)                         \
-  if (geometry.cta_m == CM && geometry.cta_n == CN &&                    \
-      geometry.warps == W) {                                             \
-    return dispatch_sm70_marlin_fp8_group_size<CM, CN, W>(launcher,       \
-                                                          group_size);   \
+struct Sm70MarlinGroupSizeDispatchLauncher {
+  Launcher const& inner;
+  int64_t group_size;
+  char const* quant_name;
+
+  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+            int WarpK, int PackedMacroN>
+  torch::Tensor operator()() const {
+    return dispatch_sm70_marlin_group_size<CtaM, CtaN, CtaK, Warps, WarpM,
+                                           WarpN, WarpK, PackedMacroN>(
+        inner, group_size, quant_name);
   }
+};
 
-  DISPATCH_SM70_FP8_GEOMETRY(32, 128, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(32, 256, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(64, 64, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(64, 128, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(64, 128, 8)
-  DISPATCH_SM70_FP8_GEOMETRY(64, 256, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(64, 256, 8)
-  DISPATCH_SM70_FP8_GEOMETRY(128, 64, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(128, 64, 8)
-  DISPATCH_SM70_FP8_GEOMETRY(128, 128, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(128, 128, 8)
-  DISPATCH_SM70_FP8_GEOMETRY(128, 256, 8)
-  DISPATCH_SM70_FP8_GEOMETRY(256, 64, 4)
-  DISPATCH_SM70_FP8_GEOMETRY(256, 64, 8)
-  DISPATCH_SM70_FP8_GEOMETRY(256, 128, 8)
-
-#undef DISPATCH_SM70_FP8_GEOMETRY
-
-  TORCH_CHECK(false, "Unreachable SM70 Marlin FP8 CTA geometry dispatch.");
+template <typename Launcher>
+torch::Tensor dispatch_sm70_marlin_geometry(Launcher const& launcher,
+                                            Sm70CtaGeometry geometry,
+                                            int packed_macro_n,
+                                            int64_t group_size,
+                                            char const* quant_name) {
+  return dispatch_sm70_marlin_cta_geometry(
+      Sm70MarlinGroupSizeDispatchLauncher<Launcher>{
+          launcher, group_size, quant_name},
+      geometry, packed_macro_n, quant_name);
 }
 
-template <int CtaM, int CtaN, int Warps, int GroupSize, typename Launcher>
+template <typename Launcher>
+struct Sm70MarlinFp8GroupSizeDispatchLauncher {
+  Launcher const& inner;
+  int64_t group_size;
+
+  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+            int WarpK, int PackedMacroN>
+  torch::Tensor operator()() const {
+    return dispatch_sm70_marlin_fp8_group_size<CtaM, CtaN, CtaK, Warps, WarpM,
+                                               WarpN, WarpK, PackedMacroN>(
+        inner, group_size);
+  }
+};
+
+template <typename Launcher>
+torch::Tensor dispatch_sm70_marlin_fp8_geometry(Launcher const& launcher,
+                                                Sm70CtaGeometry geometry,
+                                                int packed_macro_n,
+                                                int64_t group_size) {
+  return dispatch_sm70_marlin_cta_geometry(
+      Sm70MarlinFp8GroupSizeDispatchLauncher<Launcher>{launcher, group_size},
+      geometry, packed_macro_n, "FP8");
+}
+
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int GroupSize, int PackedMacroN, typename Launcher>
 torch::Tensor dispatch_sm70_marlin_fixed_group_size(Launcher const& launcher,
                                                     int64_t group_size,
                                                     char const* quant_name) {
   if (group_size == GroupSize) {
-    return launcher.template operator()<CtaM, CtaN, Warps, GroupSize>();
+    return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                        WarpK, GroupSize, PackedMacroN>();
   }
   TORCH_CHECK(false, "SM70 Marlin ", quant_name, " supports only group_size ",
               GroupSize, ". Got ", group_size, ".");
@@ -201,36 +307,28 @@ torch::Tensor dispatch_sm70_marlin_fixed_group_size(Launcher const& launcher,
 }
 
 template <int GroupSize, typename Launcher>
-torch::Tensor dispatch_sm70_marlin_fixed_group_geometry(
-    Launcher const& launcher, Sm70CtaGeometry geometry, int64_t group_size,
-    char const* quant_name) {
-#define DISPATCH_SM70_FIXED_GROUP_GEOMETRY(CM, CN, W)                    \
-  if (geometry.cta_m == CM && geometry.cta_n == CN &&                      \
-      geometry.warps == W) {                                               \
-    return dispatch_sm70_marlin_fixed_group_size<CM, CN, W, GroupSize>(     \
-        launcher, group_size, quant_name);                                  \
+struct Sm70MarlinFixedGroupDispatchLauncher {
+  Launcher const& inner;
+  int64_t group_size;
+  char const* quant_name;
+
+  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+            int WarpK, int PackedMacroN>
+  torch::Tensor operator()() const {
+    return dispatch_sm70_marlin_fixed_group_size<
+        CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
+        PackedMacroN>(inner, group_size, quant_name);
   }
+};
 
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(32, 128, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(32, 256, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(64, 64, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(64, 128, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(64, 128, 8)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(64, 256, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(64, 256, 8)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(128, 64, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(128, 64, 8)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(128, 128, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(128, 128, 8)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(128, 256, 8)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(256, 64, 4)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(256, 64, 8)
-  DISPATCH_SM70_FIXED_GROUP_GEOMETRY(256, 128, 8)
-
-#undef DISPATCH_SM70_FIXED_GROUP_GEOMETRY
-
-  TORCH_CHECK(false, "Unreachable SM70 Marlin ", quant_name,
-              " CTA geometry dispatch.");
+template <int GroupSize, typename Launcher>
+torch::Tensor dispatch_sm70_marlin_fixed_group_geometry(
+    Launcher const& launcher, Sm70CtaGeometry geometry, int packed_macro_n,
+    int64_t group_size, char const* quant_name) {
+  return dispatch_sm70_marlin_cta_geometry(
+      Sm70MarlinFixedGroupDispatchLauncher<GroupSize, Launcher>{
+          launcher, group_size, quant_name},
+      geometry, packed_macro_n, quant_name);
 }
 
 }  // namespace marlin::sm70
