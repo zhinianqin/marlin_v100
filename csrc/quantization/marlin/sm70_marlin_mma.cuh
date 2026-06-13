@@ -89,37 +89,19 @@ class Sm70MarlinMmaPipelined
 
   CUTLASS_DEVICE
   void add_initial_warp_tile_offset(int k_group) {
-    // TODO: After WarpK=16 is fully validated, try to merge the WarpK=32
-    // fast path and the phase-aware WarpK=16 path into one shared helper.
-    // Keep them split for now so the existing WarpK=32 path remains unchanged.
-    if constexpr (Base::kWarpGemmIterations != 4) {
-      this->warp_tile_iterator_A_.add_tile_offset({warp_idx_m_, k_group});
-      this->warp_tile_iterator_B_.add_tile_offset({k_group, warp_idx_n_});
-    } else {
-      reset_phase_aware_warp_tile_iterators(k_group);
-    }
+    reset_phase_aware_warp_tile_iterators(k_group);
   }
 
   CUTLASS_DEVICE
   void add_warp_tile_k_group_offset(int k_group_delta) {
-    // TODO: After WarpK=16 is fully validated, try to merge the WarpK=32
-    // fast path and the phase-aware WarpK=16 path into one shared helper.
-    // Keep them split for now so the existing WarpK=32 path remains unchanged.
-    if constexpr (Base::kWarpGemmIterations != 4) {
-      this->warp_tile_iterator_A_.add_tile_offset({0, k_group_delta});
-      this->warp_tile_iterator_B_.add_tile_offset({k_group_delta, 0});
-    } else {
-      reset_phase_aware_warp_tile_iterators(warp_tile_k_group_ + k_group_delta);
-    }
+    reset_phase_aware_warp_tile_iterators(warp_tile_k_group_ + k_group_delta);
   }
 
   CUTLASS_DEVICE
   void advance_warp_tile_iterators() {
     ++this->warp_tile_iterator_A_;
     ++this->warp_tile_iterator_B_;
-      if constexpr (Base::kWarpGemmIterations == 4) {
-        warp_tile_k_group_ = normalize_warp_tile_k_group(warp_tile_k_group_ + 1);
-      }
+    warp_tile_k_group_ = normalize_warp_tile_k_group(warp_tile_k_group_ + 1);
   }
 
  public:
@@ -167,35 +149,17 @@ class Sm70MarlinMmaPipelined
     ++this->smem_iterator_A_;
     ++this->smem_iterator_B_;
 
-    // TODO: After WarpK=16 is fully validated, try to merge the WarpK=32
-    // fast path and the phase-aware WarpK=16 path into one shared helper.
-    // Keep them split for now so the existing WarpK=32 path remains unchanged.
-    if constexpr (Base::kWarpGemmIterations != 4) {
-      if (smem_write_stage_idx == 1) {
-        this->smem_iterator_A_.add_tile_offset({0, -Base::kStages});
-        this->smem_iterator_B_.add_tile_offset({-Base::kStages, 0});
+    if (smem_write_stage_idx == 1) {
+      this->smem_iterator_A_.add_tile_offset({0, -Base::kStages});
+      this->smem_iterator_B_.add_tile_offset({-Base::kStages, 0});
 
-        if constexpr (Policy::kPartitionsK > 1) {
-          add_warp_tile_k_group_offset(
-              (Policy::kPartitionsK - 1) * Base::kWarpGemmIterations);
-        }
-      } else {
+      if constexpr (Policy::kPartitionsK > 1) {
         add_warp_tile_k_group_offset(
-            -(Policy::kPartitionsK + 1) * Base::kWarpGemmIterations);
+            (Policy::kPartitionsK - 1) * Base::kWarpGemmIterations);
       }
     } else {
-      if (smem_write_stage_idx == 1) {
-        this->smem_iterator_A_.add_tile_offset({0, -Base::kStages});
-        this->smem_iterator_B_.add_tile_offset({-Base::kStages, 0});
-
-        if constexpr (Policy::kPartitionsK > 1) {
-          add_warp_tile_k_group_offset(
-              (Policy::kPartitionsK - 1) * Base::kWarpGemmIterations);
-        }
-      } else {
-        add_warp_tile_k_group_offset(
-            -(Policy::kPartitionsK + 1) * Base::kWarpGemmIterations);
-      }
+      add_warp_tile_k_group_offset(
+          -(Policy::kPartitionsK + 1) * Base::kWarpGemmIterations);
     }
 
     smem_write_stage_idx ^= 1;
