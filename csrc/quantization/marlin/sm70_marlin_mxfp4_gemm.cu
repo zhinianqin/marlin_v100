@@ -121,7 +121,7 @@ class Sm70Mxfp4IteratorB {
   int n_offset_;
   int aligned_k_step_;
   bool mask_enabled_;
-  mutable half2 cached_scales_[ThreadMap::Iterations::kContiguous * 4];
+  mutable half2 cached_scales_[ThreadMap::Iterations::kCount * 4];
 
  public:
   CUTLASS_DEVICE
@@ -196,13 +196,21 @@ class Sm70Mxfp4IteratorB {
   }
 
   CUTLASS_DEVICE
-  void cache_current_group_metadata(int group) const {
+  void cache_current_group_metadata() const {
     CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-      int const cache_n =
-          n_offset_ + thread_offset_.contiguous() +
-          c * ThreadMap::Delta::kContiguous;
-      cache_metadata_e8m0_scales(c, group, cache_n);
+    for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+      int const logical_k =
+          k_offset_ + thread_offset_.strided() +
+          s * ThreadMap::Delta::kStrided;
+      int const group = scale_group(logical_k);
+      CUTLASS_PRAGMA_UNROLL
+      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
+        int const cache_n =
+            n_offset_ + thread_offset_.contiguous() +
+            c * ThreadMap::Delta::kContiguous;
+        int const cache_index = c + s * ThreadMap::Iterations::kContiguous;
+        cache_metadata_e8m0_scales(cache_index, group, cache_n);
+      }
     }
   }
 
@@ -275,9 +283,6 @@ class Sm70Mxfp4IteratorB {
         int const logical_k_s =
             k_offset_ + thread_offset_.strided() +
             s * ThreadMap::Delta::kStrided;
-        if constexpr (kGroupSize != -1) {
-          cache_current_group_metadata(scale_group(logical_k_s));
-        }
         int const qweight_base_s =
             qweight_offset_from_logical(params_, logical_k_s, logical_n_base);
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
@@ -353,12 +358,7 @@ class Sm70Mxfp4IteratorB {
       return;
     }
 
-    if constexpr (kGroupSize != -1 &&
-                  ThreadMap::Iterations::kStrided == 1) {
-      int const first_logical_k = k_offset_ + thread_offset_.strided();
-      cache_current_group_metadata(scale_group(first_logical_k));
-    }
-
+    cache_current_group_metadata();
     load_cta_n_aligned(frag);
   }
 };

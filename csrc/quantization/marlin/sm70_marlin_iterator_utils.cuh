@@ -86,14 +86,6 @@ CUTLASS_DEVICE int u4_packed_macro_n_qweight_offset_from_logical(
          local_word * kGroupTiles + subtile;
 }
 
-template <int CtaN>
-CUTLASS_DEVICE int u4_cta_n_qweight_offset_from_logical(int size_n,
-                                                        int logical_k,
-                                                        int logical_n) {
-  return u4_packed_macro_n_qweight_offset_from_logical<CtaN>(
-      size_n, logical_k, logical_n);
-}
-
 template <int PackedMacroN>
 CUTLASS_DEVICE int u8_packed_macro_n_qweight_offset_from_logical(
     int size_n, int logical_k, int logical_n) {
@@ -115,25 +107,12 @@ CUTLASS_DEVICE int u8_packed_macro_n_qweight_offset_from_logical(
          local_word * kGroupTiles + subtile;
 }
 
-template <int CtaN>
-CUTLASS_DEVICE int u8_cta_n_qweight_offset_from_logical(int size_n,
-                                                        int logical_k,
-                                                        int logical_n) {
-  return u8_packed_macro_n_qweight_offset_from_logical<CtaN>(
-      size_n, logical_k, logical_n);
-}
-
 template <int PackedMacroN>
 CUTLASS_DEVICE int u8_packed_macro_n_qweight_word_stride() {
   static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
                     PackedMacroN == 256,
                 "SM70 Marlin packed macro-N must be 64, 128, or 256.");
   return PackedMacroN / kQuantTileN;
-}
-
-template <int CtaN>
-CUTLASS_DEVICE int u8_cta_n_qweight_word_stride_from_logical() {
-  return u8_packed_macro_n_qweight_word_stride<CtaN>();
 }
 
 }  // namespace marlin::sm70

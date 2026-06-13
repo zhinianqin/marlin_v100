@@ -270,7 +270,7 @@ inline bool sm70_marlin_cta_geometry_is_supported(
       geometry.warp_m, geometry.warp_n, geometry.warp_k);
 }
 
-inline int sm70_marlin_dense_auto_cta_n(int64_t size_n) {
+inline int sm70_marlin_auto_packed_macro_n(int64_t size_n) {
   if (size_n % 256 == 0) {
     return 256;
   }
@@ -289,9 +289,9 @@ inline bool sm70_marlin_packed_macro_n_is_supported(int packed_macro_n) {
   return packed_macro_n == 64 || packed_macro_n == 128 || packed_macro_n == 256;
 }
 
-inline Sm70CtaGeometry sm70_marlin_generic_fallback_geometry_from_cta_n(
-    int auto_cta_n) {
-  switch (auto_cta_n) {
+inline Sm70CtaGeometry sm70_marlin_default_geometry_from_packed_macro_n(
+    int packed_macro_n) {
+  switch (packed_macro_n) {
     case 64:
       return {64, 64, 32, 4, 32, 32, 32};
     case 128:
@@ -299,17 +299,11 @@ inline Sm70CtaGeometry sm70_marlin_generic_fallback_geometry_from_cta_n(
     case 256:
       return {32, 256, 32, 4, 32, 64, 32};
     default:
-      TORCH_CHECK(false, "Unsupported SM70 Marlin auto CTA_N=", auto_cta_n,
+      TORCH_CHECK(false, "Unsupported SM70 Marlin packed macro-N=",
+                  packed_macro_n,
                   ".");
   }
   return {0, 0, 0, 0, 0, 0, 0};
-}
-
-inline Sm70CtaGeometry sm70_marlin_dense_auto_cta_geometry(int64_t size_m,
-                                                          int64_t size_n) {
-  (void)size_m;
-  int const auto_cta_n = sm70_marlin_dense_auto_cta_n(size_n);
-  return sm70_marlin_generic_fallback_geometry_from_cta_n(auto_cta_n);
 }
 
 inline bool sm70_marlin_parse_int_component(char const*& cursor, int& value) {
@@ -413,9 +407,9 @@ inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_env_and_fallback(
     char const* op_name, char const* geometry_env_name,
     char const* split_k_env_name, char const* metadata_env_name,
     int64_t size_n) {
-  int const packed_macro_n = sm70_marlin_dense_auto_cta_n(size_n);
+  int const packed_macro_n = sm70_marlin_auto_packed_macro_n(size_n);
   Sm70MarlinAutoParams params{
-      sm70_marlin_generic_fallback_geometry_from_cta_n(packed_macro_n),
+      sm70_marlin_default_geometry_from_packed_macro_n(packed_macro_n),
       1,
       true,
       packed_macro_n};

@@ -367,10 +367,11 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(max_shared_mem > 0);
 
-  int const cta_n = marlin::sm70::sm70_marlin_dense_auto_cta_n(size_n);
-  if (cta_n == 64) {
+  int const packed_macro_n =
+      marlin::sm70::sm70_marlin_auto_packed_macro_n(size_n);
+  if (packed_macro_n == 64) {
     CALL_FOR_CTA(64);
-  } else if (cta_n == 128) {
+  } else if (packed_macro_n == 128) {
     CALL_FOR_CTA(128);
   } else {
     CALL_FOR_CTA(256);

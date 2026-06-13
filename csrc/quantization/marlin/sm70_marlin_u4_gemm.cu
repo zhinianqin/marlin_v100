@@ -113,28 +113,7 @@ class Sm70U4ZpIteratorB {
     qweight_base_offset_ =
         qweight_offset_from_logical(params_, logical_k, logical_n);
     if constexpr (kGroupSize == -1) {
-      // GroupSize=-1 keeps scale and fp16 zero points stable for
-      // every K tile. Cache both planes once before the MMA mainloop.
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const cache_n =
-            n_offset_ + thread_offset_.contiguous() +
-            c * ThreadMap::Delta::kContiguous;
-        half2 const* scale_vec =
-            reinterpret_cast<half2 const*>(scales_ + cache_n);
-        half2* scale_cache = cached_scales_ + c * 4;
-        scale_cache[0] = scale_vec[0];
-        scale_cache[1] = scale_vec[1];
-        scale_cache[2] = scale_vec[2];
-        scale_cache[3] = scale_vec[3];
-
-        half2 const* zp_vec = reinterpret_cast<half2 const*>(zp_ + cache_n);
-        half2* zp_cache = cached_zp_ + c * 4;
-        zp_cache[0] = zp_vec[0];
-        zp_cache[1] = zp_vec[1];
-        zp_cache[2] = zp_vec[2];
-        zp_cache[3] = zp_vec[3];
-      }
+        cache_current_group_metadata(0);
     }
   }
 

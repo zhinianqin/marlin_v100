@@ -332,7 +332,6 @@ class Sm70Nvfp4IteratorB {
     }
 
     cache_current_group_metadata();
-
     load_cta_n_aligned(frag);
   }
 };

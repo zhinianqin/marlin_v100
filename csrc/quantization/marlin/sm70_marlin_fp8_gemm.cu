@@ -114,21 +114,7 @@ class Sm70Fp8IteratorB {
     qweight_base_offset_ =
         qweight_offset_from_logical(params_, logical_k, logical_n);
     if constexpr (kGroupSize == -1) {
-      // GroupSize=-1 uses one scale row for every K tile. Cache it once
-      // before the MMA mainloop instead of reloading it from IteratorB::load().
-      CUTLASS_PRAGMA_UNROLL
-      for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const cache_n =
-            n_offset_ + thread_offset_.contiguous() +
-            c * ThreadMap::Delta::kContiguous;
-        half2 const* scale_vec =
-            reinterpret_cast<half2 const*>(scales_ + cache_n);
-        half2* scale_cache = cached_scales_ + c * 4;
-        scale_cache[0] = scale_vec[0];
-        scale_cache[1] = scale_vec[1];
-        scale_cache[2] = scale_vec[2];
-        scale_cache[3] = scale_vec[3];
-      }
+      cache_current_group_metadata(0);
     }
   }
 
