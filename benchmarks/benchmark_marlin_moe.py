@@ -274,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-order", choices=("off", "on", "all"), help=argparse.SUPPRESS)
     parser.add_argument("--is-k-full", choices=("true", "false", "all"), help=argparse.SUPPRESS)
     parser.add_argument("--path", choices=("method", "raw"), default="method", help=argparse.SUPPRESS)
-    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
         "--check",

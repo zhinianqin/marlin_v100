@@ -24,6 +24,36 @@ from tests.writeback_marlin_cases import (
 )
 
 
+# 3-field CTA label → 7-field CTA label mapping, consistent with
+# sm70_marlin_geometry_from_legacy_cta in sm70_marlin_common.cuh.
+_LEGACY_CTA_TO_7FIELD_LABEL: dict[str, str] = {
+    "32x128x4":  "32x128x32x4x32x32x32",
+    "32x256x4":  "32x256x32x4x32x64x32",
+    "64x64x4":   "64x64x32x4x32x32x32",
+    "64x128x4":  "64x128x32x4x32x64x32",
+    "64x128x8":  "64x128x32x8x32x32x32",
+    "64x256x4":  "64x256x32x4x64x64x32",
+    "64x256x8":  "64x256x32x8x32x64x32",
+    "128x64x4":  "128x64x32x4x64x32x32",
+    "128x64x8":  "128x64x32x8x32x32x32",
+    "128x128x4": "128x128x32x4x64x64x32",
+    "128x128x8": "128x128x32x8x64x32x32",
+    "128x256x8": "128x256x32x8x64x64x32",
+    "256x64x4":  "256x64x32x4x64x64x32",
+    "256x64x8":  "256x64x32x8x64x32x32",
+    "256x128x8": "256x128x32x8x64x64x32",
+}
+
+
+def normalize_cta_label_to_7field(cta_label: str) -> str:
+    """Normalize a 3-field or 7-field CTA label to the canonical 7-field form."""
+    if cta_label in ("n/a", "auto"):
+        return cta_label
+    if cta_label.count("x") == 6:
+        return cta_label
+    return _LEGACY_CTA_TO_7FIELD_LABEL.get(cta_label, cta_label)
+
+
 DEFAULT_DENSE_AUTO = Path(
     "benchmarks/results/20260604_dense_auto_ctam_warps_splitk_iters1.csv"
 )
@@ -142,7 +172,7 @@ def dense_full_strategy(
     cta = (
         historical_dense_auto_cta_label(shape)
         if row["cta"] == "auto"
-        else row["cta"]
+        else normalize_cta_label_to_7field(row["cta"])
     )
     return (cta, split_label(row["split_k"]))
 
@@ -154,7 +184,7 @@ def moe_full_strategy(
     cta = (
         historical_moe_auto_cta_label(shape)
         if row["cta"] == "auto"
-        else row["cta"]
+        else normalize_cta_label_to_7field(row["cta"])
     )
     return (cta, split_label(row["split_k"]))
 

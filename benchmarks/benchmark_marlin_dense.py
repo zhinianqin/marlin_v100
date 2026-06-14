@@ -602,7 +602,7 @@ def parse_args() -> argparse.Namespace:
         choices=("regular", "irregular", "all"),
         default="all",
     )
-    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--csv", type=Path)
