@@ -698,27 +698,28 @@ _CT_DENSE_TARGETS = {
 _CT_MOE_TARGETS = {"FusedMoE", "FusedMoEGroupedGEMM", "MoE"}
 
 
-def _ct_target_matches_candidate_class(candidate: Candidate, target: str) -> bool:
-    if candidate.kind == "dense" and target in _CT_DENSE_TARGETS:
-        return True
-    return candidate.kind == "moe" and target in _CT_MOE_TARGETS
-
-
 def _ct_prefix_matches_target(prefix: str, target: str) -> bool:
     return _regex_or_exact(prefix, target) or _regex_or_exact(
         _normalize_prefix(prefix), target
     )
 
 
-def _ct_group_matches_candidate(candidate: Candidate, targets: list[str]) -> bool:
-    if any(_ct_target_matches_candidate_class(candidate, target)
-           for target in targets):
-        return True
+def _ct_group_match_rank(candidate: Candidate, targets: list[str]) -> int | None:
+    has_prefix_match = False
     for group in candidate.prefix_groups:
         if all(any(_ct_prefix_matches_target(prefix, target)
                    for target in targets) for prefix in group):
-            return True
-    return False
+            has_prefix_match = True
+            break
+    if has_prefix_match:
+        return 0
+    if candidate.kind == "moe" and any(target in _CT_MOE_TARGETS for target in targets):
+        return 1
+    if candidate.kind == "moe" and any(target in _CT_DENSE_TARGETS for target in targets):
+        return 2
+    if candidate.kind == "dense" and any(target in _CT_DENSE_TARGETS for target in targets):
+        return 1
+    return None
 
 
 def _ct_quant_for_candidate(candidate: Candidate,
@@ -727,12 +728,23 @@ def _ct_quant_for_candidate(candidate: Candidate,
     if not isinstance(groups, dict) or not groups:
         return quant
 
+    best_rank: int | None = None
+    best_group: dict[str, Any] | None = None
     for group_config in groups.values():
         if not isinstance(group_config, dict):
             continue
         targets = [str(x) for x in group_config.get("targets") or []]
-        if not targets or not _ct_group_matches_candidate(candidate, targets):
+        if not targets:
             continue
+        rank = _ct_group_match_rank(candidate, targets)
+        if rank is None:
+            continue
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best_group = group_config
+
+    if best_group is not None:
+        group_config = best_group
 
         weights = dict(group_config.get("weights") or {})
         bits = _as_int(weights.get("num_bits") or weights.get("bits"), quant.bits)

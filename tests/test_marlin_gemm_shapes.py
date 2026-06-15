@@ -536,6 +536,108 @@ def test_compressed_tensors_config_groups_and_fused_ignore(tmp_path: Path):
     assert moe["group_size"] == 16
 
 
+def test_minimax_moe_linear_targets_are_recognized(tmp_path: Path):
+    config = {
+        "model_type": "minimax_m2",
+        "architectures": ["MiniMaxM2ForCausalLM"],
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "ignore": [
+                "model.layers.0.block_sparse_moe.gate",
+                "lm_head",
+            ],
+            "config_groups": {
+                "dense_linear": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                        "group_size": 32,
+                        "symmetric": True,
+                    },
+                }
+            },
+        },
+        "text_config": {
+            "model_type": "minimax_m2",
+            "hidden_size": 3072,
+            "intermediate_size": 1536,
+            "num_local_experts": 256,
+            "num_experts_per_tok": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "layer_types": ["full_attention", "full_attention"],
+        },
+    }
+    keys = [
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight_packed",
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale",
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight_shape",
+        "model.layers.0.block_sparse_moe.experts.0.w2.weight_packed",
+        "model.layers.0.block_sparse_moe.experts.0.w2.weight_scale",
+        "model.layers.0.block_sparse_moe.experts.0.w2.weight_shape",
+        "model.layers.0.block_sparse_moe.experts.0.w3.weight_packed",
+        "model.layers.0.block_sparse_moe.experts.0.w3.weight_scale",
+        "model.layers.0.block_sparse_moe.experts.0.w3.weight_shape",
+        "model.layers.0.self_attn.q_proj.qweight",
+        "model.layers.0.self_attn.q_proj.qzeros",
+        "model.layers.0.self_attn.q_proj.scales",
+        "model.layers.0.self_attn.k_proj.qweight",
+        "model.layers.0.self_attn.k_proj.qzeros",
+        "model.layers.0.self_attn.k_proj.scales",
+        "model.layers.0.self_attn.v_proj.qweight",
+        "model.layers.0.self_attn.v_proj.qzeros",
+        "model.layers.0.self_attn.v_proj.scales",
+        "model.layers.0.self_attn.o_proj.qweight",
+        "model.layers.0.self_attn.o_proj.qzeros",
+        "model.layers.0.self_attn.o_proj.scales",
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "4",
+        "--ep-modes",
+        "tp,tp_ep",
+        "--max-num-batched-tokens",
+        "2048",
+        "--decode-concurrency",
+        "1",
+    )
+
+    moe_w13 = next(
+        row for row in payload["moe"]
+        if row["op"] == "w13" and row["phase"] == "prefill"
+    )
+    moe_w2 = next(
+        row for row in payload["moe"]
+        if row["op"] == "w2" and row["phase"] == "prefill"
+    )
+    assert moe_w13["call_status"] == "actual_marlin"
+    assert moe_w13["quant_method"] == "compressed-tensors"
+    assert moe_w13["quant_format"] == "uint4b8"
+    assert moe_w13["group_size"] == 32
+    assert moe_w13["marlin_path"] == "wna16_marlin"
+    assert moe_w2["call_status"] == "actual_marlin"
+    assert moe_w2["quant_format"] == "uint4b8"
+    assert moe_w2["group_size"] == 32
+    assert moe_w2["marlin_path"] == "wna16_marlin"
+
+    dense = next(
+        row for row in payload["dense"]
+        if row["op"] == "qkv_proj" and row["phase"] == "prefill"
+    )
+    assert dense["call_status"] == "actual_marlin"
+    assert dense["quant_format"] == "uint4b8"
+    assert dense["group_size"] == 32
+
+
 def test_architecture_specific_moe_specs(tmp_path: Path):
     minimax_dir = write_model(
         tmp_path,
