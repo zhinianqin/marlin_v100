@@ -130,6 +130,33 @@ PY
   设置 `MARLIN_EXHAUSTIVE_ENV_SWEEP=1` 和 `MARLIN_EXHAUSTIVE_ENV_LIMIT=<N>` 后运行相关 marked tests。
 - full env sweep：
   只在明确需要完整覆盖时执行；这类测试会很慢。
+- 模型 shape table 测试：
+  `tests/test_marlin_model_shapes_env.py` 通过 pytest `--model <model_dir>`
+  读取本地模型目录中的 `config.json`，复用
+  `benchmarks/marlin_gemm_shapes.py` 生成 Dense/MoE table，并验证 table schema、
+  pretty 输出、`actual_marlin` 行参数和可选 SM70 env runtime 精度。未传
+  `--model` 时该测试会 skip；`--model` 必须指向包含 `config.json` 的 leaf
+  模型目录，不能指向 `config.json` 文件或模型集合父目录。详细语义见
+  `docs/20260615_059_marlin_model_shape_table_pytest.md`。
+
+模型 shape table smoke 示例：
+
+```bash
+PYTHONPATH=$PWD ./.venv/bin/pytest tests/test_marlin_model_shapes_env.py \
+  --model /path/to/model_dir \
+  -v
+```
+
+模型 shape table env sweep smoke 示例：
+
+```bash
+PYTHONPATH=$PWD MARLIN_EXHAUSTIVE_ENV_SWEEP=1 \
+  MARLIN_EXHAUSTIVE_ENV_LIMIT=1 \
+  ./.venv/bin/pytest tests/test_marlin_model_shapes_env.py \
+  --model /path/to/model_dir \
+  -m sm70_env_exhaustive \
+  -v
+```
 
 当前项目目标就是 SM70 Marlin。当前 SM70 机器可用于构建、导入、op 注册和必要的 SM70 runtime smoke；大型 pytest / exhaustive sweep 不是每次文档或小改动的默认硬门槛。
 
