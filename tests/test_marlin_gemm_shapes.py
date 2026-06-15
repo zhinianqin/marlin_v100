@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).parents[1] / "benchmarks/marlin_gemm_shapes.py"
 SPEC = importlib.util.spec_from_file_location("marlin_gemm_shapes", SCRIPT)
@@ -337,6 +339,126 @@ def test_modelopt_nvfp4_mixed_modules_fall_back_to_bf16(tmp_path: Path):
         and has_layer_key(r, "layers.1.self_attn.q_proj")
     ]
     assert skipped
+
+
+def test_step_fp8_moe_weights_use_safetensors_dtype_evidence(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    config = step_config({
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "weight_block_size": [128, 128],
+        "modules_to_not_convert": [
+            "model.layers.0.self_attn.qkv_proj",
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.self_attn.k_proj",
+            "model.layers.0.self_attn.v_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.mlp.gate_up_proj",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.up_proj",
+            "model.layers.0.mlp.down_proj",
+            "model.layers.1.self_attn.qkv_proj",
+            "model.layers.1.self_attn.q_proj",
+            "model.layers.1.self_attn.k_proj",
+            "model.layers.1.self_attn.v_proj",
+            "model.layers.1.self_attn.o_proj",
+            "model.layers.1.mlp.gate_up_proj",
+            "model.layers.1.mlp.gate_proj",
+            "model.layers.1.mlp.up_proj",
+            "model.layers.1.mlp.down_proj",
+            "model.layers.2.self_attn.qkv_proj",
+            "model.layers.2.self_attn.q_proj",
+            "model.layers.2.self_attn.k_proj",
+            "model.layers.2.self_attn.v_proj",
+            "model.layers.2.self_attn.o_proj",
+            "model.layers.2.moe.gate",
+            "model.layers.2.share_expert.gate_up_proj",
+            "model.layers.2.share_expert.gate_proj",
+            "model.layers.2.share_expert.up_proj",
+            "model.layers.2.share_expert.down_proj",
+            "model.layers.3.self_attn.qkv_proj",
+            "model.layers.3.self_attn.q_proj",
+            "model.layers.3.self_attn.k_proj",
+            "model.layers.3.self_attn.v_proj",
+            "model.layers.3.self_attn.o_proj",
+            "model.layers.3.moe.gate",
+            "model.layers.3.share_expert.gate_up_proj",
+            "model.layers.3.share_expert.gate_proj",
+            "model.layers.3.share_expert.up_proj",
+            "model.layers.3.share_expert.down_proj",
+        ],
+    })
+    config["text_config"]["moe_layers_enum"] = "2"
+    keys = [
+        "model.layers.2.moe.gate.weight",
+        "model.layers.2.moe.gate_proj.weight",
+        "model.layers.2.moe.up_proj.weight",
+        "model.layers.2.moe.down_proj.weight",
+        "model.layers.2.self_attn.q_proj.weight",
+        "model.layers.2.share_expert.gate_proj.weight",
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+    safetensors_torch.save_file(
+        {
+            "model.layers.2.moe.gate.weight": torch.empty(
+                (1, 1), dtype=torch.bfloat16
+            ),
+            "model.layers.2.moe.gate_proj.weight": torch.empty(
+                (1, 1), dtype=torch.float8_e4m3fn
+            ),
+            "model.layers.2.moe.up_proj.weight": torch.empty(
+                (1, 1), dtype=torch.float8_e4m3fn
+            ),
+            "model.layers.2.moe.down_proj.weight": torch.empty(
+                (1, 1), dtype=torch.float8_e4m3fn
+            ),
+            "model.layers.2.self_attn.q_proj.weight": torch.empty(
+                (1, 1), dtype=torch.bfloat16
+            ),
+            "model.layers.2.share_expert.gate_proj.weight": torch.empty(
+                (1, 1), dtype=torch.bfloat16
+            ),
+        },
+        str(model_dir / "model.safetensors"),
+    )
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "4",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "2048",
+        "--decode-concurrency",
+        "1",
+    )
+
+    moe_w13 = next(
+        row for row in payload["moe"]
+        if row["op"] == "w13" and row["phase"] == "prefill"
+    )
+    moe_w2 = next(
+        row for row in payload["moe"]
+        if row["op"] == "w2" and row["phase"] == "prefill"
+    )
+    for row in [moe_w13, moe_w2]:
+        assert row["call_status"] == "actual_marlin"
+        assert row["quant_method"] == "fp8"
+        assert row["quant_format"] == "fp8_e4m3"
+        assert row["group_size"] == 128
+        assert row["marlin_path"] == "fp8_marlin"
+        assert row["target_op"] == "ops.moe_wna16_marlin_gemm"
+        assert row["warning"] == ""
+    assert not any(row["warning"] == "excluded_quant_module"
+                   for row in payload["moe"])
 
 
 def test_modelopt_mixed_precision_layer_map(tmp_path: Path):

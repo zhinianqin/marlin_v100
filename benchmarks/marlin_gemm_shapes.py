@@ -136,8 +136,13 @@ class QuantDecision:
 
 
 class IndexEvidence:
-    def __init__(self, keys: set[str] | None):
+    def __init__(
+        self,
+        keys: set[str] | None,
+        dtypes: dict[str, str] | None = None,
+    ):
         self.keys = keys
+        self.dtypes = dtypes or {}
         self._suffix_cache: dict[str, set[str]] = {}
         self._has_any_cache: dict[str, bool] = {}
 
@@ -155,6 +160,8 @@ class IndexEvidence:
         for key in self.keys:
             if key.startswith(exact):
                 suffixes.add(key.rsplit(".", 1)[-1])
+                if self._key_is_fp8_weight(key):
+                    suffixes.add("fp8_weight")
         self._suffix_cache[prefix] = suffixes
         return suffixes
 
@@ -176,6 +183,11 @@ class IndexEvidence:
 
     def has_any_for_group(self, prefixes: list[str]) -> bool:
         return any(self.has_any_for_prefix(prefix) for prefix in prefixes)
+
+    def _key_is_fp8_weight(self, key: str) -> bool:
+        if not key.endswith(".weight"):
+            return False
+        return self.dtypes.get(key, "").upper() in {"F8_E4M3", "F8_E4M3FN"}
 
 
 def _as_int(value: Any, default: int | None = None) -> int | None:
@@ -262,7 +274,10 @@ def _parse_quant(model_dir: Path, config: dict[str, Any],
     weight_block_size = raw.get("weight_block_size")
     if group_size is None and isinstance(weight_block_size, list):
         if weight_block_size:
-            group_size = "x".join(str(x) for x in weight_block_size)
+            if method == "fp8" and len(weight_block_size) >= 2:
+                group_size = _as_int(weight_block_size[1])
+            else:
+                group_size = "x".join(str(x) for x in weight_block_size)
 
     return QuantInfo(
         method=method,
@@ -642,39 +657,60 @@ def _regex_or_exact(value: str, target: str) -> bool:
     return value == target
 
 
-def _awq_ignored(candidate: Candidate, ignore: list[str]) -> bool:
-    for prefix in _all_prefixes(candidate):
-        normalized = _normalize_prefix(prefix)
-        for target in ignore:
-            if target in prefix or target in normalized or prefix.startswith(target):
+def _prefix_matches_ignore_target(prefix: str, target: str) -> bool:
+    normalized = _normalize_prefix(prefix)
+    candidates = [prefix, normalized]
+    if target.startswith("re:"):
+        return any(_regex_or_exact(value, target) for value in candidates)
+
+    target = target.rstrip(".")
+    if not target:
+        return False
+    for value in candidates:
+        if (
+            value == target
+            or value.startswith(target + ".")
+            or fnmatch.fnmatch(value, target)
+        ):
+            return True
+        parts = value.split(".")
+        for idx in range(len(parts)):
+            suffix = ".".join(parts[idx:])
+            if (
+                suffix == target
+                or suffix.startswith(target + ".")
+                or fnmatch.fnmatch(suffix, target)
+            ):
                 return True
     return False
 
 
-def _ct_ignored(candidate: Candidate, ignore: list[str]) -> bool:
+def _candidate_group_ignored(candidate: Candidate, ignore: list[str]) -> bool:
     for group in candidate.prefix_groups:
-        if all(any(_ct_prefix_matches_target(prefix, target) for target in ignore)
-               for prefix in group):
+        if all(
+            any(_prefix_matches_ignore_target(prefix, target)
+                for target in ignore)
+            for prefix in group
+        ):
             return True
     return False
+
+
+def _awq_ignored(candidate: Candidate, ignore: list[str]) -> bool:
+    return _candidate_group_ignored(candidate, ignore)
+
+
+def _ct_ignored(candidate: Candidate, ignore: list[str]) -> bool:
+    return _candidate_group_ignored(candidate, ignore)
 
 
 def _modelopt_ignored(candidate: Candidate, ignore: list[str]) -> bool:
-    for group in candidate.prefix_groups:
-        if all(_modelopt_prefix_ignored(prefix, ignore) for prefix in group):
-            return True
-    return False
+    return _candidate_group_ignored(candidate, ignore)
 
 
 def _modelopt_prefix_ignored(prefix: str, ignore: list[str]) -> bool:
-    normalized = _normalize_prefix(prefix)
     for target in ignore:
-        if (
-            target == prefix
-            or target == normalized
-            or fnmatch.fnmatch(prefix, target)
-            or fnmatch.fnmatch(normalized, target)
-        ):
+        if _prefix_matches_ignore_target(prefix, target):
             return True
     return False
 
@@ -981,7 +1017,7 @@ def _suffixes_satisfy_quant(qfmt: str, suffixes: set[str]) -> bool:
     )
     has_nvfp4 = has_weight and has_scale and has_global_scale
     has_mxfp4 = has_weight and has_scale
-    has_fp8 = has_weight and has_scale
+    has_fp8 = (has_weight and has_scale) or "fp8_weight" in suffixes
     has_wna16 = (
         has_awq
         or "weight_packed" in suffixes
@@ -1361,7 +1397,42 @@ def load_index(model_dir: Path, verify: bool) -> IndexEvidence:
     if not index_path.exists():
         return IndexEvidence(None)
     data = _read_json(index_path)
-    return IndexEvidence(set(data.get("weight_map", {}).keys()))
+    weight_map = data.get("weight_map", {})
+    if not isinstance(weight_map, dict):
+        return IndexEvidence(set())
+    keys = set(str(key) for key in weight_map)
+    return IndexEvidence(keys, _load_safetensors_dtypes(model_dir, weight_map))
+
+
+def _load_safetensors_dtypes(
+    model_dir: Path, weight_map: dict[str, Any]
+) -> dict[str, str]:
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return {}
+
+    dtypes: dict[str, str] = {}
+    keys_by_file: dict[str, list[str]] = {}
+    for key, filename in weight_map.items():
+        if not isinstance(key, str) or not isinstance(filename, str):
+            continue
+        if filename.endswith(".safetensors"):
+            keys_by_file.setdefault(filename, []).append(key)
+
+    for filename, keys in keys_by_file.items():
+        path = model_dir / filename
+        if not path.exists():
+            continue
+        try:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                available = set(handle.keys())
+                for key in keys:
+                    if key in available:
+                        dtypes[key] = str(handle.get_slice(key).get_dtype())
+        except Exception:
+            continue
+    return dtypes
 
 
 def _scenarios(tp_sizes: list[int], ep_modes: list[str]) -> list[Scenario]:
