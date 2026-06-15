@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from tests import ops
+from tests import ops, quant_utils
 from tests.sm70_env_sweep import (
     EXPLICIT_ENV_REJECTION_RE,
     DenseDirectOpKey,
@@ -20,10 +21,27 @@ from tests.sm70_env_sweep import (
     exhaustive_enabled,
     exhaustive_index_is_past_limit,
     exhaustive_index_is_selected,
+    exhaustive_start_limit,
     iter_env_combinations,
     iter_moe_env_combinations,
     moe_env,
     moe_stage_env_combo_is_legal,
+)
+from tests.helpers import (
+    _fp8_fused_exponent_bias_into_scales,
+    _nvfp4_marlin_process_global_scale,
+    _nvfp4_marlin_process_scales,
+    _quantize_fp8_weight,
+    _quantize_mxfp4_weight,
+    _quantize_nvfp4_weight,
+    _quantize_uint4_with_zero_point,
+    _quantize_uint8_with_zero_point,
+    _quantize_unsigned_with_bias,
+    fp4_e2m1_weight_to_marlin_weight,
+    fp8_weight_to_marlin_weight,
+    marlin_permute_scales,
+    moe_align_block_size,
+    scalar_types,
 )
 from tests.writeback_marlin_cases import (
     is_dense_group_size_supported,
@@ -35,9 +53,7 @@ from tests.test_marlin_dense import (
 )
 from tests.test_marlin_moe import (
     _MOE_ENV_SWEEP_TOLERANCES,
-    _make_moe_env_sweep_inputs,
-    _moe_stage1_reference,
-    _moe_stage2_inputs_and_reference,
+    _require_moe_cuda,
     _run_moe_env_stage1_combo,
     _run_moe_env_stage2_combo,
 )
@@ -104,6 +120,22 @@ _ACTUAL_MOE_CONTEXT_KEYS = (
     "group_size",
 )
 
+_PROGRESS_HEARTBEAT_INTERVAL = 64
+_MoeQuantizedWeight = dict[str, object]
+_MoeStage1RuntimeCase = tuple[MoeDirectOpKey, dict[str, object], torch.Tensor, float, float]
+_MoeStage2RuntimeCase = tuple[
+    MoeDirectOpKey,
+    dict[str, object],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    float,
+]
+
 
 def _quant_name(quant_format: str) -> str:
     if quant_format in {"uint4", "uint8", "uint4b8", "uint8b128", "nvfp4", "mxfp4"}:
@@ -146,6 +178,37 @@ def _capture_pretty(model_dir: Path, capsys: pytest.CaptureFixture[str]) -> str:
     )
     assert rc == 0
     return capsys.readouterr().out
+
+
+def _emit_progress(request: pytest.FixtureRequest, message: str) -> None:
+    capturemanager = request.config.pluginmanager.get_plugin("capturemanager")
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    try:
+        if capturemanager is not None:
+            with capturemanager.global_and_fixture_disabled():
+                if reporter is not None:
+                    reporter.write_line(message)
+                    terminal_writer = getattr(reporter, "_tw", None)
+                    flush = getattr(terminal_writer, "flush", None)
+                    if callable(flush):
+                        flush()
+                    return
+                print(message, flush=True)
+                return
+        if reporter is not None:
+            reporter.write_line(message)
+            terminal_writer = getattr(reporter, "_tw", None)
+            flush = getattr(terminal_writer, "flush", None)
+            if callable(flush):
+                flush()
+            return
+        print(message, flush=True)
+    except Exception:
+        print(message, flush=True)
+
+
+def _format_limit(limit: int | None) -> str:
+    return "unbounded" if limit is None else str(limit)
 
 
 def _row_context(row: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -288,6 +351,440 @@ def _helper_group_size(row: dict[str, Any]) -> int:
     return group_size
 
 
+def _moe_scalar_type(quant_name: str) -> Any:
+    return {
+        "uint4": scalar_types.uint4,
+        "uint4b8": scalar_types.uint4b8,
+        "uint8": scalar_types.uint8,
+        "uint8b128": scalar_types.uint8b128,
+        "fp8": scalar_types.float8_e4m3fn,
+        "nvfp4": scalar_types.float4_e2m1f,
+        "mxfp4": scalar_types.float4_e2m1f,
+    }[quant_name]
+
+
+def _make_uniform_topk_routing(
+    *,
+    tokens: int,
+    experts: int,
+    topk: int,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    topk_weights = torch.rand((tokens, topk), device=device, dtype=torch.float32)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = torch.empty((tokens, topk), device=device, dtype=torch.int32)
+    for token_idx in range(tokens):
+        for route_idx in range(topk):
+            topk_ids[token_idx, route_idx] = (token_idx + route_idx) % experts
+    return topk_weights, topk_ids
+
+
+def _quantize_moe_expert_weights(
+    weights: torch.Tensor,
+    *,
+    quant_name: str,
+    group_size: int,
+) -> _MoeQuantizedWeight:
+    q_weights: list[torch.Tensor] = []
+    scales: list[torch.Tensor] = []
+    zeros: list[torch.Tensor] = []
+    global_scales: list[torch.Tensor] = []
+    dequantized: list[torch.Tensor] = []
+    g_indices: list[torch.Tensor] = []
+    perms: list[torch.Tensor] = []
+
+    quant_type = _moe_scalar_type(quant_name)
+    size_k = int(weights.shape[1])
+    size_n = int(weights.shape[2])
+    for expert in range(weights.shape[0]):
+        weight = weights[expert]
+        if quant_name == "uint4":
+            q_weight, scale, zero_point = _quantize_uint4_with_zero_point(
+                weight,
+                group_size,
+            )
+            q_marlin = quant_utils.marlin_weights(
+                q_weight,
+                size_k,
+                size_n,
+                scalar_types.uint4.size_bits,
+                quant_utils.get_weight_perm(scalar_types.uint4.size_bits, is_a_8bit=False),
+                is_a_8bit=False,
+            )
+            marlin_scale = marlin_permute_scales(
+                scale,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            zp = (zero_point.to(torch.float32) * scale.to(torch.float32)).to(weight.dtype)
+            marlin_zero = marlin_permute_scales(
+                zp,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            runtime_group_size = size_k if group_size == -1 else group_size
+            expanded_scale = scale.to(torch.float32).repeat_interleave(runtime_group_size, dim=0)[
+                :size_k
+            ]
+            expanded_zp = zp.to(torch.float32).repeat_interleave(runtime_group_size, dim=0)[
+                :size_k
+            ]
+            dequant = (q_weight.to(torch.float32) * expanded_scale - expanded_zp).to(
+                torch.float16
+            )
+            zeros.append(marlin_zero)
+            global_scale = None
+        elif quant_name == "uint8":
+            q_weight, scale, zero_point = _quantize_uint8_with_zero_point(
+                weight,
+                group_size,
+            )
+            q_marlin = quant_utils.marlin_weights(
+                q_weight,
+                size_k,
+                size_n,
+                scalar_types.uint8.size_bits,
+                quant_utils.get_weight_perm(scalar_types.uint8.size_bits, is_a_8bit=False),
+                is_a_8bit=False,
+            )
+            marlin_scale = marlin_permute_scales(
+                scale,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            zp = (zero_point.to(torch.float32) * scale.to(torch.float32)).to(weight.dtype)
+            marlin_zero = marlin_permute_scales(
+                zp,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            runtime_group_size = size_k if group_size == -1 else group_size
+            expanded_scale = scale.to(torch.float32).repeat_interleave(runtime_group_size, dim=0)[
+                :size_k
+            ]
+            expanded_zp = zp.to(torch.float32).repeat_interleave(runtime_group_size, dim=0)[
+                :size_k
+            ]
+            dequant = (q_weight.to(torch.float32) * expanded_scale - expanded_zp).to(
+                torch.float16
+            )
+            zeros.append(marlin_zero)
+            global_scale = None
+        elif quant_name == "nvfp4":
+            q_weight, fp8_scales, raw_global_scale, dequant = _quantize_nvfp4_weight(
+                weight,
+                group_size,
+            )
+            q_marlin = fp4_e2m1_weight_to_marlin_weight(q_weight)
+            raw_marlin_scale = marlin_permute_scales(
+                fp8_scales,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            marlin_scale, scale_factor = _nvfp4_marlin_process_scales(
+                raw_marlin_scale,
+                a_dtype=weight.dtype,
+            )
+            global_scale = _nvfp4_marlin_process_global_scale(
+                raw_global_scale.reshape(1).contiguous(),
+                weight.dtype,
+            ).to(torch.float32)
+            global_scale = (global_scale / scale_factor).contiguous()
+        elif quant_name == "mxfp4":
+            q_weight, fp8_scales, dequant = _quantize_mxfp4_weight(weight, group_size)
+            q_marlin = fp4_e2m1_weight_to_marlin_weight(q_weight)
+            marlin_scale = marlin_permute_scales(
+                fp8_scales,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            global_scale = None
+        elif quant_name == "fp8":
+            fp8_weight, scale, dequant = _quantize_fp8_weight(weight, group_size)
+            q_marlin = fp8_weight_to_marlin_weight(fp8_weight)
+            marlin_scale = marlin_permute_scales(
+                _fp8_fused_exponent_bias_into_scales(scale).to(torch.float16),
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            global_scale = None
+        else:
+            q_weight, scale = _quantize_unsigned_with_bias(
+                weight,
+                group_size,
+                quant_type.bias,
+            )
+            q_marlin = quant_utils.marlin_weights(
+                q_weight,
+                size_k,
+                size_n,
+                quant_type.size_bits,
+                quant_utils.get_weight_perm(quant_type.size_bits, is_a_8bit=False),
+                is_a_8bit=False,
+            )
+            marlin_scale = marlin_permute_scales(
+                scale,
+                size_k,
+                size_n,
+                group_size,
+                is_a_8bit=False,
+            )
+            runtime_group_size = size_k if group_size == -1 else group_size
+            expanded_scale = scale.to(torch.float32).repeat_interleave(runtime_group_size, dim=0)[
+                :size_k
+            ]
+            dequant = (
+                (q_weight.to(torch.float32) - float(quant_type.bias)) * expanded_scale
+            ).to(torch.float16)
+            global_scale = None
+
+        q_weights.append(q_marlin)
+        scales.append(marlin_scale)
+        dequantized.append(dequant)
+        if global_scale is not None:
+            global_scales.append(global_scale.reshape(-1)[0])
+        g_indices.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+        perms.append(torch.empty((0,), dtype=torch.int, device=weights.device))
+
+    zeros_tensor = torch.stack(zeros) if zeros else None
+    global_scale_tensor = torch.stack(global_scales).contiguous() if global_scales else None
+    return {
+        "q_weight": torch.stack(q_weights),
+        "scales": torch.stack(scales),
+        "zeros": zeros_tensor,
+        "global_scale": global_scale_tensor,
+        "dequant": dequantized,
+        "g_idx": torch.stack(g_indices),
+        "perm": torch.stack(perms),
+    }
+
+
+def _repeat_moe_quantized_result(
+    quantized: _MoeQuantizedWeight,
+    expert_count: int,
+) -> _MoeQuantizedWeight:
+    current = int(cast(torch.Tensor, quantized["q_weight"]).shape[0])
+    if current == expert_count:
+        return quantized
+    repeats = math.ceil(expert_count / current)
+
+    def _repeat_tensor(value: torch.Tensor) -> torch.Tensor:
+        dims = (repeats,) + (1,) * (value.dim() - 1)
+        return value.repeat(dims)[:expert_count].contiguous()
+
+    repeated: _MoeQuantizedWeight = {
+        "q_weight": _repeat_tensor(cast(torch.Tensor, quantized["q_weight"])),
+        "scales": _repeat_tensor(cast(torch.Tensor, quantized["scales"])),
+        "zeros": None,
+        "global_scale": None,
+        "dequant": cast(list[torch.Tensor], quantized["dequant"]) * repeats,
+        "g_idx": _repeat_tensor(cast(torch.Tensor, quantized["g_idx"])),
+        "perm": _repeat_tensor(cast(torch.Tensor, quantized["perm"])),
+    }
+    repeated["dequant"] = cast(list[torch.Tensor], repeated["dequant"])[:expert_count]
+    zeros = quantized["zeros"]
+    if isinstance(zeros, torch.Tensor):
+        repeated["zeros"] = _repeat_tensor(zeros)
+    global_scale = quantized["global_scale"]
+    if isinstance(global_scale, torch.Tensor):
+        repeated["global_scale"] = _repeat_tensor(global_scale)
+    return repeated
+
+
+def _moe_stage1_reference_fast(inputs: dict[str, object]) -> torch.Tensor:
+    hidden_states = inputs["hidden_states"]
+    topk_ids = inputs["topk_ids"]
+    tokens = int(inputs["tokens"])
+    topk = int(inputs["topk"])
+    dequantized = inputs["w1_dequant"]
+    assert isinstance(hidden_states, torch.Tensor)
+    assert isinstance(topk_ids, torch.Tensor)
+    assert isinstance(dequantized, list)
+    reference_gate_up = []
+    for token_idx in range(tokens):
+        for route_idx in range(topk):
+            expert = int(topk_ids[token_idx, route_idx].item())
+            reference_gate_up.append(
+                torch.matmul(
+                    hidden_states[token_idx : token_idx + 1].to(torch.float32),
+                    dequantized[expert].to(torch.float32),
+                )[0]
+            )
+    return torch.stack(reference_gate_up, dim=0).to(torch.float16)
+
+
+def _moe_stage2_inputs_and_reference_fast(
+    inputs: dict[str, object],
+    *,
+    moe_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = int(inputs["tokens"])
+    topk = int(inputs["topk"])
+    intermediate = int(inputs["intermediate"])
+    experts = int(inputs["experts"])
+    topk_ids = inputs["topk_ids"]
+    dequantized = inputs["w2_dequant"]
+    assert isinstance(topk_ids, torch.Tensor)
+    assert isinstance(dequantized, list)
+    activation = torch.randn(
+        (tokens * topk, intermediate), device="cuda", dtype=torch.float16
+    )
+    stage2_ids = topk_ids.reshape(tokens * topk, 1).contiguous()
+    stage2_weights = torch.ones(
+        (tokens * topk, 1), device="cuda", dtype=torch.float32
+    )
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        stage2_ids,
+        block_size=moe_block_size,
+        num_experts=experts,
+    )
+    reference_rows = []
+    for row in range(tokens * topk):
+        expert = int(stage2_ids[row, 0].item())
+        reference_rows.append(
+            torch.matmul(
+                activation[row : row + 1].to(torch.float32),
+                dequantized[expert].to(torch.float32),
+            )[0]
+        )
+    reference = torch.stack(reference_rows, dim=0).to(torch.float16)
+    return activation, stage2_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference
+
+
+def _moe_stage1_runtime_case(row: dict[str, Any]) -> _MoeStage1RuntimeCase:
+    key = _moe_key_from_row(row)
+    quant_name = _quant_name(str(row["quant_format"]))
+    try:
+        rtol, atol = _MOE_ENV_SWEEP_TOLERANCES[quant_name]
+        seed = 2000 + key.tokens + key.hidden + key.intermediate + key.experts + key.topk
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        hidden_states = torch.randn((key.tokens, key.hidden), device="cuda", dtype=torch.float16)
+        routing_experts = min(key.experts, max(key.topk, key.tokens + key.topk - 1))
+        topk_weights, topk_ids = _make_uniform_topk_routing(
+            tokens=key.tokens,
+            experts=routing_experts,
+            topk=key.topk,
+        )
+        weights = torch.randn(
+            (routing_experts, key.hidden, 2 * key.intermediate),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        weights = weights * (1.0 / math.sqrt(key.hidden))
+        quantized = _repeat_moe_quantized_result(
+            _quantize_moe_expert_weights(
+                weights,
+                quant_name=quant_name,
+                group_size=key.group_size,
+            ),
+            key.experts,
+        )
+        inputs: dict[str, object] = {
+            "tokens": key.tokens,
+            "hidden": key.hidden,
+            "intermediate": key.intermediate,
+            "experts": key.experts,
+            "topk": key.topk,
+            "hidden_states": hidden_states,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "w1_q": quantized["q_weight"],
+            "w1_scales": quantized["scales"],
+            "w1_zeros": quantized["zeros"],
+            "w1_global_scale": quantized["global_scale"],
+            "w1_dequant": quantized["dequant"],
+            "w1_g_idx": quantized["g_idx"],
+            "w1_perm": quantized["perm"],
+        }
+        reference = _moe_stage1_reference_fast(inputs)
+        return key, inputs, reference, rtol, atol
+    except (AssertionError, KeyError, ValueError, RuntimeError, TypeError) as exc:
+        raise AssertionError(
+            "MoE stage1 helper does not support actual row: "
+            f"{_row_context(row, _ACTUAL_MOE_CONTEXT_KEYS)}"
+        ) from exc
+
+
+def _moe_stage2_runtime_case(
+    row: dict[str, Any],
+) -> _MoeStage2RuntimeCase:
+    key = _moe_key_from_row(row)
+    moe_block_size = int(row["moe_block_size"])
+    quant_name = _quant_name(str(row["quant_format"]))
+    try:
+        rtol, atol = _MOE_ENV_SWEEP_TOLERANCES[quant_name]
+        seed = 3000 + key.tokens + key.hidden + key.intermediate + key.experts + key.topk
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        weights = torch.randn(
+            (min(key.experts, max(key.topk, key.tokens + key.topk - 1)), key.intermediate, key.hidden),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        weights = weights * (1.0 / math.sqrt(key.intermediate))
+        quantized = _repeat_moe_quantized_result(
+            _quantize_moe_expert_weights(
+                weights,
+                quant_name=quant_name,
+                group_size=key.group_size,
+            ),
+            key.experts,
+        )
+        topk_ids = torch.empty((key.tokens, key.topk), device="cuda", dtype=torch.int32)
+        for token_idx in range(key.tokens):
+            for route_idx in range(key.topk):
+                topk_ids[token_idx, route_idx] = (token_idx + route_idx) % quantized["q_weight"].shape[0]
+        inputs: dict[str, object] = {
+            "tokens": key.tokens,
+            "intermediate": key.intermediate,
+            "experts": key.experts,
+            "topk": key.topk,
+            "topk_ids": topk_ids,
+            "w2_q": quantized["q_weight"],
+            "w2_scales": quantized["scales"],
+            "w2_zeros": quantized["zeros"],
+            "w2_global_scale": quantized["global_scale"],
+            "w2_dequant": quantized["dequant"],
+            "w2_g_idx": quantized["g_idx"],
+            "w2_perm": quantized["perm"],
+        }
+        activation, topk_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference = (
+            _moe_stage2_inputs_and_reference_fast(inputs, moe_block_size=moe_block_size)
+        )
+        return (
+            key,
+            inputs,
+            activation,
+            topk_weights,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            reference,
+            rtol,
+            atol,
+        )
+    except (AssertionError, KeyError, ValueError, RuntimeError, TypeError) as exc:
+        raise AssertionError(
+            "MoE stage2 helper does not support actual row: "
+            f"{_row_context(row, _ACTUAL_MOE_CONTEXT_KEYS)}"
+        ) from exc
+
+
 def _dense_key_from_row(row: dict[str, Any]) -> DenseDirectOpKey:
     _assert_dense_actual_row_supported(row)
     return DenseDirectOpKey(
@@ -388,49 +885,14 @@ def _make_dense_runtime_case(row: dict[str, Any]) -> tuple[DenseDirectOpKey, tup
 
 
 def _make_moe_runtime_case(row: dict[str, Any]) -> tuple[MoeDirectOpKey, Callable[[], None]]:
-    key = _moe_key_from_row(row)
     moe_block_size = int(row["moe_block_size"])
-    quant_name = _quant_name(str(row["quant_format"]))
-    try:
-        rtol, atol = _MOE_ENV_SWEEP_TOLERANCES[quant_name]
-        inputs = _make_moe_env_sweep_inputs(key)
-        if row["op"] == "w13":
-            reference = _moe_stage1_reference(inputs)
-
-            def run() -> None:
-                _run_moe_env_stage1_combo(
-                    key,
-                    inputs,
-                    moe_block_size=moe_block_size,
-                    reference=reference,
-                    rtol=rtol,
-                    atol=atol,
-                )
-
-            return key, run
-
-        stage2 = _moe_stage2_inputs_and_reference(
-            inputs,
-            moe_block_size=moe_block_size,
-        )
-        (
-            activation,
-            topk_weights,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            reference,
-        ) = stage2
+    if row["op"] == "w13":
+        key, inputs, reference, rtol, atol = _moe_stage1_runtime_case(row)
 
         def run() -> None:
-            _run_moe_env_stage2_combo(
+            _run_moe_env_stage1_combo(
                 key,
                 inputs,
-                activation=activation,
-                topk_weights=topk_weights,
-                sorted_ids=sorted_ids,
-                expert_ids=expert_ids,
-                num_tokens_post_pad=num_tokens_post_pad,
                 moe_block_size=moe_block_size,
                 reference=reference,
                 rtol=rtol,
@@ -438,11 +900,86 @@ def _make_moe_runtime_case(row: dict[str, Any]) -> tuple[MoeDirectOpKey, Callabl
             )
 
         return key, run
-    except (AssertionError, KeyError, ValueError) as exc:
-        raise AssertionError(
-            "MoE helper does not support actual row: "
-            f"{_row_context(row, _ACTUAL_MOE_CONTEXT_KEYS)}"
-        ) from exc
+
+    (
+        key,
+        inputs,
+        activation,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        reference,
+        rtol,
+        atol,
+    ) = _moe_stage2_runtime_case(row)
+
+    def run() -> None:
+        _run_moe_env_stage2_combo(
+            key,
+            inputs,
+            activation=activation,
+            topk_weights=topk_weights,
+            sorted_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_pad=num_tokens_post_pad,
+            moe_block_size=moe_block_size,
+            reference=reference,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    return key, run
+
+
+def _selected_env_summary(rows: list[dict[str, Any]], combos_per_row: int) -> tuple[int, int, int | None]:
+    start, limit = exhaustive_start_limit()
+    possible = len(rows) * combos_per_row
+    if start >= possible:
+        return possible, start, 0
+    if limit is None:
+        selected = possible - start
+    else:
+        selected = min(limit, possible - start)
+    return possible, start, selected
+
+
+def _dense_row_progress(row: dict[str, Any], row_index: int, row_count: int) -> str:
+    return (
+        f"[marlin-model-shapes][dense] row {row_index}/{row_count}: "
+        f"scenario={row.get('scenario')} phase={row.get('phase')} op={row.get('op')} "
+        f"m={row.get('size_m')} n={row.get('size_n')} k={row.get('size_k')} "
+        f"quant={row.get('quant_format')} group={row.get('group_size')}"
+    )
+
+
+def _moe_row_progress(row: dict[str, Any], row_index: int, row_count: int) -> str:
+    return (
+        f"[marlin-model-shapes][moe] row {row_index}/{row_count}: "
+        f"scenario={row.get('scenario')} phase={row.get('phase')} op={row.get('op')} "
+        f"m={row.get('size_m')} n={row.get('size_n')} k={row.get('size_k')} "
+        f"top_k={row.get('top_k')} experts={row.get('local_num_experts')} "
+        f"block={row.get('moe_block_size')} quant={row.get('quant_format')} "
+        f"group={row.get('group_size')}"
+    )
+
+
+def _heartbeat(
+    request: pytest.FixtureRequest,
+    *,
+    kind: str,
+    checked: int,
+    legal: int,
+    rejected: int,
+    total_index: int,
+) -> None:
+    if checked == 0 or checked % _PROGRESS_HEARTBEAT_INTERVAL != 0:
+        return
+    _emit_progress(
+        request,
+        f"[marlin-model-shapes][{kind}] heartbeat: "
+        f"checked={checked} legal={legal} rejected={rejected} total_index={total_index}",
+    )
 
 
 def test_marlin_model_table_payload_and_pretty_smoke(
@@ -458,21 +995,36 @@ def test_marlin_model_table_payload_and_pretty_smoke(
 
 
 @pytest.mark.sm70_env_exhaustive
-def test_marlin_model_dense_table_runtime_matches_reference(model_dir: Path) -> None:
+def test_marlin_model_dense_table_runtime_matches_reference(
+    model_dir: Path,
+    request: pytest.FixtureRequest,
+) -> None:
     if not exhaustive_enabled():
         pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the full env sweep")
 
+    _emit_progress(request, f"[marlin-model-shapes][dense] loading payload: model={model_dir}")
     payload = _load_payload(model_dir)
     actual_rows = _unique_actual_dense_rows(payload)
     if not actual_rows:
         pytest.skip("no actual dense rows to test")
+
+    combos_per_row = sum(1 for _ in iter_env_combinations())
+    possible, start, selected = _selected_env_summary(actual_rows, combos_per_row)
+    _emit_progress(
+        request,
+        f"[marlin-model-shapes][dense] start: model={model_dir} "
+        f"actual_rows={len(actual_rows)} combos_per_row={combos_per_row} "
+        f"possible={possible} start={start} limit={_format_limit(exhaustive_start_limit()[1])} "
+        f"selected={selected}",
+    )
 
     total = 0
     checked = 0
     legal = 0
     rejected = 0
 
-    for row in actual_rows:
+    for row_index, row in enumerate(actual_rows, start=1):
+        _emit_progress(request, _dense_row_progress(row, row_index, len(actual_rows)))
         key, prepared = _make_dense_runtime_case(row)
         args, output, reference, rtol, atol = prepared
         for geometry, split_k, metadata_cache in iter_env_combinations():
@@ -512,29 +1064,58 @@ def test_marlin_model_dense_table_runtime_matches_reference(model_dir: Path) -> 
                             atol=atol,
                         )
                     rejected += 1
+            _heartbeat(
+                request,
+                kind="dense",
+                checked=checked,
+                legal=legal,
+                rejected=rejected,
+                total_index=total,
+            )
         if exhaustive_index_is_past_limit(total):
             break
 
+    _emit_progress(
+        request,
+        f"[marlin-model-shapes][dense] summary: checked={checked} legal={legal} "
+        f"rejected={rejected} total_seen={total}",
+    )
     assert checked > 0
     assert legal + rejected == checked
 
 
 @pytest.mark.sm70_env_exhaustive
-def test_marlin_model_moe_table_runtime_matches_reference(model_dir: Path) -> None:
+def test_marlin_model_moe_table_runtime_matches_reference(
+    model_dir: Path,
+    request: pytest.FixtureRequest,
+) -> None:
     if not exhaustive_enabled():
         pytest.skip("set MARLIN_EXHAUSTIVE_ENV_SWEEP=1 to run the full env sweep")
 
+    _emit_progress(request, f"[marlin-model-shapes][moe] loading payload: model={model_dir}")
     payload = _load_payload(model_dir)
     actual_rows = _unique_actual_moe_rows(payload)
     if not actual_rows:
         pytest.skip("no actual moe rows to test")
+
+    combos_per_row = sum(1 for _ in iter_moe_env_combinations())
+    possible, start, selected = _selected_env_summary(actual_rows, combos_per_row)
+    _emit_progress(
+        request,
+        f"[marlin-model-shapes][moe] start: model={model_dir} "
+        f"actual_rows={len(actual_rows)} combos_per_row={combos_per_row} "
+        f"possible={possible} start={start} limit={_format_limit(exhaustive_start_limit()[1])} "
+        f"selected={selected}",
+    )
 
     total = 0
     checked = 0
     legal = 0
     rejected = 0
 
-    for row in actual_rows:
+    _require_moe_cuda()
+    for row_index, row in enumerate(actual_rows, start=1):
+        _emit_progress(request, _moe_row_progress(row, row_index, len(actual_rows)))
         key, run = _make_moe_runtime_case(row)
         for geometry, split_k, metadata_cache in iter_moe_env_combinations():
             if exhaustive_index_is_past_limit(total):
@@ -558,8 +1139,21 @@ def test_marlin_model_moe_table_runtime_matches_reference(model_dir: Path) -> No
                     with pytest.raises(RuntimeError, match=EXPLICIT_ENV_REJECTION_RE):
                         run()
                     rejected += 1
+            _heartbeat(
+                request,
+                kind="moe",
+                checked=checked,
+                legal=legal,
+                rejected=rejected,
+                total_index=total,
+            )
         if exhaustive_index_is_past_limit(total):
             break
 
+    _emit_progress(
+        request,
+        f"[marlin-model-shapes][moe] summary: checked={checked} legal={legal} "
+        f"rejected={rejected} total_seen={total}",
+    )
     assert checked > 0
     assert legal + rejected == checked

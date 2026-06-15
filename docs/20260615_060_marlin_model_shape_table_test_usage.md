@@ -247,6 +247,20 @@ PYTHONPATH=$PWD MARLIN_EXHAUSTIVE_ENV_SWEEP=1 \
 | `MARLIN_EXHAUSTIVE_ENV_START` | 从第几个 env case 开始选中。 |
 | `MARLIN_EXHAUSTIVE_ENV_LIMIT` | 最多选中多少个 env case。 |
 
+长跑时测试会主动输出 progress 行；测试会在输出 progress 时临时关闭
+pytest capture，所以默认 `pytest -v` 下也能实时看见：
+
+- start 摘要：模型路径、actual row 数、每个 row 的 env 组合数、`START/LIMIT`
+- row 摘要：当前 Dense / MoE row 的 `scenario/phase/op/M/N/K/quant/group`
+- heartbeat：每处理 64 个选中的 env 组合打印一次
+  `checked/legal/rejected/total_index`
+- summary：测试结束时打印 `checked/legal/rejected/total_seen`
+
+建议先用 `MARLIN_EXHAUSTIVE_ENV_LIMIT=1` 验证 runtime 接线，再用
+`MARLIN_EXHAUSTIVE_ENV_LIMIT=10` 看 row 级 progress 和耗时节奏。需要调试
+pytest capture 本身时，也可以额外加 `-s` 或 `--capture=tee-sys`。`LIMIT=1000`
+仍然是重测试，但 start、row、heartbeat 和 summary 会持续给出反馈。
+
 ## 默认 table smoke 会检查什么
 
 默认 smoke 不运行 Marlin kernel，但会检查 table 是否能被测试系统消费。
@@ -412,6 +426,7 @@ SM70_MARLIN_MOE_METADATA_CACHE
 
 - 先跑默认 table smoke。
 - 再用 `MARLIN_EXHAUSTIVE_ENV_LIMIT=1` 做 runtime 接线 smoke。
+- 用 `MARLIN_EXHAUSTIVE_ENV_LIMIT=10` 确认 progress 输出和单 row 耗时。
 - 完整 sweep 使用 `MARLIN_EXHAUSTIVE_ENV_START/LIMIT` 分片。
 
 ## 与 `marlin_gemm_shapes.py` 的关系
