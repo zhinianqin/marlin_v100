@@ -309,6 +309,9 @@ def test_modelopt_nvfp4_mixed_modules_fall_back_to_bf16(tmp_path: Path):
         and has_layer_key(r, "layers.0.self_attn.o_proj")
     )
     assert o_proj["call_status"] == "hypothetical_bf16"
+    assert o_proj["target_op"] == "none"
+    assert o_proj["quant_format"] == "bf16_or_fp16"
+    assert o_proj["marlin_path"] == "none"
     assert o_proj["warning"] == "index_disagrees_with_config"
 
     moe = next(
@@ -546,6 +549,7 @@ def test_modelopt_mixed_precision_layer_map(tmp_path: Path):
     ]
     assert unlisted_shared
     assert all(r["call_status"] == "hypothetical_bf16" for r in unlisted_shared)
+    assert all(r["target_op"] == "none" for r in unlisted_shared)
 
 
 def test_modelopt_mixed_precision_conflicting_fused_shards(tmp_path: Path):
@@ -639,6 +643,7 @@ def test_compressed_tensors_config_groups_and_fused_ignore(tmp_path: Path):
 
     qkv = next(r for r in payload["dense"] if r["op"] == "qkv_proj")
     assert qkv["call_status"] == "skipped"
+    assert qkv["target_op"] == "none"
     assert qkv["warning"] == "excluded_quant_module"
     assert any(r["phase"] == "skipped_router" for r in payload["dense"])
 
@@ -870,3 +875,13 @@ def test_cli_json_smoke(tmp_path: Path, capsys):
     assert "dense" in parsed
     assert "moe" in parsed
     assert parsed["warnings"] == ["hypothetical_bf16"]
+    assert parsed["dense"]
+    assert parsed["moe"]
+    assert all(r["call_status"] == "hypothetical_bf16" for r in parsed["dense"])
+    assert all(r["target_op"] == "none" for r in parsed["dense"])
+    assert all(r["quant_format"] == "bf16_or_fp16" for r in parsed["dense"])
+    assert all(r["marlin_path"] == "none" for r in parsed["dense"])
+    assert all(r["call_status"] == "hypothetical_bf16" for r in parsed["moe"])
+    assert all(r["target_op"] == "none" for r in parsed["moe"])
+    assert all(r["quant_format"] == "bf16_or_fp16" for r in parsed["moe"])
+    assert all(r["marlin_path"] == "none" for r in parsed["moe"])

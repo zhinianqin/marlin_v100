@@ -1169,6 +1169,16 @@ def _effective_group_size(group_size: int | str | None, size_k: int) -> int | st
     return group_size
 
 
+def _target_op_for_decision(kind: str, decision: QuantDecision) -> str:
+    if decision.call_status != "actual_marlin" or decision.marlin_path == "none":
+        return "none"
+    if kind == "dense":
+        return "ops.marlin_gemm"
+    if kind == "moe":
+        return "ops.moe_wna16_marlin_gemm"
+    return "none"
+
+
 def _moe_block_size(m: int, top_k: int, local_num_experts: int,
                     input_itemsize: int = 2) -> int:
     block_size_m = 64
@@ -1274,7 +1284,7 @@ def enumerate_dense_rows(spec: ModelSpec, evidence: IndexEvidence,
                         "phase": "shape_error",
                         "layer_key": layer_key,
                         "op": candidate.op,
-                        "target_op": "ops.marlin_gemm",
+                        "target_op": "none",
                         "size_m": None,
                         "size_n": None,
                         "size_k": None,
@@ -1299,7 +1309,7 @@ def enumerate_dense_rows(spec: ModelSpec, evidence: IndexEvidence,
                     "decode_concurrency": concurrency,
                     "layer_key": layer_key,
                     "op": candidate.op,
-                    "target_op": "ops.marlin_gemm",
+                    "target_op": _target_op_for_decision("dense", decision),
                     "size_m": m,
                     "size_n": size_n,
                     "size_k": size_k,
@@ -1363,7 +1373,7 @@ def enumerate_moe_rows(spec: ModelSpec, evidence: IndexEvidence,
                         "decode_concurrency": concurrency,
                         "layer_key": layer_key,
                         "op": op,
-                        "target_op": "ops.moe_wna16_marlin_gemm",
+                        "target_op": _target_op_for_decision("moe", decision),
                         "moe_block_size": block_size,
                         "top_k": top_k,
                         "size_m": size_m,

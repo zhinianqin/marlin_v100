@@ -189,7 +189,9 @@ benchmark 目标。
 - `moe`：MoE table 行。
 - `warnings`：所有行 warning 的去重汇总。
 
-Dense table 对应 `ops.marlin_gemm(size_m, size_n, size_k)`，关键字段：
+Dense table 描述 dense linear GEMM shape。只有 `actual_marlin` 行会对应
+`ops.marlin_gemm(size_m, size_n, size_k)`；BF16/FP16 推测行和 skipped 行只保留
+shape 参考，`target_op` 为 `none`。关键字段：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -198,7 +200,7 @@ Dense table 对应 `ops.marlin_gemm(size_m, size_n, size_k)`，关键字段：
 | `layer_key` | 聚合后的模块 key 摘要。 |
 | `layer_keys` | JSON 中保留的完整模块 key 列表。 |
 | `op` | `qkv_proj`、`o_proj`、`gate_up_proj`、`down_proj` 等。 |
-| `target_op` | 目标 torch op；Dense table 固定为 `ops.marlin_gemm`。 |
+| `target_op` | 实际目标 torch op；只有 `actual_marlin` Dense 行为 `ops.marlin_gemm`，非 Marlin 行为 `none`。 |
 | `size_m` | GEMM M；prefill 来自 `--max-num-batched-tokens`，decode 来自并发数。 |
 | `size_n` | GEMM N；通常是输出通道或分片后的输出通道。 |
 | `size_k` | GEMM K；通常是输入通道或分片后的输入通道。 |
@@ -209,15 +211,16 @@ Dense table 对应 `ops.marlin_gemm(size_m, size_n, size_k)`，关键字段：
 | `warning` | 配置/index 不一致、配置推断、BF16 推测等提示。 |
 | `call_count` | 聚合到该 shape 行的模块数量。 |
 
-MoE table 对应
-`ops.moe_wna16_marlin_gemm(moe_block_size, top_k, size_m, size_n, size_k)`，
-除 Dense 字段外还包含：
+MoE table 描述 routed expert GEMM shape。只有 `actual_marlin` 行会对应
+`ops.moe_wna16_marlin_gemm(moe_block_size, top_k, size_m, size_n, size_k)`；
+BF16/FP16 推测行和 skipped 行只保留 shape 参考，`target_op` 为 `none`。除
+Dense 字段外还包含：
 
 | 字段 | 含义 |
 | --- | --- |
 | `moe_block_size` | fused Marlin MoE kernel 的 block size M。 |
 | `top_k` | w13 使用模型 experts-per-token；w2 固定为 `1`。 |
-| `target_op` | MoE table 固定为 `ops.moe_wna16_marlin_gemm`。 |
+| `target_op` | 实际目标 torch op；只有 `actual_marlin` MoE 行为 `ops.moe_wna16_marlin_gemm`，非 Marlin 行为 `none`。 |
 | `local_num_experts` | 当前 rank 本地 expert 数。 |
 | `global_num_experts` | 模型全局 routed expert 数。 |
 | `intermediate_size_per_partition` | TP/EP 后当前 GEMM 使用的 expert intermediate。 |
@@ -499,11 +502,12 @@ Qwen3.6-35B-A3B-NVFP4:
 - 这是 shape/benchmark 参数设计工具，不是性能 benchmark。
 - `actual_marlin` 表示静态证据显示该模块可走目标 Marlin op，不代表该 shape
   一定是性能热点。
-- `hypothetical_bf16` 行用于保留 MNK 参考，不能当作实际 Marlin 调用。
+- `hypothetical_bf16` 行用于保留 MNK 参考，不能当作实际 Marlin 调用；
+  这类行的 `target_op` 为 `none`。
 - 非 MoE AWQ dense 模型也可能在 Dense table 里显示
   `marlin_path=awq_marlin_wna16`。这表示 dense AWQ Marlin 路径，
-  不是 `ops.moe_wna16_marlin_gemm`；应结合 `target_op=ops.marlin_gemm`
-  判断。
+  不是 `ops.moe_wna16_marlin_gemm`；应结合 `call_status=actual_marlin` 和
+  `target_op=ops.marlin_gemm` 判断。
 - `config_derived_quant` 表示缺少足够 index 粒度，需要结合 checkpoint 实际情况
   复核。
 - EP 推导假设 `ep_size=tensor_parallel_size`，不模拟 router dispatch 的负载不均。
@@ -514,6 +518,7 @@ Qwen3.6-35B-A3B-NVFP4:
 ### 非 MoE 模型为什么会看到 `awq_marlin_wna16`？
 
 `awq_marlin_wna16` 是 AWQ Marlin 量化/内核家族描述，不代表该行一定来自 MoE。
-如果它出现在 Dense table，并且 `target_op=ops.marlin_gemm`，说明这是 dense
-linear 的 AWQ Marlin shape。只有 MoE table 中
+如果它出现在 Dense table，并且 `call_status=actual_marlin`、
+`target_op=ops.marlin_gemm`，说明这是 dense linear 的 AWQ Marlin shape。只有
+MoE table 中 `call_status=actual_marlin`、
 `target_op=ops.moe_wna16_marlin_gemm` 的行才表示 MoE Marlin GEMM。
