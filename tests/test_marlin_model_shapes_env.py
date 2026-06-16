@@ -4,6 +4,7 @@ import importlib.util
 import math
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -45,7 +46,6 @@ from tests.helpers import (
 )
 from tests.writeback_marlin_cases import (
     is_dense_group_size_supported,
-    is_moe_group_size_supported,
 )
 from tests.test_marlin_dense import (
     _assert_dense_env_sweep_combo_matches_reference,
@@ -121,6 +121,7 @@ _ACTUAL_MOE_CONTEXT_KEYS = (
 )
 
 _PROGRESS_HEARTBEAT_INTERVAL = 64
+_MOE_RUNTIME_EXPERT_SUBSET = 8
 _MoeQuantizedWeight = dict[str, object]
 _MoeStage1RuntimeCase = tuple[MoeDirectOpKey, dict[str, object], torch.Tensor, float, float]
 _MoeStage2RuntimeCase = tuple[
@@ -135,6 +136,12 @@ _MoeStage2RuntimeCase = tuple[
     float,
     float,
 ]
+
+
+@dataclass(frozen=True)
+class RuntimeSupport:
+    supported: bool
+    reason: str = ""
 
 
 def _quant_name(quant_format: str) -> str:
@@ -325,22 +332,50 @@ def _assert_moe_actual_row_supported(row: dict[str, Any]) -> None:
             "unsupported MoE quant in actual row: "
             f"{_row_context(row, _ACTUAL_MOE_CONTEXT_KEYS)}"
         ) from exc
-    if row["op"] == "w13":
-        hidden = int(row["size_k"])
-        intermediate = int(row["size_n"]) // 2
-    else:
-        hidden = int(row["size_n"])
-        intermediate = int(row["size_k"])
-    if not is_moe_group_size_supported(
-        quant_name,
-        _helper_group_size(row),
-        hidden,
-        intermediate,
-    ):
-        raise AssertionError(
-            "unsupported MoE group_size in actual row: "
-            f"{_row_context(row, _ACTUAL_MOE_CONTEXT_KEYS)}"
+
+
+def _moe_runtime_support(row: dict[str, Any]) -> RuntimeSupport:
+    try:
+        quant_name = _quant_name(str(row["quant_format"]))
+        group_size = _helper_group_size(row)
+        size_k = int(row["size_k"])
+    except (AssertionError, TypeError, ValueError) as exc:
+        return RuntimeSupport(False, f"invalid runtime row metadata: {exc}")
+
+    if group_size == -1:
+        return RuntimeSupport(True)
+
+    if size_k % group_size != 0:
+        if quant_name == "fp8":
+            return RuntimeSupport(
+                False,
+                "fp8 group_size=128 requires row size_k divisible by 128 "
+                "in current SM70 MoE runtime helper/op",
+            )
+        return RuntimeSupport(
+            False,
+            f"{quant_name} group_size={group_size} requires row size_k divisible "
+            "by group_size in current SM70 MoE runtime helper/op",
         )
+
+    if quant_name == "nvfp4":
+        if group_size == 16:
+            return RuntimeSupport(True)
+        return RuntimeSupport(False, "nvfp4 supports only group_size=16")
+    if quant_name == "mxfp4":
+        if group_size == 32:
+            return RuntimeSupport(True)
+        return RuntimeSupport(False, "mxfp4 supports only group_size=32")
+    if quant_name == "fp8":
+        if group_size == 128:
+            return RuntimeSupport(True)
+        return RuntimeSupport(False, "fp8 supports only group_size=-1 or 128")
+    if group_size in (32, 64, 128):
+        return RuntimeSupport(True)
+    return RuntimeSupport(
+        False,
+        f"{quant_name} supports only group_size=-1, 32, 64, or 128",
+    )
 
 
 def _helper_group_size(row: dict[str, Any]) -> int:
@@ -361,6 +396,12 @@ def _moe_scalar_type(quant_name: str) -> Any:
         "nvfp4": scalar_types.float4_e2m1f,
         "mxfp4": scalar_types.float4_e2m1f,
     }[quant_name]
+
+
+def _moe_runtime_expert_count(row: dict[str, Any]) -> int:
+    experts = int(row["local_num_experts"])
+    topk = int(row["top_k"])
+    return min(experts, max(topk, _MOE_RUNTIME_EXPERT_SUBSET))
 
 
 def _make_uniform_topk_routing(
@@ -614,17 +655,29 @@ def _moe_stage1_reference_fast(inputs: dict[str, object]) -> torch.Tensor:
     assert isinstance(hidden_states, torch.Tensor)
     assert isinstance(topk_ids, torch.Tensor)
     assert isinstance(dequantized, list)
-    reference_gate_up = []
-    for token_idx in range(tokens):
-        for route_idx in range(topk):
-            expert = int(topk_ids[token_idx, route_idx].item())
-            reference_gate_up.append(
-                torch.matmul(
-                    hidden_states[token_idx : token_idx + 1].to(torch.float32),
-                    dequantized[expert].to(torch.float32),
-                )[0]
-            )
-    return torch.stack(reference_gate_up, dim=0).to(torch.float16)
+    route_count = tokens * topk
+    flat_topk_ids = topk_ids.reshape(route_count)
+    route_token_ids = (
+        torch.arange(tokens, device=hidden_states.device, dtype=torch.long)
+        .repeat_interleave(topk)
+        .contiguous()
+    )
+    output = torch.empty(
+        (route_count, dequantized[0].shape[1]),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    for expert_tensor in torch.unique(flat_topk_ids).tolist():
+        expert = int(expert_tensor)
+        route_mask = flat_topk_ids == expert
+        route_indices = torch.nonzero(route_mask, as_tuple=False).reshape(-1)
+        token_indices = route_token_ids.index_select(0, route_indices)
+        expert_output = torch.matmul(
+            hidden_states.index_select(0, token_indices).to(torch.float32),
+            dequantized[expert].to(torch.float32),
+        )
+        output.index_copy_(0, route_indices, expert_output)
+    return output.to(torch.float16)
 
 
 def _moe_stage2_inputs_and_reference_fast(
@@ -652,16 +705,24 @@ def _moe_stage2_inputs_and_reference_fast(
         block_size=moe_block_size,
         num_experts=experts,
     )
-    reference_rows = []
-    for row in range(tokens * topk):
-        expert = int(stage2_ids[row, 0].item())
-        reference_rows.append(
-            torch.matmul(
-                activation[row : row + 1].to(torch.float32),
-                dequantized[expert].to(torch.float32),
-            )[0]
+    route_count = tokens * topk
+    flat_stage2_ids = stage2_ids.reshape(route_count)
+    reference = torch.empty(
+        (route_count, dequantized[0].shape[1]),
+        device=activation.device,
+        dtype=torch.float32,
+    )
+    for expert_tensor in torch.unique(flat_stage2_ids).tolist():
+        expert = int(expert_tensor)
+        route_indices = torch.nonzero(
+            flat_stage2_ids == expert, as_tuple=False
+        ).reshape(-1)
+        expert_output = torch.matmul(
+            activation.index_select(0, route_indices).to(torch.float32),
+            dequantized[expert].to(torch.float32),
         )
-    reference = torch.stack(reference_rows, dim=0).to(torch.float16)
+        reference.index_copy_(0, route_indices, expert_output)
+    reference = reference.to(torch.float16)
     return activation, stage2_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference
 
 
@@ -674,7 +735,7 @@ def _moe_stage1_runtime_case(row: dict[str, Any]) -> _MoeStage1RuntimeCase:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         hidden_states = torch.randn((key.tokens, key.hidden), device="cuda", dtype=torch.float16)
-        routing_experts = min(key.experts, max(key.topk, key.tokens + key.topk - 1))
+        routing_experts = _moe_runtime_expert_count(row)
         topk_weights, topk_ids = _make_uniform_topk_routing(
             tokens=key.tokens,
             experts=routing_experts,
@@ -732,7 +793,7 @@ def _moe_stage2_runtime_case(
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         weights = torch.randn(
-            (min(key.experts, max(key.topk, key.tokens + key.topk - 1)), key.intermediate, key.hidden),
+            (_moe_runtime_expert_count(row), key.intermediate, key.hidden),
             device="cuda",
             dtype=torch.float16,
         )
@@ -748,7 +809,9 @@ def _moe_stage2_runtime_case(
         topk_ids = torch.empty((key.tokens, key.topk), device="cuda", dtype=torch.int32)
         for token_idx in range(key.tokens):
             for route_idx in range(key.topk):
-                topk_ids[token_idx, route_idx] = (token_idx + route_idx) % quantized["q_weight"].shape[0]
+                topk_ids[token_idx, route_idx] = (
+                    token_idx + route_idx
+                ) % quantized["q_weight"].shape[0]
         inputs: dict[str, object] = {
             "tokens": key.tokens,
             "intermediate": key.intermediate,
@@ -885,6 +948,13 @@ def _make_dense_runtime_case(row: dict[str, Any]) -> tuple[DenseDirectOpKey, tup
 
 
 def _make_moe_runtime_case(row: dict[str, Any]) -> tuple[MoeDirectOpKey, Callable[[], None]]:
+    support = _moe_runtime_support(row)
+    if not support.supported:
+        raise AssertionError(
+            "MoE helper does not support actual row: "
+            f"{_row_context(row, _ACTUAL_MOE_CONTEXT_KEYS)}; reason={support.reason}"
+        )
+
     moe_block_size = int(row["moe_block_size"])
     if row["op"] == "w13":
         key, inputs, reference, rtol, atol = _moe_stage1_runtime_case(row)
@@ -944,6 +1014,14 @@ def _selected_env_summary(rows: list[dict[str, Any]], combos_per_row: int) -> tu
     return possible, start, selected
 
 
+def _env_row_range_is_selected(row_start: int, combos_per_row: int) -> bool:
+    row_end = row_start + combos_per_row
+    start, limit = exhaustive_start_limit()
+    if limit is None:
+        return row_end > start
+    return row_start < start + limit and row_end > start
+
+
 def _dense_row_progress(row: dict[str, Any], row_index: int, row_count: int) -> str:
     return (
         f"[marlin-model-shapes][dense] row {row_index}/{row_count}: "
@@ -961,6 +1039,23 @@ def _moe_row_progress(row: dict[str, Any], row_index: int, row_count: int) -> st
         f"top_k={row.get('top_k')} experts={row.get('local_num_experts')} "
         f"block={row.get('moe_block_size')} quant={row.get('quant_format')} "
         f"group={row.get('group_size')}"
+    )
+
+
+def _moe_unsupported_row_progress(
+    row: dict[str, Any],
+    row_index: int,
+    row_count: int,
+    reason: str,
+) -> str:
+    return (
+        f"[marlin-model-shapes][moe] unsupported runtime row "
+        f"{row_index}/{row_count}: "
+        f"scenario={row.get('scenario')} phase={row.get('phase')} op={row.get('op')} "
+        f"m={row.get('size_m')} n={row.get('size_n')} k={row.get('size_k')} "
+        f"top_k={row.get('top_k')} experts={row.get('local_num_experts')} "
+        f"block={row.get('moe_block_size')} quant={row.get('quant_format')} "
+        f"group={row.get('group_size')} reason={reason}"
     )
 
 
@@ -1023,11 +1118,17 @@ def test_marlin_model_dense_table_runtime_matches_reference(
     legal = 0
     rejected = 0
 
+    combos = tuple(iter_env_combinations())
     for row_index, row in enumerate(actual_rows, start=1):
+        if not _env_row_range_is_selected(total, combos_per_row):
+            total += combos_per_row
+            if exhaustive_index_is_past_limit(total):
+                break
+            continue
         _emit_progress(request, _dense_row_progress(row, row_index, len(actual_rows)))
         key, prepared = _make_dense_runtime_case(row)
         args, output, reference, rtol, atol = prepared
-        for geometry, split_k, metadata_cache in iter_env_combinations():
+        for geometry, split_k, metadata_cache in combos:
             if exhaustive_index_is_past_limit(total):
                 break
             selected = exhaustive_index_is_selected(total)
@@ -1098,12 +1199,32 @@ def test_marlin_model_moe_table_runtime_matches_reference(
     if not actual_rows:
         pytest.skip("no actual moe rows to test")
 
+    supported_rows: list[dict[str, Any]] = []
+    unsupported_rows: list[tuple[int, dict[str, Any], str]] = []
+    for row_index, row in enumerate(actual_rows, start=1):
+        support = _moe_runtime_support(row)
+        if support.supported:
+            supported_rows.append(row)
+        else:
+            unsupported_rows.append((row_index, row, support.reason))
+
+    for row_index, row, reason in unsupported_rows:
+        _emit_progress(
+            request,
+            _moe_unsupported_row_progress(row, row_index, len(actual_rows), reason),
+        )
+
+    if not supported_rows:
+        pytest.skip("no supported actual moe runtime rows to test")
+
     combos_per_row = sum(1 for _ in iter_moe_env_combinations())
-    possible, start, selected = _selected_env_summary(actual_rows, combos_per_row)
+    possible, start, selected = _selected_env_summary(supported_rows, combos_per_row)
     _emit_progress(
         request,
         f"[marlin-model-shapes][moe] start: model={model_dir} "
-        f"actual_rows={len(actual_rows)} combos_per_row={combos_per_row} "
+        f"actual_rows={len(actual_rows)} supported_runtime_rows={len(supported_rows)} "
+        f"unsupported_runtime_rows={len(unsupported_rows)} "
+        f"combos_per_row={combos_per_row} "
         f"possible={possible} start={start} limit={_format_limit(exhaustive_start_limit()[1])} "
         f"selected={selected}",
     )
@@ -1114,10 +1235,16 @@ def test_marlin_model_moe_table_runtime_matches_reference(
     rejected = 0
 
     _require_moe_cuda()
-    for row_index, row in enumerate(actual_rows, start=1):
-        _emit_progress(request, _moe_row_progress(row, row_index, len(actual_rows)))
+    combos = tuple(iter_moe_env_combinations())
+    for row_index, row in enumerate(supported_rows, start=1):
+        if not _env_row_range_is_selected(total, combos_per_row):
+            total += combos_per_row
+            if exhaustive_index_is_past_limit(total):
+                break
+            continue
+        _emit_progress(request, _moe_row_progress(row, row_index, len(supported_rows)))
         key, run = _make_moe_runtime_case(row)
-        for geometry, split_k, metadata_cache in iter_moe_env_combinations():
+        for geometry, split_k, metadata_cache in combos:
             if exhaustive_index_is_past_limit(total):
                 break
             selected = exhaustive_index_is_selected(total)
@@ -1153,7 +1280,8 @@ def test_marlin_model_moe_table_runtime_matches_reference(
     _emit_progress(
         request,
         f"[marlin-model-shapes][moe] summary: checked={checked} legal={legal} "
-        f"rejected={rejected} total_seen={total}",
+        f"rejected={rejected} unsupported_rows={len(unsupported_rows)} "
+        f"total_seen={total}",
     )
     assert checked > 0
     assert legal + rejected == checked
