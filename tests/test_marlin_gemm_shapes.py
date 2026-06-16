@@ -190,6 +190,85 @@ def test_qwen_awq_moe_decode_concurrency_block_sizes(tmp_path: Path):
     assert row["size_k"] == 1024
 
 
+def test_qwen3_moe_experts_are_not_dense_mlp(tmp_path: Path):
+    config = {
+        "model_type": "qwen3_moe",
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "quantization_config": {
+            "quant_method": "gptq",
+            "bits": 8,
+            "group_size": 32,
+            "format": "gptq",
+        },
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 1536,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+    }
+    keys = [
+        "model.layers.0.mlp.experts.0.gate_proj.qweight",
+        "model.layers.0.mlp.experts.0.gate_proj.qzeros",
+        "model.layers.0.mlp.experts.0.gate_proj.scales",
+        "model.layers.0.mlp.experts.0.up_proj.qweight",
+        "model.layers.0.mlp.experts.0.up_proj.qzeros",
+        "model.layers.0.mlp.experts.0.up_proj.scales",
+        "model.layers.0.mlp.experts.0.down_proj.qweight",
+        "model.layers.0.mlp.experts.0.down_proj.qzeros",
+        "model.layers.0.mlp.experts.0.down_proj.scales",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "4",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "2048",
+        "--decode-concurrency",
+        "1",
+    )
+
+    assert payload["model_config"]["architecture_family"] == "qwen3_moe"
+    assert payload["model_config"]["moe_layer_indices"] == [0, 1]
+    assert not any(
+        row["op"] in {"gate_up_proj", "down_proj"}
+        for row in payload["dense"]
+    )
+
+    w13 = next(
+        row for row in payload["moe"]
+        if row["op"] == "w13" and row["phase"] == "prefill"
+    )
+    w2 = next(
+        row for row in payload["moe"]
+        if row["op"] == "w2" and row["phase"] == "prefill"
+    )
+    for row in [w13, w2]:
+        assert row["call_status"] == "actual_marlin"
+        assert row["target_op"] == "ops.moe_wna16_marlin_gemm"
+        assert row["quant_format"] == "uint8b128"
+        assert row["group_size"] == 32
+        assert row["marlin_path"] == "wna16_marlin"
+        assert has_layer_key(row, "model.layers.0.mlp.experts")
+
+    qkv = next(row for row in payload["dense"] if row["op"] == "qkv_proj")
+    assert qkv["call_status"] == "hypothetical_bf16"
+    assert qkv["target_op"] == "none"
+
+
 def step_config(quant_config: dict) -> dict:
     return {
         "model_type": "step3p7",

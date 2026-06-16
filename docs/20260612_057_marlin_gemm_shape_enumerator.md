@@ -361,6 +361,7 @@ AWQ 和 GPTQ/WNA16 都可能是 4-bit 或 8-bit，但含义不同：
 - `qwen3_5_text`
 - `qwen3_5_moe_text`
 - `qwen3_next`
+- `qwen3_moe`
 - `minimax_m2`
 - `glm4_moe`
 - `step3p5`

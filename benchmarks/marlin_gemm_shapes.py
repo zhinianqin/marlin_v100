@@ -301,6 +301,8 @@ def _text_config(config: dict[str, Any]) -> dict[str, Any]:
 def _architecture_family(model_type: str) -> str:
     if model_type in {"qwen3_5_text", "qwen3_5_moe_text", "qwen3_next"}:
         return model_type
+    if model_type == "qwen3_moe":
+        return "qwen3_moe"
     if model_type == "minimax_m2":
         return "minimax_m2"
     if model_type == "glm4_moe":
@@ -349,7 +351,7 @@ def _parse_moe_layers(family: str, text: dict[str, Any],
         return list(range(first_k_dense_replace, num_hidden_layers))
     if family == "minimax_m2":
         return list(range(num_hidden_layers))
-    if family in {"qwen3_5_moe_text", "qwen3_next"}:
+    if family in {"qwen3_5_moe_text", "qwen3_next", "qwen3_moe"}:
         if text.get("num_experts") or text.get("moe_intermediate_size"):
             return list(range(num_hidden_layers))
     return []
