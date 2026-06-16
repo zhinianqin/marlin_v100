@@ -28,16 +28,21 @@ namespace marlin_moe_wna16 {
 
 using marlin::sm70::Sm70CtaGeometry;
 using marlin::sm70::Sm70MarlinAutoParams;
+using marlin::sm70::Sm70MarlinMoeAutoParamsContext;
 using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::Sm70MarlinMmaPipelined;
 using marlin::sm70::Sm70WarpShape;
 using marlin::sm70::configure_sm70_dynamic_smem;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
-using marlin::sm70::sm70_marlin_auto_params_from_env_and_fallback;
+using marlin::sm70::sm70_marlin_any_auto_env_is_set;
+using marlin::sm70::sm70_marlin_auto_packed_macro_n;
+using marlin::sm70::sm70_marlin_auto_params_from_env;
 using marlin::sm70::sm70_marlin_cta_geometry_is_supported;
+using marlin::sm70::sm70_marlin_default_auto_params;
 using marlin::sm70::sm70_active_split_k;
 using marlin::sm70::sm70_splitk_partition;
+using marlin::sm70::validate_sm70_marlin_auto_params;
 
 inline constexpr char const* kSupportedSm70MarlinMoeCtaGeometries =
     "{CTA_M}x{CTA_N}x{CTA_K}x{Warps}x{WarpM}x{WarpN}x{WarpK} "
@@ -48,13 +53,45 @@ inline constexpr char const* kSupportedSm70MarlinMoeCtaGeometries =
     "phase-aware SM70 Marlin warp-K offset support. CTA_M=128/256 "
     "geometries are dense-only.";
 
-inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
-    char const* /*quant_format*/, int64_t /*group_size*/,
-    int64_t /*moe_block_size*/, int64_t /*top_k*/, int64_t /*size_m*/,
-    int64_t size_n, int64_t /*size_k*/) {
-  return sm70_marlin_auto_params_from_env_and_fallback(
+inline bool sm70_marlin_moe_auto_env_is_set() {
+  return sm70_marlin_any_auto_env_is_set(
+      "SM70_MARLIN_MOE_CTA_GEOMETRY", "SM70_MARLIN_MOE_SPLIT_K",
+      "SM70_MARLIN_MOE_METADATA_CACHE");
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_moe_auto_params_from_env(
+    Sm70MarlinMoeAutoParamsContext const& ctx) {
+  return sm70_marlin_auto_params_from_env(
       "MoE", "SM70_MARLIN_MOE_CTA_GEOMETRY", "SM70_MARLIN_MOE_SPLIT_K",
-      "SM70_MARLIN_MOE_METADATA_CACHE", size_n);
+      "SM70_MARLIN_MOE_METADATA_CACHE", ctx.packed_macro_n);
+}
+
+inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
+    Sm70MarlinMoeAutoParamsContext const& /*ctx*/,
+    Sm70MarlinAutoParams& /*params*/) {
+  return false;
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
+    char const* quant_format, int64_t group_size,
+    int64_t moe_block_size, int64_t top_k, int64_t size_m,
+    int64_t size_n, int64_t size_k) {
+  Sm70MarlinMoeAutoParamsContext const ctx{
+      quant_format, group_size, moe_block_size, top_k, size_m, size_n, size_k,
+      sm70_marlin_auto_packed_macro_n(size_n)};
+
+  if (sm70_marlin_moe_auto_env_is_set()) {
+    return sm70_marlin_moe_auto_params_from_env(ctx);
+  }
+
+  Sm70MarlinAutoParams params{};
+  if (sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
+          ctx, params)) {
+    validate_sm70_marlin_auto_params("MoE", params);
+    return params;
+  }
+
+  return sm70_marlin_default_auto_params(ctx.packed_macro_n);
 }
 
 inline bool sm70_marlin_moe_cta_geometry_is_supported(

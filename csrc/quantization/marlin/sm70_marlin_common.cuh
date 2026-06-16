@@ -255,6 +255,26 @@ struct Sm70MarlinAutoParams {
   int packed_macro_n;
 };
 
+struct Sm70MarlinDenseAutoParamsContext {
+  char const* quant_format;
+  int64_t group_size;
+  int64_t size_m;
+  int64_t size_n;
+  int64_t size_k;
+  int packed_macro_n;
+};
+
+struct Sm70MarlinMoeAutoParamsContext {
+  char const* quant_format;
+  int64_t group_size;
+  int64_t moe_block_size;
+  int64_t top_k;
+  int64_t size_m;
+  int64_t size_n;
+  int64_t size_k;
+  int packed_macro_n;
+};
+
 inline constexpr char const* kSupportedSm70MarlinCtaGeometries =
     "{CTA_M}x{CTA_N}x{CTA_K}x{Warps}x{WarpM}x{WarpN}x{WarpK} "
     "with CTA_M in {32,64,128,256}, CTA_N in {64,128,256}, "
@@ -289,6 +309,15 @@ inline bool sm70_marlin_packed_macro_n_is_supported(int packed_macro_n) {
   return packed_macro_n == 64 || packed_macro_n == 128 || packed_macro_n == 256;
 }
 
+inline bool sm70_marlin_requested_split_k_is_supported(
+    int requested_split_k) {
+  return requested_split_k == 1 || requested_split_k == 2 ||
+         requested_split_k == 4 || requested_split_k == 8;
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_default_auto_params(
+    int packed_macro_n);
+
 inline Sm70CtaGeometry sm70_marlin_default_geometry_from_packed_macro_n(
     int packed_macro_n) {
   switch (packed_macro_n) {
@@ -304,6 +333,14 @@ inline Sm70CtaGeometry sm70_marlin_default_geometry_from_packed_macro_n(
                   ".");
   }
   return {0, 0, 0, 0, 0, 0, 0};
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_default_auto_params(
+    int packed_macro_n) {
+  return {sm70_marlin_default_geometry_from_packed_macro_n(packed_macro_n),
+          1,
+          true,
+          packed_macro_n};
 }
 
 inline bool sm70_marlin_parse_int_component(char const*& cursor, int& value) {
@@ -365,7 +402,7 @@ inline bool sm70_marlin_try_get_split_k_env(char const* env_name,
   int parsed = 0;
   TORCH_CHECK(sm70_marlin_parse_int_component(cursor, parsed) &&
                   *cursor == '\0' &&
-                  (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8),
+                  sm70_marlin_requested_split_k_is_supported(parsed),
               "Invalid ", env_name, " value '", value,
               "'. Expected one of 1, 2, 4, or 8.");
   requested_split_k = parsed;
@@ -391,6 +428,19 @@ inline bool sm70_marlin_try_get_metadata_env(
   return false;
 }
 
+inline bool sm70_marlin_env_is_set(char const* env_name) {
+  char const* value = std::getenv(env_name);
+  return value != nullptr && value[0] != '\0';
+}
+
+inline bool sm70_marlin_any_auto_env_is_set(
+    char const* geometry_env_name, char const* split_k_env_name,
+    char const* metadata_env_name) {
+  return sm70_marlin_env_is_set(geometry_env_name) ||
+         sm70_marlin_env_is_set(split_k_env_name) ||
+         sm70_marlin_env_is_set(metadata_env_name);
+}
+
 inline void validate_sm70_marlin_packed_macro_n(char const* op_name,
                                                 Sm70CtaGeometry geometry,
                                                 int packed_macro_n) {
@@ -403,20 +453,8 @@ inline void validate_sm70_marlin_packed_macro_n(char const* op_name,
               packed_macro_n, ", CTA_N=", geometry.cta_n, ".");
 }
 
-inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_env_and_fallback(
-    char const* op_name, char const* geometry_env_name,
-    char const* split_k_env_name, char const* metadata_env_name,
-    int64_t size_n) {
-  int const packed_macro_n = sm70_marlin_auto_packed_macro_n(size_n);
-  Sm70MarlinAutoParams params{
-      sm70_marlin_default_geometry_from_packed_macro_n(packed_macro_n),
-      1,
-      true,
-      packed_macro_n};
-  sm70_marlin_try_get_geometry_env(geometry_env_name, params.geometry);
-  sm70_marlin_try_get_split_k_env(split_k_env_name, params.requested_split_k);
-  sm70_marlin_try_get_metadata_env(metadata_env_name,
-                                   params.use_metadata_vector_words);
+inline void validate_sm70_marlin_auto_params(
+    char const* op_name, Sm70MarlinAutoParams params) {
   TORCH_CHECK(sm70_marlin_cta_geometry_is_supported(params.geometry),
               "Unsupported SM70 Marlin CTA geometry for ", op_name, ": ",
               params.geometry.cta_m, "x", params.geometry.cta_n, "x",
@@ -424,17 +462,70 @@ inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_env_and_fallback(
               params.geometry.warp_m, "x", params.geometry.warp_n, "x",
               params.geometry.warp_k, ". Supported geometries are ",
               kSupportedSm70MarlinCtaGeometries, ".");
-  validate_sm70_marlin_packed_macro_n(op_name, params.geometry, packed_macro_n);
+  TORCH_CHECK(
+      sm70_marlin_requested_split_k_is_supported(params.requested_split_k),
+      "Unsupported SM70 Marlin requested split-K for ", op_name, ": ",
+      params.requested_split_k, ". Expected one of 1, 2, 4, or 8.");
+  validate_sm70_marlin_packed_macro_n(op_name, params.geometry,
+                                      params.packed_macro_n);
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_auto_params_from_env(
+    char const* op_name, char const* geometry_env_name,
+    char const* split_k_env_name, char const* metadata_env_name,
+    int packed_macro_n) {
+  Sm70MarlinAutoParams params =
+      sm70_marlin_default_auto_params(packed_macro_n);
+  sm70_marlin_try_get_geometry_env(geometry_env_name, params.geometry);
+  sm70_marlin_try_get_split_k_env(split_k_env_name, params.requested_split_k);
+  sm70_marlin_try_get_metadata_env(metadata_env_name,
+                                   params.use_metadata_vector_words);
+  validate_sm70_marlin_auto_params(op_name, params);
   return params;
 }
 
-inline Sm70MarlinAutoParams sm70_marlin_dense_auto_params(
-    char const* /*quant_format*/, int64_t /*group_size*/, int64_t /*size_m*/,
-    int64_t size_n, int64_t /*size_k*/) {
-  return sm70_marlin_auto_params_from_env_and_fallback(
+inline bool sm70_marlin_dense_auto_env_is_set() {
+  return sm70_marlin_any_auto_env_is_set(
+      "SM70_MARLIN_DENSE_CTA_GEOMETRY", "SM70_MARLIN_DENSE_SPLIT_K",
+      "SM70_MARLIN_DENSE_METADATA_CACHE");
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_dense_auto_params_from_env(
+    Sm70MarlinDenseAutoParamsContext const& ctx) {
+  return sm70_marlin_auto_params_from_env(
       "Dense", "SM70_MARLIN_DENSE_CTA_GEOMETRY",
       "SM70_MARLIN_DENSE_SPLIT_K", "SM70_MARLIN_DENSE_METADATA_CACHE",
-      size_n);
+      ctx.packed_macro_n);
+}
+
+inline bool
+sm70_marlin_dense_try_select_quanttrio_qwen3_6_27b_awq_params(
+    Sm70MarlinDenseAutoParamsContext const& ctx,
+    Sm70MarlinAutoParams& params) {
+  (void)ctx;
+  (void)params;
+  return false;
+}
+
+inline Sm70MarlinAutoParams sm70_marlin_dense_auto_params(
+    char const* quant_format, int64_t group_size, int64_t size_m,
+    int64_t size_n, int64_t size_k) {
+  Sm70MarlinDenseAutoParamsContext const ctx{
+      quant_format, group_size, size_m, size_n, size_k,
+      sm70_marlin_auto_packed_macro_n(size_n)};
+
+  if (sm70_marlin_dense_auto_env_is_set()) {
+    return sm70_marlin_dense_auto_params_from_env(ctx);
+  }
+
+  Sm70MarlinAutoParams params{};
+  if (sm70_marlin_dense_try_select_quanttrio_qwen3_6_27b_awq_params(
+          ctx, params)) {
+    validate_sm70_marlin_auto_params("Dense", params);
+    return params;
+  }
+
+  return sm70_marlin_default_auto_params(ctx.packed_macro_n);
 }
 
 inline void validate_sm70_marlin_dense_cta_geometry_supported(char const* op_name,
