@@ -962,7 +962,7 @@ def _configured_quant_format(quant: QuantInfo,
             )
     return QuantDecision(
         "hypothetical_bf16",
-        method,
+        "unquantized",
         "bf16_or_fp16",
         None,
         False,
@@ -974,7 +974,7 @@ def _configured_quant_format(quant: QuantInfo,
 def _bf16_decision(quant: QuantInfo, warning: str) -> QuantDecision:
     return QuantDecision(
         "hypothetical_bf16",
-        quant.method,
+        "unquantized",
         "bf16_or_fp16",
         None,
         False,

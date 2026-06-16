@@ -182,7 +182,8 @@ benchmark 目标。
 
 - `model`：解析后的模型目录绝对路径。
 - `model_config`：脚本归一化后的关键模型结构字段。
-- `quantization`：模型级量化配置摘要，只用于参考。
+- `quantization`：模型级量化配置摘要，只用于参考；table row 中的
+  `quant_method` 表示该模块/row 的有效量化方法。
 - `shape_inputs`：本次枚举的 prefill/decode 输入列表。
 - `scenarios`：本次枚举的 TP/EP 场景。
 - `dense`：Dense table 行。
@@ -205,6 +206,7 @@ shape 参考，`target_op` 为 `none`。关键字段：
 | `size_n` | GEMM N；通常是输出通道或分片后的输出通道。 |
 | `size_k` | GEMM K；通常是输入通道或分片后的输入通道。 |
 | `group_size` | 有效 group size；配置为 `-1` 时会展开为当前 `size_k`。 |
+| `quant_method` | 当前 row 的有效模块量化方法；BF16/FP16 推测行为 `unquantized`，模型级原始方法见顶层 `quantization`。 |
 | `quant_format` | `uint4`、`uint4b8`、`fp8_e4m3`、`nvfp4`、`mxfp4`、`bf16_or_fp16` 等。 |
 | `marlin_path` | 推断的量化/内核家族，例如 `awq_marlin_wna16`、`fp4_marlin`。 |
 | `call_status` | 当前模块是否真实走目标 Marlin op。 |
@@ -335,16 +337,16 @@ MoE w2.size_m = C * top_k
 
 ## 量化格式映射
 
-| 来源 | 条件 | `quant_format` | `has_zp` | `marlin_path` |
-| --- | --- | --- | --- | --- |
-| AWQ | bits=4, zp=true | `uint4` | true | `awq_marlin_wna16` |
-| AWQ | bits=8, zp=true | `uint8` | true | `awq_marlin_wna16` |
-| GPTQ/WNA16 | int4 symmetric | `uint4b8` | false | `wna16_marlin` |
-| GPTQ/WNA16 | int8 symmetric | `uint8b128` | false | `wna16_marlin` |
-| FP8 | e4m3 weight-only | `fp8_e4m3` | false | `fp8_marlin` |
-| NVFP4 | group size 通常为 16 | `nvfp4` | false | `fp4_marlin` |
-| MXFP4 | group size 通常为 32 | `mxfp4` | false | `fp4_marlin` |
-| BF16/FP16/unquantized | 无目标量化证据 | `bf16_or_fp16` | false | `none` |
+| 来源 | 条件 | `quant_method` | `quant_format` | `has_zp` | `marlin_path` |
+| --- | --- | --- | --- | --- | --- |
+| AWQ | bits=4, zp=true | `awq`/`awq_marlin` | `uint4` | true | `awq_marlin_wna16` |
+| AWQ | bits=8, zp=true | `awq`/`awq_marlin` | `uint8` | true | `awq_marlin_wna16` |
+| GPTQ/WNA16 | int4 symmetric | `gptq`/`gptq_marlin` | `uint4b8` | false | `wna16_marlin` |
+| GPTQ/WNA16 | int8 symmetric | `gptq`/`gptq_marlin` | `uint8b128` | false | `wna16_marlin` |
+| FP8 | e4m3 weight-only | `fp8` | `fp8_e4m3` | false | `fp8_marlin` |
+| NVFP4 | group size 通常为 16 | `modelopt`/`compressed-tensors` | `nvfp4` | false | `fp4_marlin` |
+| MXFP4 | group size 通常为 32 | `modelopt`/`compressed-tensors` | `mxfp4` | false | `fp4_marlin` |
+| BF16/FP16/unquantized | 无目标量化证据 | `unquantized` | `bf16_or_fp16` | false | `none` |
 
 AWQ 和 GPTQ/WNA16 都可能是 4-bit 或 8-bit，但含义不同：
 
