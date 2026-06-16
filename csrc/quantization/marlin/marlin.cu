@@ -278,9 +278,9 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(global_scale.is_contiguous(),
                 "global_scale is not contiguous");
     TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
-                "SM70 Marlin NVFP4 expects fp32 global_scale.");
+                "SM70 Marlin nvfp4 expects fp32 global_scale.");
     TORCH_CHECK(global_scale.numel() == 1,
-                "SM70 Marlin NVFP4 expects a single global_scale "
+                "SM70 Marlin nvfp4 expects a single global_scale "
                 "value.");
   } else {
     global_scale = torch::empty({0}, options_fp32);
@@ -402,13 +402,13 @@ torch::Tensor marlin_gemm(
   if (b_type == vllm::kFE4M3fn) {
     TORCH_CHECK(
         size_k % 32 == 0,
-        "SM70 Marlin FP8 dense path requires size_k % 32 == 0.");
+        "SM70 Marlin fp8_e4m3 dense path requires size_k % 32 == 0.");
     TORCH_CHECK(group_size == -1 || group_size == 128,
-                "SM70 Marlin FP8 supports only group_size -1 or "
+                "SM70 Marlin fp8_e4m3 supports only group_size -1 or "
                 "128. Got ",
                 group_size);
     TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin FP8 does not support zero-point "
+                "SM70 Marlin fp8_e4m3 does not support zero-point "
                 "metadata.");
     return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
                                 size_k, group_size);
@@ -417,15 +417,15 @@ torch::Tensor marlin_gemm(
   if (b_type == vllm::kFE2M1f) {
     TORCH_CHECK(
         size_k % 32 == 0,
-        "SM70 Marlin FP4 dense path requires size_k % 32 == 0.");
+        "SM70 Marlin nvfp4/mxfp4 dense path requires size_k % 32 == 0.");
     TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin FP4 does not support zero-point "
+                "SM70 Marlin nvfp4/mxfp4 does not support zero-point "
                 "metadata.");
     if (s_type == vllm::kFE4M3fn) {
       TORCH_CHECK(global_scale.numel() == 1,
                   "the global_scale parameter must be passed for nvfp4 format.");
       TORCH_CHECK(group_size == 16,
-                  "SM70 Marlin NVFP4 supports only group_size 16. "
+                  "SM70 Marlin nvfp4 supports only group_size 16. "
                   "Got ",
                   group_size);
       return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales, global_scale,
@@ -433,10 +433,10 @@ torch::Tensor marlin_gemm(
     }
 
     TORCH_CHECK(s_type == vllm::kFE8M0fnu,
-                "SM70 Marlin MXFP4 expects float8_e8m0fnu "
-                "MXFP4 scales.");
+                "SM70 Marlin mxfp4 expects float8_e8m0fnu "
+                "mxfp4 scales.");
     TORCH_CHECK(group_size == 32,
-                "SM70 Marlin MXFP4 supports only group_size 32 "
+                "SM70 Marlin mxfp4 supports only group_size 32 "
                 "when global_scale is not provided. Got ",
                 group_size);
     return sm70_marlin_mxfp4_gemm(a, c, b_q_weight, b_scales, size_m, size_n,

@@ -444,13 +444,13 @@ torch::Tensor sm70_marlin_fp8_gemm(
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params = sm70_marlin_moe_auto_stage_params(
-      "FP8", group_size, moe_block_size, top_k, size_m, size_n, size_k);
+      "fp8_e4m3", group_size, moe_block_size, top_k, size_m, size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
-  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE FP8", geometry);
-  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE FP8", geometry,
+  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE fp8_e4m3", geometry);
+  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE fp8_e4m3", geometry,
                                         size_n);
   TORCH_CHECK(size_k % geometry.cta_k == 0,
-              "SM70 Marlin MoE FP8 requires K divisible by CTA_K=",
+              "SM70 Marlin MoE fp8_e4m3 requires K divisible by CTA_K=",
               geometry.cta_k, ". Got K=", size_k, ".");
 
   auto empty_half = torch::empty({0}, b_scales.options().dtype(at::kHalf));

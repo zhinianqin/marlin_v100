@@ -134,7 +134,7 @@ torch::Tensor dispatch_sm70_marlin_fp8_group_size(Launcher const& launcher,
                                           WarpN, WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false,
-                  "SM70 Marlin FP8 supports only group_size -1 or 128. Got ",
+                  "SM70 Marlin fp8_e4m3 supports only group_size -1 or 128. Got ",
                   group_size, ".");
   }
   return torch::Tensor();
@@ -289,7 +289,7 @@ torch::Tensor dispatch_sm70_marlin_fp8_geometry(Launcher const& launcher,
                                                 int64_t group_size) {
   return dispatch_sm70_marlin_cta_geometry(
       Sm70MarlinFp8GroupSizeDispatchLauncher<Launcher>{launcher, group_size},
-      geometry, packed_macro_n, "FP8");
+      geometry, packed_macro_n, "fp8_e4m3");
 }
 
 template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,

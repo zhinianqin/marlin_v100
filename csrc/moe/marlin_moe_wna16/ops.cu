@@ -305,9 +305,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     TORCH_CHECK(global_scale.device().is_cuda(), "global_scale is not on GPU");
     TORCH_CHECK(global_scale.is_contiguous(), "global_scale is not contiguous");
     TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
-                "SM70 Marlin MoE NVFP4 expects fp32 global_scale.");
+                "SM70 Marlin MoE nvfp4 expects fp32 global_scale.");
     TORCH_CHECK(global_scale.numel() == num_experts,
-                "SM70 Marlin MoE NVFP4 expects global_scale numel = "
+                "SM70 Marlin MoE nvfp4 expects global_scale numel = "
                 "num_experts. Got global_scale.numel() = ",
                 global_scale.numel(), ", num_experts = ", num_experts);
   } else {
@@ -428,11 +428,12 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   if (b_type == vllm::kFE4M3fn) {
     TORCH_CHECK(group_size == -1 || group_size == 128,
-                "SM70 Marlin MoE FP8 supports only group_size -1 or "
+                "SM70 Marlin MoE fp8_e4m3 supports only group_size -1 or "
                 "128. Got ",
                 group_size);
     TORCH_CHECK(!has_zp && !is_zp_float,
-                "SM70 Marlin MoE fp8 does not support zero-point metadata.");
+                "SM70 Marlin MoE fp8_e4m3 does not support zero-point "
+                "metadata.");
     return MARLIN_NAMESPACE_NAME::sm70_marlin_fp8_gemm(
         a, c, b_q_weight, b_scales, sorted_token_ids, expert_ids,
         num_tokens_past_padded, topk_weights, moe_block_size, top_k,
@@ -446,7 +447,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       TORCH_CHECK(global_scale.numel() == num_experts,
                   "the global_scale parameter must be passed for nvfp4 format.");
       TORCH_CHECK(group_size == 16,
-                  "SM70 Marlin MoE NVFP4 supports only group_size 16. "
+                  "SM70 Marlin MoE nvfp4 supports only group_size 16. "
                   "Got ",
                   group_size);
       return MARLIN_NAMESPACE_NAME::sm70_marlin_nvfp4_gemm(
@@ -456,9 +457,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     }
 
     TORCH_CHECK(s_type == vllm::kFE8M0fnu,
-                "SM70 Marlin MoE MXFP4 expects float8_e8m0fnu scales.");
+                "SM70 Marlin MoE mxfp4 expects float8_e8m0fnu scales.");
     TORCH_CHECK(group_size == 32,
-                "SM70 Marlin MoE MXFP4 supports only group_size 32. "
+                "SM70 Marlin MoE mxfp4 supports only group_size 32. "
                 "Got ",
                 group_size);
     return MARLIN_NAMESPACE_NAME::sm70_marlin_mxfp4_gemm(

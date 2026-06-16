@@ -10,6 +10,7 @@
 #include <torch/types.h>
 
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 #include "quantization/marlin/sm70_marlin_common.cuh"
@@ -67,8 +68,96 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_params_from_env(
 }
 
 inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
-    Sm70MarlinMoeAutoParamsContext const& /*ctx*/,
-    Sm70MarlinAutoParams& /*params*/) {
+    Sm70MarlinMoeAutoParamsContext const& ctx,
+    Sm70MarlinAutoParams& params) {
+  if (ctx.quant_format == nullptr ||
+      std::strcmp(ctx.quant_format, "uint4") != 0 ||
+      ctx.group_size != 128 || ctx.size_m <= 0) {
+    return false;
+  }
+
+  auto const set_params = [&](Sm70CtaGeometry geometry,
+                              int requested_split_k,
+                              bool use_metadata_vector_words) {
+    params = {geometry, requested_split_k, use_metadata_vector_words,
+              ctx.packed_macro_n};
+    return true;
+  };
+
+  if (ctx.top_k == 1 && ctx.size_n == 2048) {
+    if (ctx.moe_block_size == 8 && ctx.size_k == 128) {
+      if (ctx.size_m <= 128) {
+        return set_params({32, 64, 32, 4, 32, 32, 16}, 1, true);
+      }
+      return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
+    }
+    if (ctx.moe_block_size == 8 && ctx.size_k == 512) {
+      if (ctx.size_m <= 128) {
+        return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+      }
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    if ((ctx.moe_block_size == 16 || ctx.moe_block_size == 32) &&
+        ctx.size_k == 512) {
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 64 && ctx.size_k == 128) {
+      if (ctx.size_m < 24576) {
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
+      }
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 64 && ctx.size_k == 512) {
+      return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+    }
+  }
+
+  if (ctx.top_k == 8 && ctx.size_k == 2048) {
+    if (ctx.moe_block_size == 8 && ctx.size_n == 128) {
+      if (ctx.size_m <= 16) {
+        return set_params({32, 64, 32, 4, 32, 32, 16}, 8, true);
+      }
+      if (ctx.size_m <= 48) {
+        return set_params({32, 128, 64, 8, 32, 32, 32}, 2, true);
+      }
+      return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 8 && ctx.size_n == 256) {
+      if (ctx.size_m <= 16) {
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+      }
+      if (ctx.size_m <= 48) {
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+      }
+      return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 8 && ctx.size_n == 1024) {
+      if (ctx.size_m <= 16) {
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 4, true);
+      }
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 16 && ctx.size_n == 1024) {
+      if (ctx.size_m <= 48) {
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, false);
+      }
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 32 && ctx.size_n == 1024) {
+      return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+    }
+    if (ctx.moe_block_size == 64 && ctx.size_n == 128) {
+      if (ctx.size_m < 3072) {
+        return set_params({64, 128, 32, 4, 32, 64, 32}, 1, true);
+      }
+      return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
+    }
+    if (ctx.moe_block_size == 64 &&
+        (ctx.size_n == 256 || ctx.size_n == 1024)) {
+      return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+    }
+  }
+
   return false;
 }
 
@@ -161,7 +250,7 @@ torch::Tensor dispatch_sm70_marlin_moe_fp8_group_size(
                                           WarpN, WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false,
-                  "SM70 Marlin MoE FP8 supports only group_size -1 "
+                  "SM70 Marlin MoE fp8_e4m3 supports only group_size -1 "
                   "or 128. Got ",
                   group_size, ".");
   }
@@ -323,7 +412,7 @@ torch::Tensor dispatch_sm70_marlin_moe_fp8_geometry(
   return dispatch_sm70_marlin_moe_cta_geometry(
       Sm70MarlinMoeFp8GroupSizeDispatchLauncher<Launcher>{launcher,
                                                           group_size},
-      geometry, packed_macro_n, "FP8");
+      geometry, packed_macro_n, "fp8_e4m3");
 }
 
 template <int GroupSize, typename Launcher>

@@ -558,7 +558,7 @@ torch::Tensor launch_sm70_marlin_u8b128_gemm(
   }
 
   TORCH_CHECK(size_k % int64_t(CtaK) == 0,
-              "SM70 Marlin U8B128 requires K divisible by CTA_K=",
+              "SM70 Marlin uint8b128 requires K divisible by CTA_K=",
               CtaK, " for requested_split_k > 1. Got K=", size_k,
               ", requested_split_k=", requested_split_k, ".");
 
@@ -620,20 +620,20 @@ torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params = sm70_marlin_dense_auto_params(
-      "U8B128", group_size, size_m, size_n, size_k);
+      "uint8b128", group_size, size_m, size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
-  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin U8B128", geometry);
-  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin U8B128", geometry, size_n);
+  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin uint8b128", geometry);
+  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin uint8b128", geometry, size_n);
   if (params.use_metadata_vector_words) {
     Sm70U8B128Launcher<true> const launcher{
         a, c, b_q_weight, b_scales, size_m, size_n, size_k,
         params.requested_split_k};
     return dispatch_sm70_marlin_geometry(
-        launcher, geometry, params.packed_macro_n, group_size, "U8B128");
+        launcher, geometry, params.packed_macro_n, group_size, "uint8b128");
   }
   Sm70U8B128Launcher<false> const launcher{
       a, c, b_q_weight, b_scales, size_m, size_n, size_k,
       params.requested_split_k};
   return dispatch_sm70_marlin_geometry(
-      launcher, geometry, params.packed_macro_n, group_size, "U8B128");
+      launcher, geometry, params.packed_macro_n, group_size, "uint8b128");
 }

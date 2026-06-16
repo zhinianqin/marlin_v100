@@ -526,7 +526,7 @@ torch::Tensor launch_sm70_marlin_mxfp4_gemm(
   }
 
   TORCH_CHECK(size_k % int64_t(CtaK) == 0,
-              "SM70 Marlin MXFP4 requires K divisible by CTA_K=",
+              "SM70 Marlin mxfp4 requires K divisible by CTA_K=",
               CtaK, " for requested_split_k > 1. Got K=", size_k,
               ", requested_split_k=", requested_split_k, ".");
 
@@ -583,13 +583,13 @@ torch::Tensor sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params = sm70_marlin_dense_auto_params(
-      "MXFP4", group_size, size_m, size_n, size_k);
+      "mxfp4", group_size, size_m, size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
-  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin MXFP4", geometry);
-  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin MXFP4", geometry, size_n);
+  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin mxfp4", geometry);
+  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin mxfp4", geometry, size_n);
   Sm70Mxfp4Launcher const launcher{
       a, c, b_q_weight, b_scales, size_m, size_n, size_k,
       params.requested_split_k};
   return dispatch_sm70_marlin_fixed_group_geometry<32>(
-      launcher, geometry, params.packed_macro_n, group_size, "MXFP4");
+      launcher, geometry, params.packed_macro_n, group_size, "mxfp4");
 }

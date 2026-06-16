@@ -473,13 +473,13 @@ torch::Tensor sm70_marlin_u8_gemm(
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params = sm70_marlin_moe_auto_stage_params(
-      "U8", group_size, moe_block_size, top_k, size_m, size_n, size_k);
+      "uint8", group_size, moe_block_size, top_k, size_m, size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
-  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE U8", geometry);
-  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE U8", geometry,
+  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE uint8", geometry);
+  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE uint8", geometry,
                                         size_n);
   TORCH_CHECK(size_k % geometry.cta_k == 0,
-              "SM70 Marlin MoE U8 requires K divisible by CTA_K=",
+              "SM70 Marlin MoE uint8 requires K divisible by CTA_K=",
               geometry.cta_k, ". Got K=", size_k, ".");
 
   auto empty_float = torch::empty(
@@ -490,14 +490,14 @@ torch::Tensor sm70_marlin_u8_gemm(
         expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
         mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
     return dispatch_sm70_marlin_moe_geometry(launcher, geometry, params.packed_macro_n, group_size,
-        "U8");
+        "uint8");
   }
   Sm70MoeU8Launcher<false> const launcher{
       a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
       mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
   return dispatch_sm70_marlin_moe_geometry(launcher, geometry, params.packed_macro_n, group_size,
-      "U8");
+      "uint8");
 }
 
 }  // namespace marlin_moe_wna16
