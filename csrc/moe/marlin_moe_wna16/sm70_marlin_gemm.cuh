@@ -378,6 +378,119 @@ inline bool sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
   return false;
 }
 
+inline bool sm70_marlin_moe_try_select_cyankiwi_glm_4_7_awq_4bit_params(
+    Sm70MarlinMoeAutoParamsContext const& ctx,
+    Sm70MarlinAutoParams& params) {
+  if (ctx.quant_format == nullptr ||
+      std::strcmp(ctx.quant_format, "uint4b8") != 0 ||
+      ctx.group_size != 32 || ctx.size_m <= 0) {
+    return false;
+  }
+
+  auto const set_params = [&](Sm70CtaGeometry geometry,
+                              int requested_split_k,
+                              bool use_metadata_vector_words) {
+    params = {geometry, requested_split_k, use_metadata_vector_words,
+              ctx.packed_macro_n};
+    return true;
+  };
+
+  // === moe_block_size == 8 ===
+  if (ctx.moe_block_size == 8) {
+    // top_k=1: down projection, size_n=5120
+    if (ctx.top_k == 1 && ctx.size_n == 5120) {
+      if (ctx.size_k == 192 || ctx.size_k == 384 || ctx.size_k == 1536) {
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+      }
+    }
+
+    // top_k=8: gate-up projection, size_k=5120
+    if (ctx.top_k == 8 && ctx.size_k == 5120) {
+      if (ctx.size_n == 384) {
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 2, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+      }
+      if (ctx.size_n == 768) {
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 4, false);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
+      }
+      if (ctx.size_n == 3072) {
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 2, true);
+      }
+    }
+  }
+
+  // === moe_block_size == 16 ===
+  if (ctx.moe_block_size == 16) {
+    // top_k=1: down projection, size_n=5120
+    if (ctx.top_k == 1 && ctx.size_n == 5120 && ctx.size_k == 1536) {
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    // top_k=8: gate-up projection, size_k=5120
+    if (ctx.top_k == 8 && ctx.size_n == 3072 && ctx.size_k == 5120) {
+      if (ctx.size_m <= 32) {
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
+      }
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+  }
+
+  // === moe_block_size == 32 ===
+  if (ctx.moe_block_size == 32) {
+    // top_k=1: down projection, size_n=5120
+    if (ctx.top_k == 1 && ctx.size_n == 5120 && ctx.size_k == 1536) {
+      return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+    }
+    // top_k=8: gate-up projection, size_k=5120
+    if (ctx.top_k == 8 && ctx.size_n == 3072 && ctx.size_k == 5120) {
+      return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+    }
+  }
+
+  // === moe_block_size == 64 ===
+  if (ctx.moe_block_size == 64) {
+    // top_k=1: down projection, size_n=5120
+    if (ctx.top_k == 1 && ctx.size_n == 5120) {
+      if (ctx.size_k == 192 || ctx.size_k == 384 || ctx.size_k == 1536) {
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+      }
+    }
+    // top_k=8: gate-up projection, size_k=5120
+    if (ctx.top_k == 8 && ctx.size_k == 5120) {
+      if (ctx.size_n == 384) {
+        return set_params({64, 128, 64, 4, 64, 64, 32}, 1, false);
+      }
+      if (ctx.size_n == 768) {
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+      }
+      if (ctx.size_n == 3072) {
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+      }
+    }
+  }
+
+  return false;
+}
+
 inline bool sm70_marlin_moe_try_select_quanttrio_glm_4_7_awq_params(
     Sm70MarlinMoeAutoParamsContext const& ctx,
     Sm70MarlinAutoParams& params) {
@@ -500,6 +613,11 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
     return params;
   }
   if (sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+          ctx, params)) {
+    validate_sm70_marlin_auto_params("MoE", params);
+    return params;
+  }
+  if (sm70_marlin_moe_try_select_cyankiwi_glm_4_7_awq_4bit_params(
           ctx, params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
