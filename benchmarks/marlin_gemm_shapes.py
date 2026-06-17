@@ -882,7 +882,7 @@ def _configured_quant_format(quant: QuantInfo,
             "actual_marlin",
             method,
             f"fp8_{quant.format}" if quant.format else "fp8_e4m3",
-            quant.group_size,
+            quant.group_size or -1,
             False,
             "fp8_marlin",
         )
