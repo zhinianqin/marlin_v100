@@ -80,11 +80,10 @@ class CMakeBuild(build_ext):
 setup(
     name="marlin-v100",
     version="0.0.0",
-    package_dir={"": "python"},
-    packages=find_packages(where="python"),
+    packages=find_packages(where=".", include=["vllm", "vllm.*"]),
     ext_modules=[
-        CMakeExtension("marlin_v100._C"),
-        CMakeExtension("marlin_v100._moe_C"),
+        CMakeExtension("vllm._C"),
+        CMakeExtension("vllm._moe_C"),
     ],
     cmdclass={"build_ext": CMakeBuild},
 )

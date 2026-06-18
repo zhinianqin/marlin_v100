@@ -1,4 +1,6 @@
 upstream_map:
+  - source: vllm/_custom_ops.py
+    target: vllm/_custom_ops.py
   - source: csrc/quantization/marlin/**
     target: csrc/quantization/marlin/**
   - source: csrc/moe/marlin_moe_wna16/**
@@ -7,3 +9,49 @@ upstream_map:
     target: csrc/torch_bindings_marlin.cpp
   - source: csrc/moe/torch_bindings_marlin.cpp
     target: csrc/moe/torch_bindings_marlin.cpp
+  - source: vllm/model_executor/__init__.py
+    target: vllm/model_executor/__init__.py
+  - source: vllm/model_executor/kernels/__init__.py
+    target: vllm/model_executor/kernels/__init__.py
+  - source: vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+    target: vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+  - source: vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py
+    target: vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py
+  - source: vllm/model_executor/kernels/linear/scaled_mm/marlin.py
+    target: vllm/model_executor/kernels/linear/scaled_mm/marlin.py
+  - source: vllm/model_executor/kernels/linear/scaled_mm/ScaledMMLinearKernel.py
+    target: vllm/model_executor/kernels/linear/scaled_mm/ScaledMMLinearKernel.py
+  - source: vllm/model_executor/layers/__init__.py
+    target: vllm/model_executor/layers/__init__.py
+  - source: vllm/model_executor/layers/quantization/utils/__init__.py
+    target: vllm/model_executor/layers/quantization/utils/__init__.py
+  - source: vllm/model_executor/layers/quantization/utils/marlin_utils.py
+    target: vllm/model_executor/layers/quantization/utils/marlin_utils.py
+  - source: vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py
+    target: vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py
+  - source: vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+    target: vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+  - source: vllm/model_executor/layers/quantization/utils/nvfp4_utils.py
+    target: vllm/model_executor/layers/quantization/utils/nvfp4_utils.py
+  - source: vllm/model_executor/layers/fused_moe/fused_marlin_moe.py
+    target: vllm/model_executor/layers/fused_moe/fused_marlin_moe.py
+  - source: vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+    target: vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+  - source: vllm/model_executor/layers/quantization/gptq_marlin.py
+    target: vllm/model_executor/layers/quantization/gptq_marlin.py
+  - source: vllm/model_executor/layers/quantization/awq_marlin.py
+    target: vllm/model_executor/layers/quantization/awq_marlin.py
+  - source: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+    target: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+  - source: vllm/model_executor/layers/quantization/quark/__init__.py
+    target: vllm/model_executor/layers/quantization/quark/__init__.py
+  - source: vllm/model_executor/layers/quantization/quark/quark_moe.py
+    target: vllm/model_executor/layers/quantization/quark/quark_moe.py
+  - source: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
+    target: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py
+  - source: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py
+    target: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py
+  - source: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py
+    target: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py
+  - source: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py
+    target: vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py

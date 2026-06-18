@@ -26,6 +26,7 @@ python/marlin_v100/_moe_C*.so
 .pytest_cache/
 marlin_generation.log
 moe_marlin_generation.log
+benchmarks/results/
 
 # Editor and OS files
 .DS_Store

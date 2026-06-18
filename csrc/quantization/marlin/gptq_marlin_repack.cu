@@ -1,11 +1,12 @@
 #include "marlin.cuh"
 
 #include "core/registration.h"
+#include "quantization/marlin/sm70_marlin_common.cuh"
 
 namespace marlin {
 
 template <int const num_threads, int const num_bits, bool const has_perm,
-          bool is_a_8bit>
+          bool is_a_8bit, int CtaN>
 __global__ void gptq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr,
     uint32_t const* __restrict__ perm_ptr, uint32_t* __restrict__ out_ptr,
@@ -14,6 +15,9 @@ __global__ void gptq_marlin_repack_kernel(
 
   constexpr int target_tile_n_size = tile_n_size / (is_a_8bit ? 2 : 1);
   constexpr int target_tile_k_size = tile_k_size * (is_a_8bit ? 2 : 1);
+  static_assert(CtaN % target_tile_n_size == 0,
+                "CTA_N must be a multiple of the repack N tile size.");
+  constexpr int cta_n_tiles = CtaN / target_tile_n_size;
   int k_tiles = size_k / target_tile_k_size;
   int n_tiles = size_n / target_tile_n_size;
   int block_k_tiles = div_ceil(k_tiles, gridDim.x);
@@ -112,6 +116,112 @@ __global__ void gptq_marlin_repack_kernel(
       return;
     }
 
+    constexpr int tile_size =
+        target_tile_k_size * target_tile_n_size / pack_factor;
+    int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_size;
+
+    if constexpr (!is_a_8bit && num_bits == 4) {
+      int word_idx = threadIdx.x;
+      if (word_idx >= tile_size) {
+        return;
+      }
+
+      int local_k = word_idx / 8;
+      int local_n_vec = word_idx % 8;
+      int first_n = local_n_vec * 8;
+
+      constexpr int sh_stride = target_tile_n_size;
+      constexpr uint32_t mask = (1 << num_bits) - 1;
+      constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+      int4* sh_stage_ptr = sh_pipe_ptr + stage_size * pipe;
+      uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
+      uint32_t* sh_perm_int_ptr = reinterpret_cast<uint32_t*>(sh_perm_ptr);
+
+      int src_k_pos = local_k % pack_factor;
+      int src_k_int = local_k / pack_factor;
+      if constexpr (has_perm) {
+        uint32_t src_k = sh_perm_int_ptr[local_k];
+        src_k_pos = src_k % pack_factor;
+        src_k_int = local_k;
+      }
+
+      uint32_t vals[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        uint32_t packed_src =
+            sh_stage_int_ptr[src_k_int * sh_stride + first_n + i];
+        vals[i] = (packed_src >> (src_k_pos * num_bits)) & mask;
+      }
+
+      uint32_t res = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        res |= vals[pack_idx[i]] << (i * 4);
+      }
+
+      int const cta_n_tile = n_tile_id / cta_n_tiles;
+      int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
+      int const subtile = n_tile_id - cta_first_n_tile;
+      int const local_word = local_k * 8 + local_n_vec;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
+      out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
+      return;
+    }
+
+    if constexpr (!is_a_8bit && num_bits == 8) {
+      int word_idx = threadIdx.x;
+      if (word_idx >= tile_size) {
+        return;
+      }
+
+      int local_k = word_idx / 16;
+      int local_n_word = word_idx % 16;
+      int first_n = local_n_word * 4;
+
+      constexpr int sh_stride = target_tile_n_size;
+      constexpr uint32_t mask = (1 << num_bits) - 1;
+      constexpr int pack_idx[4] = {0, 2, 1, 3};
+
+      int4* sh_stage_ptr = sh_pipe_ptr + stage_size * pipe;
+      uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
+      uint32_t* sh_perm_int_ptr = reinterpret_cast<uint32_t*>(sh_perm_ptr);
+
+      int src_k_pos = local_k % pack_factor;
+      int src_k_int = local_k / pack_factor;
+      if constexpr (has_perm) {
+        uint32_t src_k = sh_perm_int_ptr[local_k];
+        src_k_pos = src_k % pack_factor;
+        src_k_int = local_k;
+      }
+
+      uint32_t vals[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        uint32_t packed_src =
+            sh_stage_int_ptr[src_k_int * sh_stride + first_n + i];
+        vals[i] = (packed_src >> (src_k_pos * num_bits)) & mask;
+      }
+
+      uint32_t res = 0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        res |= vals[pack_idx[i]] << (i * 8);
+      }
+
+      int const cta_n_tile = n_tile_id / cta_n_tiles;
+      int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
+      int const subtile = n_tile_id - cta_first_n_tile;
+      int const local_word = local_k * 16 + local_n_word;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
+      out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
+      return;
+    }
+
     auto warp_id = threadIdx.x / 32;
     auto th_id = threadIdx.x % 32;
 
@@ -183,10 +293,6 @@ __global__ void gptq_marlin_repack_kernel(
           vals[4 + i] = (b2_vals[cur_int] >> (cur_pos * num_bits)) & mask;
       }
     }
-
-    constexpr int tile_size =
-        target_tile_k_size * target_tile_n_size / pack_factor;
-    int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_size;
 
     // Result of:
     // https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h
@@ -262,18 +368,33 @@ __global__ void gptq_marlin_repack_kernel(
 
 }  // namespace marlin
 
-#define CALL_IF(NUM_BITS, HAS_PERM, IS_A_8BIT)                              \
-  else if (num_bits == NUM_BITS && has_perm == HAS_PERM &&                  \
-           is_a_8bit == IS_A_8BIT) {                                        \
+#define CALL_IF(NUM_BITS, HAS_PERM, IS_A_8BIT, CTA_N)                       \
+  if (num_bits == NUM_BITS && has_perm == HAS_PERM &&                       \
+      is_a_8bit == IS_A_8BIT) {                                             \
     cudaFuncSetAttribute(                                                   \
         marlin::gptq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS, \
-                                          HAS_PERM, IS_A_8BIT>,             \
+                                          HAS_PERM, IS_A_8BIT, CTA_N>,      \
         cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);       \
     marlin::gptq_marlin_repack_kernel<marlin::repack_threads, NUM_BITS,     \
-                                      HAS_PERM, IS_A_8BIT>                  \
+                                      HAS_PERM, IS_A_8BIT, CTA_N>           \
         <<<blocks, marlin::repack_threads, max_shared_mem, stream>>>(       \
             b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n);             \
-  }
+  } else
+
+#define CALL_FOR_CTA(CTA_N)                                                 \
+  do {                                                                      \
+    CALL_IF(4, false, false, CTA_N)                                         \
+    CALL_IF(4, true, false, CTA_N)                                          \
+    CALL_IF(8, false, false, CTA_N)                                         \
+    CALL_IF(8, true, false, CTA_N)                                          \
+    CALL_IF(4, false, true, CTA_N)                                          \
+    CALL_IF(8, false, true, CTA_N)                                          \
+    {                                                                       \
+      TORCH_CHECK(false, "Unsupported repack config: num_bits = ",          \
+                  num_bits, ", has_perm = ", has_perm,                     \
+                  ", is_a_8bit = ", is_a_8bit);                            \
+    }                                                                       \
+  } while (false)
 
 torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,
                                  int64_t size_k, int64_t size_n,
@@ -334,19 +455,14 @@ torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(max_shared_mem > 0);
 
-  if (false) {
-  }
-  CALL_IF(4, false, false)
-  CALL_IF(4, true, false)
-  CALL_IF(8, false, false)
-  CALL_IF(8, true, false)
-
-  CALL_IF(4, false, true)
-  CALL_IF(8, false, true)
-
-  else {
-    TORCH_CHECK(false, "Unsupported repack config: num_bits = ", num_bits,
-                ", has_perm = ", has_perm, ", is_a_8bit = ", is_a_8bit);
+  int const packed_macro_n =
+      marlin::sm70::sm70_marlin_auto_packed_macro_n(size_n);
+  if (packed_macro_n == 64) {
+    CALL_FOR_CTA(64);
+  } else if (packed_macro_n == 128) {
+    CALL_FOR_CTA(128);
+  } else {
+    CALL_FOR_CTA(256);
   }
 
   return out;

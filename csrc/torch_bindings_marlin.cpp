@@ -3,13 +3,6 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // Note about marlin kernel 'workspace' arguments:
-  // Technically these should be mutable since they are modified by the kernel.
-  // But since they are set back to zero once the kernel is finished we can
-  // hand wave and say that they have no net effect.
-  //
-  // The reason to mark 'workspace' as immutable is so that they don't
-  // interfere with using ScalarType arguments in the ops.
   ops.def(
       "marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
       "Tensor? b_bias_or_none,Tensor b_scales, "
@@ -30,6 +23,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "marlin_int4_fp8_preprocess(Tensor qweight, "
       "Tensor? qzeros_or_none, bool inplace) -> Tensor");
+
+  ops.def(
+      "sm70_cutlass_matmul_probe(Tensor a, Tensor b, int cta_m, int cta_n, "
+      "int cta_k, int warps, int stages, int a_path, int b_path) -> Tensor");
+
+  ops.def(
+      "sm70_cutlass_matmul_explicit_warp_probe(Tensor a, Tensor b, "
+      "int cta_m, int cta_n, int cta_k, int warps, "
+      "int warp_m, int warp_n, int warp_k) -> Tensor");
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
