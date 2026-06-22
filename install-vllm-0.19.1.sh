@@ -345,6 +345,14 @@ replace("vllm/model_executor/layers/quantization/moe_wna16.py",
             self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
 ''')
 
+replace("vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py",
+        "return 75",
+        "return 70")
+
+replace("vllm/model_executor/layers/quantization/modelopt.py",
+        "return 75",
+        "return 70")
+
 setup = root / "setup.py"
 setup_data = setup.read_text()
 if "_is_sm70_flash_attn_source_build" not in setup_data:

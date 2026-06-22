@@ -196,6 +196,12 @@ git clone --branch main http://openmediavault.lan:3000/admin/flash-attention-v10
 - `csrc/quantization/gptq_allspark/allspark_qgemm_w8a16.cu`
   - 将 `MarlinScalarType2<FType>` 替换为 `AllSparkScalarType<FType>`。
   - 理由：删除旧 Marlin header 后避免非 Marlin AllSpark 路径被悬空 include 破坏；不改变 AllSpark 的高能力 CMake gate。
+- `vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py`
+  - `CompressedTensorsW4A4Fp4.get_min_capability()` 从 `75` 改为 `70`。
+  - 理由：NVFP4 Marlin SM70 kernel 已通过 `sm70_marlin_nvfp4_gemm.cu` 提供，`75` 门槛会阻止 SM70 GPU 使用 CompressedTensors W4A4 NVFP4 量化路径。
+- `vllm/model_executor/layers/quantization/modelopt.py`
+  - `ModelOptNvFp4Config.get_min_capability()` 从 `75` 改为 `70`。
+  - 理由：ModelOpt NVFP4 量化路径同样依赖 SM70 Marlin NVFP4 kernel，`75` 门槛不必要地阻止 SM70 GPU 加载 ModelOpt NVFP4 量化模型。
 
 ## 已确认保留的高能力限制
 
