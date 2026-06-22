@@ -434,6 +434,69 @@ if "MarlinScalarType2<FType>::" not in allspark_kernel_data:
     raise SystemExit("pattern not found in csrc/quantization/gptq_allspark/allspark_qgemm_w8a16.cu")
 allspark_kernel.write_text(allspark_kernel_data.replace("MarlinScalarType2<FType>::", "AllSparkScalarType<FType>::"))
 
+replace("vllm/model_executor/layers/attention/attention.py",
+        "from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod\n",
+        "")
+
+replace("vllm/model_executor/layers/attention/attention.py",
+        "    quant_method = (\n        quant_config.get_quant_method(layer, prefix=prefix) if quant_config else None\n    )\n\n    # Note [Register q/k/v/prob scales in state dict]",
+        "    # Note [Register q/k/v/prob scales in state dict]")
+
+replace("vllm/model_executor/layers/attention/attention.py",
+        '''    quant_method = (
+        quant_config.get_quant_method(layer, prefix=prefix) if quant_config else None
+    )
+
+    # See [Note: Register q/k/v/prob scales in state dict]
+    if should_load_quant_weights(quant_method):
+        assert isinstance(quant_method, BaseKVCacheMethod)
+        # TODO (mgoin): kv cache dtype should be specified in the FP8
+        # checkpoint config and become the "auto" behavior
+        if layer.kv_cache_dtype == "fp8_e5m2":
+            raise ValueError("fp8_e5m2 kv-cache is not supported with fp8 checkpoints.")
+        # If quantization is enabled, we make "k_scale" and "v_scale"
+        # parameters so that it can be loaded from the model checkpoint.
+        # The k/v_scale will then be converted back to native float32
+        # values after weight loading.
+        layer.quant_method = quant_method
+        layer.quant_method.create_weights(layer)
+
+''',
+        "")
+
+replace("vllm/model_executor/layers/attention/attention.py",
+        '''        # llm-compressor mdls need to set cache_dtype to "fp8" manually.
+        kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
+        if kv_cache_scheme is not None:
+            kv_cache_dtype = "fp8"
+            calculate_kv_scales = False
+            if cache_config is not None:
+                cache_config.cache_dtype = "fp8"
+                cache_config.calculate_kv_scales = False
+
+        # Check if per-head quant scales are required based on kv_cache_scheme
+        use_per_head_quant_scales = (
+            kv_cache_scheme is not None
+            and kv_cache_scheme.get("strategy") == "attn_head"
+        )''',
+        "        use_per_head_quant_scales = False")
+
+replace("vllm/utils/torch_utils.py",
+        '''    hf_cfg = getattr(model_config, "hf_config", None)
+    if hf_cfg is not None:
+        quant_cfg = getattr(hf_cfg, "quantization_config", None)
+        if quant_cfg is not None:
+            kv_algo_str = get_kv_cache_quant_algo_string(quant_cfg)
+            if kv_algo_str is not None:
+                return kv_algo_str
+
+    # Default to auto (will be handled by downstream code)''',
+        "    # Default to auto (will be handled by downstream code)")
+
+replace("vllm/model_executor/models/glm4_moe.py",
+        "            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)\n            if spec_layer is not None:\n                continue\n            for param_name, weight_name, shard_id in stacked_params_mapping:",
+        "            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)\n            if spec_layer is not None:\n                continue\n            # Skip attention KV cache quantization scale weights.\n            # V100 (SM 7.0) has no FP8 hardware, and the corresponding\n            # parameters are not created.\n            if name.endswith((\".k_scale\", \".v_scale\", \".q_scale\")):\n                continue\n            for param_name, weight_name, shard_id in stacked_params_mapping:")
+
 replace("requirements/common.txt",
         "fastapi[standard] >= 0.115.0 # Required by FastAPI's form models",
         "fastapi[standard] >= 0.115.0, < 0.137.0 # Required by FastAPI's form models")

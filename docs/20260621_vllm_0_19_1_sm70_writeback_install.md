@@ -178,6 +178,9 @@ git clone --branch main http://openmediavault.lan:3000/admin/flash-attention-v10
 - `vllm/v1/attention/backends/flash_attn.py`
   - `FlashAttentionBackend.supports_compute_capability()` 从 `DeviceCapability(8, 0)` 改为 `DeviceCapability(7, 0)`。
   - 理由：FlashAttention V100 README 要求普通 FlashAttention backend 对 SM70 可用。
+- `vllm/vllm_flash_attn/flash_attn_interface.py`
+  - `has_device_capability(80)` 改为 `has_device_capability(70)`。
+  - 理由：FlashAttention V100 仅提供 FA2；放宽到 SM70 允许 V100 通过 backend 能力检查。
 - `vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py`
   - `is_fp8_marlin_supported()` 从 `has_device_capability(75)` 改为 `has_device_capability(70)`。
 - `vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py`
@@ -202,6 +205,21 @@ git clone --branch main http://openmediavault.lan:3000/admin/flash-attention-v10
 - `vllm/model_executor/layers/quantization/modelopt.py`
   - `ModelOptNvFp4Config.get_min_capability()` 从 `75` 改为 `70`。
   - 理由：ModelOpt NVFP4 量化路径同样依赖 SM70 Marlin NVFP4 kernel，`75` 门槛不必要地阻止 SM70 GPU 加载 ModelOpt NVFP4 量化模型。
+- `vllm/model_executor/layers/attention/attention.py`
+  - 删除 `BaseKVCacheMethod` import（唯一使用处已被删除）。
+  - 删除第一个废弃的 `quant_method =` 赋值（被 L156 遮蔽，本就 dead）。
+  - 删除第二个 `quant_method =` 赋值及其后续 `should_load_quant_weights` 块（原 L156-172）。
+  - 删除 `kv_cache_scheme` 覆写块（原 L228-241），硬编码 `use_per_head_quant_scales = False`。
+  - 理由：V100 无 FP8 硬件，KV cache 量化在所有量化配置下均不应生效。`kv_cache_scheme` 块会篡改 `cache_config.cache_dtype` 为 `"fp8"`；`should_load_quant_weights` 块会创建 `k_scale`/`v_scale` 参数导致权重加载 KeyError。`set_default_quant_scales` 已为 `k_scale`/`v_scale` 注册 1.0 buffer 作为默认值。这两处是所有量化配置 KV cache 量化的汇聚点。注意：仅删除这两处不足以保证 SM70 运行——上游 `resolve_kv_cache_dtype_string()` 仍会将模型 `kv_cache_scheme` 解析为 `"fp8_e4m3"`，需配合 `torch_utils.py` 修改。
+- `vllm/utils/torch_utils.py`
+  - `resolve_kv_cache_dtype_string()` 删除 FP8 量化配置解析块（原 L333-339），`"auto"` 直接返回 `"auto"`。
+  - 理由：V100 无 FP8 硬件。该块将模型 `config.json` 的 `kv_cache_scheme` 解析为 `"fp8_e4m3"`，导致 `CacheConfig.cache_dtype` 被设为 FP8，随后 FlashAttention backend 在 SM70 上拒绝启动（`kv_cache_dtype not supported`）。直接删除解析逻辑，与 attention.py 的删除策略一致。
+- `vllm/model_executor/models/glm4_moe.py`
+  - `Glm4MoeModel.load_weights()` 在 spec_layer 检查之后、stacked_params_mapping 循环之前，添加 `if name.endswith((".k_scale", ".v_scale", ".q_scale")): continue` 显式跳过 attention KV cache scale 权重。
+  - 理由：attention.py 补丁删除 `create_weights` 后 `k_scale`/`v_scale`/`q_scale` 不再是 nn.Parameter。原 `stacked_params_mapping` 子串匹配 bug（`"v_proj" in "qkv_proj"`）会在这些权重上触发 KeyError。`.split(".")` 组件匹配虽然逻辑正确，但运行时可能因 `.pyc` 缓存未生效。在循环入口显式跳过是最稳健方案。
+- `requirements/common.txt`
+  - 添加 `fastapi[standard]` 版本上限 `< 0.137.0`。
+  - 理由：`fastapi>=0.137.0` 移除了 `fastapi[standard]` extra，导致 vLLM 0.19.1 的 `pip install -r requirements/common.txt` 失败。
 
 ## 已确认保留的高能力限制
 
