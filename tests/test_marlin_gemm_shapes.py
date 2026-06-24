@@ -42,6 +42,17 @@ def has_layer_key(row: dict, needle: str) -> bool:
     return any(needle in key for key in row["layer_keys"])
 
 
+def awq_keys(prefix: str, *, bias: bool = False) -> list[str]:
+    keys = [
+        f"{prefix}.qweight",
+        f"{prefix}.qzeros",
+        f"{prefix}.scales",
+    ]
+    if bias:
+        keys.append(f"{prefix}.bias")
+    return keys
+
+
 def qwen_moe_config(quant_config: dict) -> dict:
     return {
         "model_type": "qwen3_5_moe",
@@ -81,6 +92,306 @@ def qwen_dense_config(quant_config: dict) -> dict:
             "attn_output_gate": True,
         },
     }
+
+
+def glm_moe_config(quant_config: dict) -> dict:
+    return {
+        "model_type": "glm4_moe",
+        "hidden_size": 512,
+        "intermediate_size": 1024,
+        "moe_intermediate_size": 256,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "first_k_dense_replace": 1,
+        "quantization_config": quant_config,
+    }
+
+
+def test_glm_like_awq_bias_is_row_level_from_index_evidence(tmp_path: Path):
+    config = glm_moe_config({
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    })
+    keys = [
+        *awq_keys("model.layers.0.self_attn.q_proj", bias=True),
+        *awq_keys("model.layers.0.self_attn.k_proj", bias=True),
+        *awq_keys("model.layers.0.self_attn.v_proj", bias=True),
+        *awq_keys("model.layers.0.self_attn.o_proj"),
+        *awq_keys("model.layers.0.mlp.gate_proj"),
+        *awq_keys("model.layers.0.mlp.up_proj"),
+        *awq_keys("model.layers.0.mlp.down_proj"),
+        *awq_keys("model.layers.1.mlp.experts.0.gate_proj"),
+        *awq_keys("model.layers.1.mlp.experts.0.up_proj"),
+        *awq_keys("model.layers.1.mlp.experts.0.down_proj"),
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "1",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "32",
+        "--decode-concurrency",
+        "1",
+    )
+
+    qkv = next(
+        row for row in payload["dense"]
+        if row["op"] == "qkv_proj" and row["phase"] == "prefill"
+    )
+    assert qkv["call_status"] == "actual_marlin"
+    assert qkv["has_bias"] is True
+
+    no_bias_dense_ops = {"o_proj", "gate_up_proj", "down_proj"}
+    no_bias_dense = [
+        row for row in payload["dense"]
+        if row["op"] in no_bias_dense_ops and row["call_status"] == "actual_marlin"
+    ]
+    assert no_bias_dense
+    assert all(row["has_bias"] is False for row in no_bias_dense)
+
+    actual_moe = [
+        row for row in payload["moe"]
+        if row["call_status"] == "actual_marlin"
+    ]
+    assert actual_moe
+    assert all(row["has_bias"] is False for row in actual_moe)
+
+
+def test_qwen_visual_bias_does_not_mark_language_marlin_rows(tmp_path: Path):
+    config = qwen_moe_config({
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    })
+    keys = [
+        "model.visual.patch_embed.proj.bias",
+        *awq_keys("model.language_model.layers.1.self_attn.q_proj"),
+        *awq_keys("model.language_model.layers.1.self_attn.k_proj"),
+        *awq_keys("model.language_model.layers.1.self_attn.v_proj"),
+        *awq_keys("model.language_model.layers.1.self_attn.o_proj"),
+        *awq_keys("model.language_model.layers.0.mlp.experts.0.gate_proj"),
+        *awq_keys("model.language_model.layers.0.mlp.experts.0.up_proj"),
+        *awq_keys("model.language_model.layers.0.mlp.experts.0.down_proj"),
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "4",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "32",
+        "--decode-concurrency",
+        "1",
+    )
+
+    actual_rows = [
+        *[row for row in payload["dense"] if row["call_status"] == "actual_marlin"],
+        *[row for row in payload["moe"] if row["call_status"] == "actual_marlin"],
+    ]
+    assert actual_rows
+    assert all(row["has_bias"] is False for row in actual_rows)
+
+
+def test_has_bias_separates_aggregated_qkv_rows(tmp_path: Path):
+    config = qwen_dense_config({
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    })
+    config["text_config"]["layer_types"] = ["full_attention", "full_attention"]
+    keys = [
+        *awq_keys("model.language_model.layers.0.self_attn.q_proj", bias=True),
+        *awq_keys("model.language_model.layers.0.self_attn.k_proj", bias=True),
+        *awq_keys("model.language_model.layers.0.self_attn.v_proj", bias=True),
+        *awq_keys("model.language_model.layers.1.self_attn.q_proj"),
+        *awq_keys("model.language_model.layers.1.self_attn.k_proj"),
+        *awq_keys("model.language_model.layers.1.self_attn.v_proj"),
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "1",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "32",
+        "--decode-concurrency",
+        "1",
+    )
+
+    qkv_rows = [
+        row for row in payload["dense"]
+        if row["op"] == "qkv_proj"
+        and row["phase"] == "prefill"
+        and row["call_status"] == "actual_marlin"
+    ]
+    assert len(qkv_rows) == 2
+    assert sorted(row["has_bias"] for row in qkv_rows) == [False, True]
+
+
+def test_moe_partial_expert_bias_evidence_stays_false():
+    evidence = marlin_gemm_shapes.IndexEvidence(
+        {
+            "model.layers.0.mlp.experts.0.gate_proj.bias",
+            "model.layers.0.mlp.experts.1.up_proj.bias",
+        }
+    )
+    assert not evidence.has_child_biases(
+        "model.layers.0.mlp.experts",
+        ("gate_proj", "up_proj"),
+        2,
+    )
+
+
+def test_moe_child_bias_evidence_accepts_unindexed_biases():
+    prefix = "model.layers.0.mlp.experts"
+    evidence = marlin_gemm_shapes.IndexEvidence(
+        {
+            f"{prefix}.gate_proj.bias",
+            f"{prefix}.up_proj.bias",
+            f"{prefix}.down_proj.bias",
+            f"{prefix}.w1.bias",
+            f"{prefix}.w3.bias",
+            f"{prefix}.w2.bias",
+        }
+    )
+
+    assert evidence.has_child_biases(prefix, ("gate_proj", "up_proj"), 4)
+    assert evidence.has_child_biases(prefix, ("down_proj",), 4)
+    assert evidence.has_child_biases(prefix, ("w1", "w3"), 4)
+    assert evidence.has_child_biases(prefix, ("w2",), 4)
+
+
+def test_moe_child_bias_evidence_accepts_global_indexed_biases():
+    prefix = "model.layers.0.mlp.experts"
+    evidence = marlin_gemm_shapes.IndexEvidence(
+        {
+            f"{prefix}.{expert}.{name}.bias"
+            for expert in range(4)
+            for name in ("gate_proj", "up_proj", "down_proj")
+        }
+    )
+
+    assert evidence.has_child_biases(prefix, ("gate_proj", "up_proj"), 4)
+    assert evidence.has_child_biases(prefix, ("down_proj",), 4)
+
+
+def test_moe_mixed_indexed_and_unindexed_bias_evidence_stays_false():
+    prefix = "model.layers.0.mlp.experts"
+    evidence = marlin_gemm_shapes.IndexEvidence(
+        {
+            f"{prefix}.gate_proj.bias",
+            *(f"{prefix}.{expert}.up_proj.bias" for expert in range(4)),
+        }
+    )
+
+    assert not evidence.has_child_biases(prefix, ("gate_proj", "up_proj"), 4)
+
+
+def test_moe_unindexed_child_bias_marks_rows(tmp_path: Path):
+    config = glm_moe_config({
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    })
+    prefix = "model.layers.1.mlp.experts"
+    keys = [
+        *awq_keys(f"{prefix}.gate_proj", bias=True),
+        *awq_keys(f"{prefix}.up_proj", bias=True),
+        *awq_keys(f"{prefix}.down_proj", bias=True),
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "1",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "32",
+        "--decode-concurrency",
+        "1",
+    )
+
+    rows = {
+        row["op"]: row for row in payload["moe"]
+        if row["scenario"] == "tp1"
+        and row["phase"] == "prefill"
+        and row["call_status"] == "actual_marlin"
+    }
+    assert rows["w13"]["has_bias"] is True
+    assert rows["w2"]["has_bias"] is True
+
+
+def test_moe_ep_uses_global_expert_count_for_bias_evidence(tmp_path: Path):
+    config = glm_moe_config({
+        "quant_method": "awq",
+        "bits": 4,
+        "group_size": 128,
+        "zero_point": True,
+    })
+    prefix = "model.layers.1.mlp.experts"
+    keys = [
+        key
+        for expert in range(4)
+        for name in ("gate_proj", "up_proj", "down_proj")
+        for key in awq_keys(f"{prefix}.{expert}.{name}", bias=True)
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "2",
+        "--ep-modes",
+        "tp_ep",
+        "--max-num-batched-tokens",
+        "32",
+        "--decode-concurrency",
+        "1",
+    )
+
+    rows = {
+        row["op"]: row for row in payload["moe"]
+        if row["scenario"] == "tp2+ep"
+        and row["phase"] == "prefill"
+        and row["call_status"] == "actual_marlin"
+    }
+    assert rows["w13"]["local_num_experts"] == 2
+    assert rows["w13"]["global_num_experts"] == 4
+    assert rows["w13"]["has_bias"] is True
+    assert rows["w2"]["local_num_experts"] == 2
+    assert rows["w2"]["global_num_experts"] == 4
+    assert rows["w2"]["has_bias"] is True
 
 
 def test_qwen_awq_dense_model_is_not_moe(tmp_path: Path):

@@ -39,6 +39,12 @@ checkpoint 可能在同一个模型里混合 FP8、NVFP4、MXFP4、BF16/FP16 未
 才输出 `actual_marlin`；BF16/FP16/未量化模块只输出
 `hypothetical_bf16`，用于 benchmark shape 参考。
 
+`has_bias` 也按 table row 判定，不按模型名或模型级任意 `.bias` key 判定。
+脚本只查看当前 Marlin candidate prefix 对应的 safetensors index 证据：
+qkv/gate_up 这类 fused row 需要所有 shard 的 `.bias` 都存在；MoE `w13`
+需要 gate/up bias 完整存在，`w2` 需要 down bias 存在。index 缺失、证据不完整、
+或只有无关模块 bias 时，`has_bias=false`。
+
 ## 开发目标
 
 工具设计目标：
@@ -208,6 +214,8 @@ shape 参考，`target_op` 为 `none`。关键字段：
 | `group_size` | 有效 group size；配置为 `-1` 时会展开为当前 `size_k`。 |
 | `quant_method` | 当前 row 的有效模块量化方法；BF16/FP16 推测行为 `unquantized`，模型级原始方法见顶层 `quantization`。 |
 | `quant_format` | `uint4`、`uint4b8`、`fp8_e4m3`、`nvfp4`、`mxfp4`、`bf16_or_fp16` 等。 |
+| `has_zp` | 当前 row 是否需要 zero point 输入。 |
+| `has_bias` | 当前 row 对应 Marlin op 是否应传入 `b_bias_or_none`；来自当前 candidate prefix 的完整 `.bias` index 证据。 |
 | `marlin_path` | 推断的量化/内核家族，例如 `awq_marlin_wna16`、`fp4_marlin`。 |
 | `call_status` | 当前模块是否真实走目标 Marlin op。 |
 | `warning` | 配置/index 不一致、配置推断、BF16 推测等提示。 |
@@ -228,6 +236,7 @@ Dense 字段外还包含：
 | `intermediate_size_per_partition` | TP/EP 后当前 GEMM 使用的 expert intermediate。 |
 
 脚本会聚合 shape 完全相同且量化判定相同的行，因此同一行可能代表多个层。
+`has_bias` 是聚合 key 的一部分，因此相同 MNK 但 bias 状态不同的 row 不会合并。
 需要逐层查看时，以 JSON 的 `layer_keys` 和 `call_count` 为准。
 
 ## call_status 判定语义

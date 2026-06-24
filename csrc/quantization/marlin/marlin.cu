@@ -27,42 +27,56 @@
 #include "core/registration.h"
 #include "core/scalar_type.hpp"
 
+template <bool HasBias>
 torch::Tensor sm70_marlin_u4b8_gemm(torch::Tensor& a, torch::Tensor& c,
                                     torch::Tensor& b_q_weight,
-                                    torch::Tensor& b_scales, int64_t size_m,
+                                    torch::Tensor& b_scales,
+                                    torch::Tensor& b_bias, int64_t size_m,
                                     int64_t size_n, int64_t size_k,
                                     int64_t group_size);
+template <bool HasBias>
 torch::Tensor sm70_marlin_u4_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zeros, int64_t size_m,
+                                  torch::Tensor& b_zeros,
+                                  torch::Tensor& b_bias, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size);
+template <bool HasBias>
 torch::Tensor sm70_marlin_u8_gemm(torch::Tensor& a, torch::Tensor& c,
                                   torch::Tensor& b_q_weight,
                                   torch::Tensor& b_scales,
-                                  torch::Tensor& b_zeros, int64_t size_m,
+                                  torch::Tensor& b_zeros,
+                                  torch::Tensor& b_bias, int64_t size_m,
                                   int64_t size_n, int64_t size_k,
                                   int64_t group_size);
+template <bool HasBias>
 torch::Tensor sm70_marlin_u8b128_gemm(torch::Tensor& a, torch::Tensor& c,
                                       torch::Tensor& b_q_weight,
-                                      torch::Tensor& b_scales, int64_t size_m,
+                                      torch::Tensor& b_scales,
+                                      torch::Tensor& b_bias, int64_t size_m,
                                       int64_t size_n, int64_t size_k,
                                       int64_t group_size);
+template <bool HasBias>
 torch::Tensor sm70_marlin_fp8_gemm(torch::Tensor& a, torch::Tensor& c,
                                    torch::Tensor& b_q_weight,
-                                   torch::Tensor& b_scales, int64_t size_m,
+                                   torch::Tensor& b_scales,
+                                   torch::Tensor& b_bias, int64_t size_m,
                                    int64_t size_n, int64_t size_k,
                                    int64_t group_size);
+template <bool HasBias>
 torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      torch::Tensor& b_q_weight,
                                      torch::Tensor& b_scales,
                                      torch::Tensor& global_scale,
-                                     int64_t size_m, int64_t size_n,
-                                     int64_t size_k, int64_t group_size);
+                                     torch::Tensor& b_bias, int64_t size_m,
+                                     int64_t size_n, int64_t size_k,
+                                     int64_t group_size);
+template <bool HasBias>
 torch::Tensor sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      torch::Tensor& b_q_weight,
-                                     torch::Tensor& b_scales, int64_t size_m,
+                                     torch::Tensor& b_scales,
+                                     torch::Tensor& b_bias, int64_t size_m,
                                      int64_t size_n, int64_t size_k,
                                      int64_t group_size);
 
@@ -294,6 +308,8 @@ torch::Tensor marlin_gemm(
     b_bias = b_bias_or_none.value();
     TORCH_CHECK(b_bias.device().is_cuda(), "b_bias is not on GPU");
     TORCH_CHECK(b_bias.is_contiguous(), "b_bias is not contiguous");
+    TORCH_CHECK(b_bias.scalar_type() == at::ScalarType::Half,
+                "SM70 Marlin bias must be float16.");
     TORCH_CHECK(b_bias.size(0) == size_n, "b_bias.size(0) != size_n");
     TORCH_CHECK(b_bias.stride(0) == 1, "b_bias.stride(0) != 1");
   } else {
@@ -354,8 +370,6 @@ torch::Tensor marlin_gemm(
 
   TORCH_CHECK(b_q_weight.scalar_type() == at::ScalarType::Int,
               "SM70 Marlin expects int32 packed weights.");
-  TORCH_CHECK(!has_bias,
-              "SM70 Marlin does not support bias. TODO: add epilogue bias fusion.");
   TORCH_CHECK((b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) ||
                   global_scale.numel() == 0,
               "SM70 Marlin supports global_scale only for "
@@ -374,8 +388,14 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(
         has_zp && is_zp_float,
         "SM70 Marlin uint4 dense path requires fp16 zero points.");
-    return sm70_marlin_u4_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size);
+    if (has_bias) {
+      return sm70_marlin_u4_gemm<true>(
+          a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+          group_size);
+    }
+    return sm70_marlin_u4_gemm<false>(
+        a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+        group_size);
   }
 
   if (b_type == vllm::kU8) {
@@ -384,8 +404,14 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(
         has_zp && is_zp_float,
         "SM70 Marlin uint8 dense path requires fp16 zero points.");
-    return sm70_marlin_u8_gemm(a, c, b_q_weight, b_scales, b_zeros, size_m,
-                               size_n, size_k, group_size);
+    if (has_bias) {
+      return sm70_marlin_u8_gemm<true>(
+          a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+          group_size);
+    }
+    return sm70_marlin_u8_gemm<false>(
+        a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+        group_size);
   }
 
   if (b_type == vllm::kU8B128) {
@@ -395,8 +421,14 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(!has_zp && !is_zp_float,
                 "SM70 Marlin uint8b128 does not support "
                 "zero-point metadata.");
-    return sm70_marlin_u8b128_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                                   size_k, group_size);
+    if (has_bias) {
+      return sm70_marlin_u8b128_gemm<true>(
+          a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+          group_size);
+    }
+    return sm70_marlin_u8b128_gemm<false>(
+        a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+        group_size);
   }
 
   if (b_type == vllm::kFE4M3fn) {
@@ -410,8 +442,14 @@ torch::Tensor marlin_gemm(
     TORCH_CHECK(!has_zp && !is_zp_float,
                 "SM70 Marlin fp8_e4m3 does not support zero-point "
                 "metadata.");
-    return sm70_marlin_fp8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                                size_k, group_size);
+    if (has_bias) {
+      return sm70_marlin_fp8_gemm<true>(
+          a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+          group_size);
+    }
+    return sm70_marlin_fp8_gemm<false>(
+        a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+        group_size);
   }
 
   if (b_type == vllm::kFE2M1f) {
@@ -428,8 +466,14 @@ torch::Tensor marlin_gemm(
                   "SM70 Marlin nvfp4 supports only group_size 16. "
                   "Got ",
                   group_size);
-      return sm70_marlin_nvfp4_gemm(a, c, b_q_weight, b_scales, global_scale,
-                                    size_m, size_n, size_k, group_size);
+      if (has_bias) {
+        return sm70_marlin_nvfp4_gemm<true>(
+            a, c, b_q_weight, b_scales, global_scale, b_bias, size_m, size_n,
+            size_k, group_size);
+      }
+      return sm70_marlin_nvfp4_gemm<false>(
+          a, c, b_q_weight, b_scales, global_scale, b_bias, size_m, size_n,
+          size_k, group_size);
     }
 
     TORCH_CHECK(s_type == vllm::kFE8M0fnu,
@@ -439,15 +483,26 @@ torch::Tensor marlin_gemm(
                 "SM70 Marlin mxfp4 supports only group_size 32 "
                 "when global_scale is not provided. Got ",
                 group_size);
-    return sm70_marlin_mxfp4_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                                  size_k, group_size);
+    if (has_bias) {
+      return sm70_marlin_mxfp4_gemm<true>(
+          a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+          group_size);
+    }
+    return sm70_marlin_mxfp4_gemm<false>(
+        a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+        group_size);
   }
 
   TORCH_CHECK(!has_zp && !is_zp_float,
               "SM70 Marlin uint4b8 does not support zero-point "
               "metadata.");
-  return sm70_marlin_u4b8_gemm(a, c, b_q_weight, b_scales, size_m, size_n,
-                               size_k, group_size);
+  if (has_bias) {
+    return sm70_marlin_u4b8_gemm<true>(
+        a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k,
+        group_size);
+  }
+  return sm70_marlin_u4b8_gemm<false>(
+      a, c, b_q_weight, b_scales, b_bias, size_m, size_n, size_k, group_size);
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {

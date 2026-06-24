@@ -145,6 +145,11 @@ class IndexEvidence:
         self.dtypes = dtypes or {}
         self._suffix_cache: dict[str, set[str]] = {}
         self._has_any_cache: dict[str, bool] = {}
+        self._bias_prefixes = (
+            {key[:-len(".bias")] for key in keys if key.endswith(".bias")}
+            if keys is not None else set()
+        )
+        self._child_bias_cache: dict[tuple[str, str], frozenset[int]] = {}
 
     @property
     def available(self) -> bool:
@@ -183,6 +188,56 @@ class IndexEvidence:
 
     def has_any_for_group(self, prefixes: list[str]) -> bool:
         return any(self.has_any_for_prefix(prefix) for prefix in prefixes)
+
+    def has_bias_for_prefix(self, prefix: str) -> bool:
+        if self.keys is None:
+            return False
+        return prefix in self._bias_prefixes
+
+    def _child_bias_expert_ids(self, prefix: str, name: str) -> frozenset[int]:
+        if self.keys is None:
+            return frozenset()
+        cache_key = (prefix, name)
+        if cache_key in self._child_bias_cache:
+            return self._child_bias_cache[cache_key]
+        prefix_dot = prefix + "."
+        exact = prefix_dot + name
+        suffix = "." + name
+        expert_ids: set[int] = set()
+        for bias_prefix in self._bias_prefixes:
+            if bias_prefix == exact:
+                expert_ids.add(-1)
+                continue
+            if not (
+                bias_prefix.startswith(prefix_dot) and bias_prefix.endswith(suffix)
+            ):
+                continue
+            middle = bias_prefix[len(prefix_dot):-len(suffix)]
+            if not middle:
+                expert_ids.add(-1)
+                continue
+            expert_token = middle.split(".", 1)[0]
+            try:
+                expert_ids.add(int(expert_token))
+            except ValueError:
+                continue
+        result = frozenset(expert_ids)
+        self._child_bias_cache[cache_key] = result
+        return result
+
+    def has_child_biases(
+        self, prefix: str, names: tuple[str, ...], global_expert_count: int
+    ) -> bool:
+        if self.keys is None or global_expert_count <= 0:
+            return False
+        child_sets = [self._child_bias_expert_ids(prefix, name) for name in names]
+        unindexed_ids = frozenset({-1})
+        if all(ids == unindexed_ids for ids in child_sets):
+            return True
+        expected_ids = frozenset(range(global_expert_count))
+        if all(ids == expected_ids for ids in child_sets):
+            return True
+        return False
 
     def _key_is_fp8_weight(self, key: str) -> bool:
         if not key.endswith(".weight"):
@@ -1081,6 +1136,66 @@ def _group_evidence_status(
     return "none"
 
 
+def _actual_evidence_group(
+    candidate: Candidate, evidence: IndexEvidence, qfmt: str
+) -> list[str] | None:
+    if not evidence.available:
+        return None
+    for group in candidate.prefix_groups:
+        suffixes_by_prefix = [evidence.suffixes_for_prefix(prefix) for prefix in group]
+        if not any(suffixes_by_prefix):
+            continue
+        if len(group) > 1 and not all(suffixes_by_prefix):
+            continue
+        if all(_suffixes_satisfy_quant(qfmt, suffixes) for suffixes in suffixes_by_prefix):
+            return group
+    return None
+
+
+def _dense_has_bias(
+    candidate: Candidate, evidence: IndexEvidence, decision: QuantDecision
+) -> bool:
+    if decision.call_status != "actual_marlin":
+        return False
+    group = _actual_evidence_group(candidate, evidence, decision.quant_format)
+    if group is None:
+        return False
+    return all(evidence.has_bias_for_prefix(prefix) for prefix in group)
+
+
+def _moe_has_bias(
+    candidate: Candidate, evidence: IndexEvidence, decision: QuantDecision,
+    op: str, global_expert_count: int,
+) -> bool:
+    if decision.call_status != "actual_marlin":
+        return False
+    group = _actual_evidence_group(candidate, evidence, decision.quant_format)
+    if group is None:
+        return False
+    if len(group) == 3:
+        if op == "w13":
+            return all(evidence.has_bias_for_prefix(prefix) for prefix in group[:2])
+        return evidence.has_bias_for_prefix(group[2])
+    if len(group) == 1:
+        prefix = group[0]
+        if op == "w13":
+            return (
+                evidence.has_child_biases(
+                    prefix, ("gate_proj", "up_proj"), global_expert_count
+                )
+                or evidence.has_child_biases(
+                    prefix, ("w1", "w3"), global_expert_count
+                )
+            )
+        return (
+            evidence.has_child_biases(
+                prefix, ("down_proj",), global_expert_count
+            )
+            or evidence.has_child_biases(prefix, ("w2",), global_expert_count)
+        )
+    return False
+
+
 def decide_quant(candidate: Candidate, spec: ModelSpec,
                  evidence: IndexEvidence) -> QuantDecision:
     quant = spec.quant
@@ -1262,6 +1377,7 @@ def enumerate_dense_rows(spec: ModelSpec, evidence: IndexEvidence,
                 "quant_method": spec.quant.method,
                 "quant_format": "router",
                 "has_zp": False,
+                "has_bias": False,
                 "marlin_path": "none",
                 "call_status": "skipped",
                 "description": (
@@ -1294,6 +1410,7 @@ def enumerate_dense_rows(spec: ModelSpec, evidence: IndexEvidence,
                         "quant_format": "unknown",
                         "group_size": None,
                         "has_zp": False,
+                        "has_bias": False,
                         "marlin_path": "none",
                         "call_status": "skipped",
                         "description": f"shape_error: {exc}",
@@ -1321,6 +1438,7 @@ def enumerate_dense_rows(spec: ModelSpec, evidence: IndexEvidence,
                     "quant_method": decision.quant_method,
                     "quant_format": decision.quant_format,
                     "has_zp": decision.has_zp,
+                    "has_bias": _dense_has_bias(candidate, evidence, decision),
                     "marlin_path": decision.marlin_path,
                     "call_status": decision.call_status,
                     "description": (
@@ -1387,6 +1505,9 @@ def enumerate_moe_rows(spec: ModelSpec, evidence: IndexEvidence,
                         "quant_method": decision.quant_method,
                         "quant_format": decision.quant_format,
                         "has_zp": decision.has_zp,
+                        "has_bias": _moe_has_bias(
+                            candidate, evidence, decision, op, spec.num_experts
+                        ),
                         "marlin_path": decision.marlin_path,
                         "local_num_experts": local_num_experts,
                         "global_num_experts": spec.num_experts,
@@ -1573,12 +1694,13 @@ def print_pretty(payload: dict[str, Any]) -> None:
     dense_columns = [
         "scenario", "phase", "layer_key", "op", "target_op", "size_m",
         "size_n", "size_k", "group_size", "quant_method", "quant_format",
-        "has_zp", "marlin_path", "call_status", "call_count", "warning",
+        "has_zp", "has_bias", "marlin_path", "call_status", "call_count",
+        "warning",
     ]
     moe_columns = [
         "scenario", "phase", "layer_key", "op", "target_op",
         "moe_block_size", "top_k", "size_m", "size_n", "size_k", "group_size",
-        "quant_method", "quant_format", "has_zp", "marlin_path",
+        "quant_method", "quant_format", "has_zp", "has_bias", "marlin_path",
         "local_num_experts", "global_num_experts",
         "intermediate_size_per_partition", "call_status", "call_count",
         "warning",

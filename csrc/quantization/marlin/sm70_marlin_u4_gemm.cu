@@ -406,16 +406,21 @@ using Sm70U4ZpGemmTraits =
                          CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
                          GroupSize, PackedMacroN>;
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
+template <bool HasBias, int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
           int WarpN, int WarpK, int GroupSize, int PackedMacroN,
-          bool UseMetadataVectorWords = true>
+          bool UseMetadataVectorWords = true, typename... BiasArgs>
 __global__ __launch_bounds__(Warps * 32, 1)
 void sm70_marlin_u4_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     cutlass::half_t const* __restrict__ b_scales,
     cutlass::half_t const* __restrict__ b_zeros,
-    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
+    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda,
+    BiasArgs... bias_args) {
+  static_assert(!HasBias || sizeof...(BiasArgs) == 1,
+                "HasBias=true expects one bias pointer.");
+  static_assert(HasBias || sizeof...(BiasArgs) == 0,
+                "HasBias=false expects no bias pointer.");
   using Traits = Sm70U4ZpGemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
                                     WarpN, WarpK, GroupSize, PackedMacroN,
                                     UseMetadataVectorWords>;
@@ -455,16 +460,26 @@ void sm70_marlin_u4_gemm_kernel(
   int const gemm_k_iterations = (k + CtaK - 1) / CtaK;
   mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
 
-  typename Traits::OutputOp output_op({1.0f, 0.0f});
-  typename Epilogue::OutputTileIterator iterator_C(
-      typename Epilogue::OutputTileIterator::Params(layout_c), c,
-      cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
-  typename Epilogue::OutputTileIterator iterator_D(
-      typename Epilogue::OutputTileIterator::Params(layout_c), c,
-      cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
-
-  Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
-  epilogue(output_op, iterator_D, accumulators, iterator_C);
+  if constexpr (HasBias) {
+    using BiasEpilogue = marlin::sm70::Sm70BiasFp16Epilogue<Traits>;
+    typename BiasEpilogue::OutputTileIterator iterator_D(
+        typename BiasEpilogue::OutputTileIterator::Params(layout_c), c,
+        cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
+    BiasEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx,
+                          lane_idx);
+    epilogue(iterator_D, accumulators, c,
+             marlin::sm70::sm70_marlin_bias_arg(bias_args...), n);
+  } else {
+    typename Traits::OutputOp output_op({1.0f, 0.0f});
+    typename Epilogue::OutputTileIterator iterator_C(
+        typename Epilogue::OutputTileIterator::Params(layout_c), c,
+        cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
+    typename Epilogue::OutputTileIterator iterator_D(
+        typename Epilogue::OutputTileIterator::Params(layout_c), c,
+        cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
+    Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
+    epilogue(output_op, iterator_D, accumulators, iterator_C);
+  }
 }
 
 template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
@@ -534,34 +549,53 @@ void sm70_marlin_u4_gemm_splitk_kernel(
 
 }  // namespace
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
+template <bool HasBias, int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
           int WarpN, int WarpK, int GroupSize, int PackedMacroN,
           bool UseMetadataVectorWords = true>
 torch::Tensor launch_sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int requested_split_k) {
-  auto kernel = sm70_marlin_u4_gemm_kernel<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
-                                           GroupSize, PackedMacroN,
-                                           UseMetadataVectorWords>;
+    torch::Tensor& b_scales, torch::Tensor& b_zeros, torch::Tensor& b_bias,
+    int64_t size_m, int64_t size_n, int64_t size_k, int requested_split_k) {
   using SharedStorage = typename Sm70U4ZpGemmTraits<
       CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
       PackedMacroN, UseMetadataVectorWords>::SharedStorage;
-  size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
   if (requested_split_k == 1) {
     dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
-    kernel<<<grid, block, smem_bytes, stream>>>(
-        reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
-        reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
-        reinterpret_cast<cutlass::half_t const*>(
-            b_scales.data_ptr<at::Half>()),
-        reinterpret_cast<cutlass::half_t const*>(b_zeros.data_ptr<at::Half>()),
-        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
-        static_cast<int>(size_m), static_cast<int>(size_n),
-        static_cast<int>(size_k), static_cast<int>(a.stride(0)));
+    if constexpr (HasBias) {
+      auto kernel = sm70_marlin_u4_gemm_kernel<
+          HasBias, CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
+          PackedMacroN, UseMetadataVectorWords, cutlass::half_t const*>;
+      size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
+      kernel<<<grid, block, smem_bytes, stream>>>(
+          reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
+          reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
+          reinterpret_cast<cutlass::half_t const*>(
+              b_scales.data_ptr<at::Half>()),
+          reinterpret_cast<cutlass::half_t const*>(
+              b_zeros.data_ptr<at::Half>()),
+          reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+          static_cast<int>(size_m), static_cast<int>(size_n),
+          static_cast<int>(size_k), static_cast<int>(a.stride(0)),
+          reinterpret_cast<cutlass::half_t const*>(b_bias.data_ptr<at::Half>()));
+    } else {
+      auto kernel = sm70_marlin_u4_gemm_kernel<
+          HasBias, CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
+          PackedMacroN, UseMetadataVectorWords>;
+      size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
+      kernel<<<grid, block, smem_bytes, stream>>>(
+          reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
+          reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
+          reinterpret_cast<cutlass::half_t const*>(
+              b_scales.data_ptr<at::Half>()),
+          reinterpret_cast<cutlass::half_t const*>(
+              b_zeros.data_ptr<at::Half>()),
+          reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+          static_cast<int>(size_m), static_cast<int>(size_n),
+          static_cast<int>(size_k), static_cast<int>(a.stride(0)));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return c;
   }
@@ -575,12 +609,19 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
       sm70_marlin_u4_gemm_splitk_kernel<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
                                         WarpK, GroupSize, PackedMacroN,
                                         UseMetadataVectorWords>;
-  smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
+  size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
-  int64_t const numel = size_m * size_n;
-  C10_CUDA_CHECK(cudaMemsetAsync(
-      c.data_ptr<at::Half>(), 0,
-      static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  if constexpr (HasBias) {
+    marlin::sm70::launch_sm70_marlin_dense_bias_init(
+        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+        reinterpret_cast<cutlass::half_t const*>(b_bias.data_ptr<at::Half>()),
+        size_m, size_n, stream);
+  } else {
+    int64_t const numel = size_m * size_n;
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        c.data_ptr<at::Half>(), 0,
+        static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  }
 
   dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
@@ -599,13 +640,14 @@ torch::Tensor launch_sm70_marlin_u4_gemm(
   return c;
 }
 
-template <bool UseMetadataVectorWords = true>
+template <bool HasBias, bool UseMetadataVectorWords = true>
 struct Sm70U4Launcher {
   torch::Tensor& a;
   torch::Tensor& c;
   torch::Tensor& b_q_weight;
   torch::Tensor& b_scales;
   torch::Tensor& b_zeros;
+  torch::Tensor& b_bias;
   int64_t size_m;
   int64_t size_n;
   int64_t size_k;
@@ -614,17 +656,19 @@ struct Sm70U4Launcher {
   template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
             int WarpN, int WarpK, int GroupSize, int PackedMacroN>
   torch::Tensor operator()() const {
-    return launch_sm70_marlin_u4_gemm<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
+    return launch_sm70_marlin_u4_gemm<HasBias, CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
                                       GroupSize, PackedMacroN,
                                       UseMetadataVectorWords>(
-        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n, size_k, requested_split_k);
+        a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+        requested_split_k);
   }
 };
 
+template <bool HasBias>
 torch::Tensor sm70_marlin_u4_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zeros, int64_t size_m,
-    int64_t size_n, int64_t size_k, int64_t group_size) {
+    torch::Tensor& b_scales, torch::Tensor& b_zeros, torch::Tensor& b_bias,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params =
@@ -634,15 +678,24 @@ torch::Tensor sm70_marlin_u4_gemm(
   validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin uint4", geometry);
   validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin uint4", geometry, size_n);
   if (params.use_metadata_vector_words) {
-    Sm70U4Launcher<true> const launcher{
-        a, c, b_q_weight, b_scales, b_zeros, size_m, size_n,
-        size_k, params.requested_split_k};
+    Sm70U4Launcher<HasBias, true> const launcher{
+        a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+        params.requested_split_k};
     return dispatch_sm70_marlin_geometry(
         launcher, geometry, params.packed_macro_n, group_size, "uint4");
   }
-  Sm70U4Launcher<false> const launcher{
-      a, c, b_q_weight, b_scales, b_zeros, size_m, size_n,
-      size_k, params.requested_split_k};
+  Sm70U4Launcher<HasBias, false> const launcher{
+      a, c, b_q_weight, b_scales, b_zeros, b_bias, size_m, size_n, size_k,
+      params.requested_split_k};
   return dispatch_sm70_marlin_geometry(
       launcher, geometry, params.packed_macro_n, group_size, "uint4");
 }
+
+template torch::Tensor sm70_marlin_u4_gemm<false>(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& b_zeros, torch::Tensor& b_bias,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);
+template torch::Tensor sm70_marlin_u4_gemm<true>(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& b_zeros, torch::Tensor& b_bias,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);

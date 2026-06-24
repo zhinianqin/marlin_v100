@@ -14,6 +14,7 @@
 #include <type_traits>
 
 #include "quantization/marlin/sm70_marlin_common.cuh"
+#include "quantization/marlin/sm70_marlin_bias.cuh"
 #include "quantization/marlin/sm70_marlin_gemm.cuh"
 #include "quantization/marlin/sm70_marlin_mma.cuh"
 #include "quantization/marlin/sm70_marlin_splitk.cuh"
@@ -2763,7 +2764,7 @@ struct Sm70MarlinMoeGemmTraits {
   };
 };
 
-template <typename Traits>
+template <typename Traits, bool HasBias>
 class Sm70MoeScatterEpilogue {
  public:
   using CutlassEpilogue = typename Traits::Epilogue;
@@ -2780,16 +2781,23 @@ class Sm70MoeScatterEpilogue {
   WarpTileIterator warp_tile_iterator_;
   SharedLoadIterator shared_load_iterator_;
 
+  template <typename... BiasArgs>
   CUTLASS_DEVICE
   void store_fragment(OutputTileIterator const& destination_iterator,
                       typename SharedLoadIterator::Fragment const& frag,
                       int32_t const* __restrict__ sorted_token_ids,
+                      int expert,
                       float const* __restrict__ topk_weights,
                       cutlass::half_t* __restrict__ c,
                       int n, int moe_block, int local_m_offset,
                       int moe_block_size, int expanded_token_count,
                       int padded_tokens, bool mul_topk_weights,
-                      bool atomic_store, float output_scale) const {
+                      bool atomic_store, float output_scale,
+                      BiasArgs... bias_args) const {
+    static_assert(!HasBias || sizeof...(BiasArgs) == 1,
+                  "HasBias=true expects one bias pointer.");
+    static_assert(HasBias || sizeof...(BiasArgs) == 0,
+                  "HasBias=false expects no bias pointer.");
     float const* frag_ptr = reinterpret_cast<float const*>(&frag);
     half* c_half = reinterpret_cast<half*>(c);
     int const thread_start_row = destination_iterator.thread_start_row();
@@ -2835,10 +2843,24 @@ class Sm70MoeScatterEpilogue {
             if (valid_row) {
               CUTLASS_PRAGMA_UNROLL
               for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
+                int const logical_col = logical_column_base + e;
                 int64_t const offset =
-                    int64_t(sorted_id) * n + logical_column_base + e;
-                float const value =
-                    frag_ptr[frag_base + e] * route_scale * output_scale;
+                    int64_t(sorted_id) * n + logical_col;
+                float value = frag_ptr[frag_base + e] * output_scale;
+                if constexpr (HasBias) {
+                  auto const* b_bias =
+                      marlin::sm70::sm70_marlin_bias_arg(bias_args...);
+                  float bias = __half2float(
+                      reinterpret_cast<half const*>(b_bias)[
+                          int64_t(expert) * n +
+                          marlin::sm70::sm70_marlin_bias_storage_index(
+                              logical_col)]);
+                  if (mul_topk_weights) {
+                    bias *= output_scale;
+                  }
+                  value += bias;
+                }
+                value *= route_scale;
                 if (atomic_store) {
                   atomicAdd(c_half + offset, __float2half_rn(value));
                 } else {
@@ -2868,16 +2890,19 @@ class Sm70MoeScatterEpilogue {
     warp_tile_iterator_.add_tile_offset(warp_offset);
   }
 
+  template <typename... BiasArgs>
   CUTLASS_DEVICE
   void operator()(OutputTileIterator destination_iterator,
                   AccumulatorTile const& accumulators,
                   int32_t const* __restrict__ sorted_token_ids,
+                  int expert,
                   float const* __restrict__ topk_weights,
                   cutlass::half_t* __restrict__ c,
                   int n, int moe_block, int local_m_offset,
                   int moe_block_size, int expanded_token_count,
                   int padded_tokens, bool mul_topk_weights,
-                  bool atomic_store, float output_scale = 1.0f) {
+                  bool atomic_store, float output_scale = 1.0f,
+                  BiasArgs... bias_args) {
     AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
 
     CUTLASS_PRAGMA_UNROLL
@@ -2913,16 +2938,16 @@ class Sm70MoeScatterEpilogue {
       }
 
       store_fragment(destination_iterator, aligned_accum_fragment,
-                     sorted_token_ids, topk_weights, c, n, moe_block,
+                     sorted_token_ids, expert, topk_weights, c, n, moe_block,
                      local_m_offset, moe_block_size, expanded_token_count,
                      padded_tokens, mul_topk_weights, atomic_store,
-                     output_scale);
+                     output_scale, bias_args...);
       ++destination_iterator;
     }
   }
 };
 
-template <typename Traits, bool SplitK>
+template <typename Traits, bool SplitK, bool HasBias, typename... BiasArgs>
 __global__ __launch_bounds__(Traits::MmaCore::kThreads, 1)
 void sm70_marlin_moe_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
@@ -2935,9 +2960,14 @@ void sm70_marlin_moe_gemm_kernel(
     int32_t const* __restrict__ expert_ids,
     int32_t const* __restrict__ num_tokens_past_padded,
     float const* __restrict__ topk_weights, int moe_block_size, int top_k,
-    bool mul_topk_weights, int m, int n, int k, int lda, int requested_split_k) {
+    bool mul_topk_weights, int m, int n, int k, int lda,
+    int requested_split_k, BiasArgs... bias_args) {
+  static_assert(!HasBias || sizeof...(BiasArgs) == 1,
+                "HasBias=true expects one bias pointer.");
+  static_assert(HasBias || sizeof...(BiasArgs) == 0,
+                "HasBias=false expects no bias pointer.");
   using Mma = typename Traits::Mma;
-  using Epilogue = Sm70MoeScatterEpilogue<Traits>;
+  using Epilogue = Sm70MoeScatterEpilogue<Traits, HasBias>;
   constexpr int CtaM = Traits::ThreadblockShape::kM;
   constexpr int CtaN = Traits::ThreadblockShape::kN;
   constexpr int CtaK = Traits::ThreadblockShape::kK;
@@ -3008,15 +3038,16 @@ void sm70_marlin_moe_gemm_kernel(
     output_scale = global_scale[expert];
   }
   Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
-  epilogue(iterator_D, accumulators, sorted_token_ids, topk_weights, c, n,
+  epilogue(iterator_D, accumulators, sorted_token_ids, expert, topk_weights, c, n,
            moe_block, local_m_offset, moe_block_size, m * top_k,
-           padded_tokens, mul_topk_weights, SplitK, output_scale);
+           padded_tokens, mul_topk_weights, SplitK, output_scale,
+           bias_args...);
 }
 
-template <typename Traits>
+template <typename Traits, bool HasBias>
 torch::Tensor launch_sm70_marlin_moe_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& b_zeros,
+    torch::Tensor& b_scales, torch::Tensor& b_zeros, torch::Tensor& b_bias,
     torch::Tensor& global_scale, torch::Tensor& sorted_token_ids,
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
@@ -3029,8 +3060,6 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
   constexpr int CtaN = Traits::ThreadblockShape::kN;
   constexpr int CtaK = Traits::ThreadblockShape::kK;
 
-  auto kernel = sm70_marlin_moe_gemm_kernel<Traits, false>;
-  size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
   dim3 block(Warps * 32);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
@@ -3047,16 +3076,38 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
       global_scale.numel() == 0 ? nullptr : global_scale.data_ptr<float>();
 
   if (requested_split_k == 1) {
-    kernel<<<grid, block, smem_bytes, stream>>>(
-        reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
-        reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
-        b_scales_ptr, b_zeros_ptr, global_scale_ptr,
-        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
-        sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
-        num_tokens_past_padded.data_ptr<int32_t>(),
-        topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
-        mul_topk_weights, int(size_m), int(size_n), int(size_k),
-        int(a.stride(0)), requested_split_k);
+    if constexpr (HasBias) {
+      auto kernel = sm70_marlin_moe_gemm_kernel<
+          Traits, false, HasBias, cutlass::half_t const*>;
+      size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
+      kernel<<<grid, block, smem_bytes, stream>>>(
+          reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
+          reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
+          b_scales_ptr, b_zeros_ptr, global_scale_ptr,
+          reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+          sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(),
+          num_tokens_past_padded.data_ptr<int32_t>(),
+          topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
+          mul_topk_weights, int(size_m), int(size_n), int(size_k),
+          int(a.stride(0)), requested_split_k,
+          reinterpret_cast<cutlass::half_t const*>(
+              b_bias.data_ptr<at::Half>()));
+    } else {
+      auto kernel = sm70_marlin_moe_gemm_kernel<Traits, false, HasBias>;
+      size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
+      kernel<<<grid, block, smem_bytes, stream>>>(
+          reinterpret_cast<cutlass::half_t const*>(a.data_ptr<at::Half>()),
+          reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
+          b_scales_ptr, b_zeros_ptr, global_scale_ptr,
+          reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+          sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(),
+          num_tokens_past_padded.data_ptr<int32_t>(),
+          topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
+          mul_topk_weights, int(size_m), int(size_n), int(size_k),
+          int(a.stride(0)), requested_split_k);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return c;
   }
@@ -3066,13 +3117,25 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
               " for requested_split_k > 1. Got K=", size_k,
               ", requested_split_k=", requested_split_k, ".");
 
-  auto split_kernel = sm70_marlin_moe_gemm_kernel<Traits, true>;
-  smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
+  auto split_kernel = sm70_marlin_moe_gemm_kernel<Traits, true, false>;
+  size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
-  int64_t const numel = size_m * top_k * size_n;
-  C10_CUDA_CHECK(cudaMemsetAsync(
-      c.data_ptr<at::Half>(), 0,
-      static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  if constexpr (HasBias) {
+    marlin::sm70::launch_sm70_marlin_moe_bias_init(
+        reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
+        reinterpret_cast<cutlass::half_t const*>(b_bias.data_ptr<at::Half>()),
+        Spec::kUsesGlobalScale ? global_scale_ptr : nullptr,
+        sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
+        num_tokens_past_padded.data_ptr<int32_t>(),
+        topk_weights.data_ptr<float>(), static_cast<int>(sorted_token_ids.numel()),
+        static_cast<int>(size_n), static_cast<int>(moe_block_size),
+        static_cast<int>(size_m * top_k), mul_topk_weights, stream);
+  } else {
+    int64_t const numel = size_m * top_k * size_n;
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        c.data_ptr<at::Half>(), 0,
+        static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  }
 
   int const active_split_k =
       sm70_active_split_k(static_cast<int>(size_k), requested_split_k, CtaK);

@@ -12,7 +12,7 @@ fi
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
 export PATH="$ROOT_DIR/.venv/bin:$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export MAX_JOBS="${MAX_JOBS:-8}"
+export MAX_JOBS="${MAX_JOBS:-$(nproc)}"
 export NVCC_THREADS="${NVCC_THREADS:-1}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.0}"
 export PYTHONPATH="$ROOT_DIR"

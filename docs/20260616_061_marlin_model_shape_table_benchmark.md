@@ -7,6 +7,15 @@
 的去重行做 runtime benchmark，并使用 synthetic tensor 构造输入，不读取 checkpoint
 tensor payload。
 
+shape table row 中的 `has_bias` 会直接决定 benchmark 输入构造：
+
+- `has_bias=false`：在 `b_bias_or_none` 位置传 `None`，保持旧无 bias 路径。
+- `has_bias=true`：构造 synthetic fp16 `raw_bias`，传入
+  `marlin_permute_bias(raw_bias)`，reference 使用未 permute 的 `raw_bias` 计算。
+- Dense reference 为 `matmul + raw_bias`。
+- MoE 当前 model-shape helper 使用 `mul_topk_weights=false`，stage1/stage2
+  reference 都按 routed expert 加对应 `raw_bias[expert]`。
+
 如果你想看对应的 pytest 校验说明，可以先读：
 `docs/20260615_060_marlin_model_shape_table_test_usage.md`。
 
@@ -109,3 +118,7 @@ env combo 枚举。`MARLIN_EXHAUSTIVE_ENV_START` 和 `MARLIN_EXHAUSTIVE_ENV_LIMI
 ```text
 checked=<n> ok=<n> rejected=<n> unsupported=<n> err=<n>
 ```
+
+CSV 输出包含 `has_bias` 列，值为 `true` / `false`，用于确认某个 benchmark row
+实际覆盖的是 bias 还是 no-bias Marlin 路径。unique actual row 去重也包含
+`has_bias`，因此相同 shape 的 bias/no-bias row 会分别执行。

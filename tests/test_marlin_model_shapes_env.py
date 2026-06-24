@@ -40,6 +40,7 @@ from tests.helpers import (
     _quantize_unsigned_with_bias,
     fp4_e2m1_weight_to_marlin_weight,
     fp8_weight_to_marlin_weight,
+    marlin_permute_bias,
     marlin_permute_scales,
     moe_align_block_size,
     scalar_types,
@@ -81,6 +82,7 @@ _DENSE_ROW_KEYS = (
     "quant_method",
     "quant_format",
     "has_zp",
+    "has_bias",
     "marlin_path",
     "call_status",
     "call_count",
@@ -283,6 +285,7 @@ def _validate_row_schema(payload: dict[str, Any]) -> None:
 def _assert_pretty_output(payload: dict[str, Any], output: str) -> None:
     for needle in ("Model:", "Config:", "Warnings:", "Dense table", "MoE table"):
         assert needle in output
+    assert "has_bias" in output
     if not payload["dense"]:
         assert "Dense table\n  (no rows)" in output
     if not payload["moe"]:
@@ -652,9 +655,11 @@ def _moe_stage1_reference_fast(inputs: dict[str, object]) -> torch.Tensor:
     tokens = int(inputs["tokens"])
     topk = int(inputs["topk"])
     dequantized = inputs["w1_dequant"]
+    bias = inputs.get("w1_bias_raw")
     assert isinstance(hidden_states, torch.Tensor)
     assert isinstance(topk_ids, torch.Tensor)
     assert isinstance(dequantized, list)
+    assert bias is None or isinstance(bias, torch.Tensor)
     route_count = tokens * topk
     flat_topk_ids = topk_ids.reshape(route_count)
     route_token_ids = (
@@ -676,6 +681,8 @@ def _moe_stage1_reference_fast(inputs: dict[str, object]) -> torch.Tensor:
             hidden_states.index_select(0, token_indices).to(torch.float32),
             dequantized[expert].to(torch.float32),
         )
+        if bias is not None:
+            expert_output = expert_output + bias[expert].to(torch.float32)
         output.index_copy_(0, route_indices, expert_output)
     return output.to(torch.float16)
 
@@ -691,8 +698,10 @@ def _moe_stage2_inputs_and_reference_fast(
     experts = int(inputs["experts"])
     topk_ids = inputs["topk_ids"]
     dequantized = inputs["w2_dequant"]
+    bias = inputs.get("w2_bias_raw")
     assert isinstance(topk_ids, torch.Tensor)
     assert isinstance(dequantized, list)
+    assert bias is None or isinstance(bias, torch.Tensor)
     activation = torch.randn(
         (tokens * topk, intermediate), device="cuda", dtype=torch.float16
     )
@@ -721,6 +730,8 @@ def _moe_stage2_inputs_and_reference_fast(
             activation.index_select(0, route_indices).to(torch.float32),
             dequantized[expert].to(torch.float32),
         )
+        if bias is not None:
+            expert_output = expert_output + bias[expert].to(torch.float32)
         reference.index_copy_(0, route_indices, expert_output)
     reference = reference.to(torch.float16)
     return activation, stage2_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference
@@ -772,6 +783,14 @@ def _moe_stage1_runtime_case(row: dict[str, Any]) -> _MoeStage1RuntimeCase:
             "w1_g_idx": quantized["g_idx"],
             "w1_perm": quantized["perm"],
         }
+        if bool(row.get("has_bias", False)):
+            raw_bias = torch.randn(
+                (key.experts, 2 * key.intermediate),
+                device="cuda",
+                dtype=torch.float16,
+            )
+            inputs["w1_bias_raw"] = raw_bias
+            inputs["w1_bias"] = marlin_permute_bias(raw_bias)
         reference = _moe_stage1_reference_fast(inputs)
         return key, inputs, reference, rtol, atol
     except (AssertionError, KeyError, ValueError, RuntimeError, TypeError) as exc:
@@ -826,6 +845,14 @@ def _moe_stage2_runtime_case(
             "w2_g_idx": quantized["g_idx"],
             "w2_perm": quantized["perm"],
         }
+        if bool(row.get("has_bias", False)):
+            raw_bias = torch.randn(
+                (key.experts, key.hidden),
+                device="cuda",
+                dtype=torch.float16,
+            )
+            inputs["w2_bias_raw"] = raw_bias
+            inputs["w2_bias"] = marlin_permute_bias(raw_bias)
         activation, topk_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference = (
             _moe_stage2_inputs_and_reference_fast(inputs, moe_block_size=moe_block_size)
         )
@@ -902,6 +929,7 @@ def _unique_actual_dense_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
             key.size_m,
             key.size_n,
             key.size_k,
+            bool(row.get("has_bias", False)),
         )
         if marker in seen:
             continue
@@ -928,6 +956,7 @@ def _unique_actual_moe_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
             key.intermediate,
             key.experts,
             key.topk,
+            bool(row.get("has_bias", False)),
         )
         if marker in seen:
             continue
@@ -939,7 +968,20 @@ def _unique_actual_moe_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def _make_dense_runtime_case(row: dict[str, Any]) -> tuple[DenseDirectOpKey, tuple]:
     key = _dense_key_from_row(row)
     try:
-        return key, _make_dense_env_sweep_case(key)
+        args, output, reference, rtol, atol = _make_dense_env_sweep_case(key)
+        if bool(row.get("has_bias", False)):
+            raw_bias = torch.randn(
+                (key.size_n,),
+                device="cuda",
+                dtype=torch.float16,
+            )
+            args_list = list(args)
+            args_list[3] = marlin_permute_bias(raw_bias)
+            args = tuple(args_list)
+            reference = (reference.to(torch.float32) + raw_bias.to(torch.float32)).to(
+                torch.float16
+            )
+        return key, (args, output, reference, rtol, atol)
     except (AssertionError, KeyError, ValueError) as exc:
         raise AssertionError(
             "dense helper does not support actual row: "
@@ -1002,6 +1044,156 @@ def _make_moe_runtime_case(row: dict[str, Any]) -> tuple[MoeDirectOpKey, Callabl
     return key, run
 
 
+def _dense_bias_smoke_row() -> dict[str, Any]:
+    return {
+        "model": "synthetic",
+        "scenario": "tp1",
+        "phase": "smoke",
+        "layer_key": "model.layers.0.mlp.gate_up_proj",
+        "op": "gate_up_proj",
+        "target_op": "ops.marlin_gemm",
+        "size_m": 4,
+        "size_n": 128,
+        "size_k": 128,
+        "group_size": 128,
+        "quant_method": "gptq",
+        "quant_format": "uint4b8",
+        "has_zp": False,
+        "has_bias": True,
+        "marlin_path": "wna16_marlin",
+        "call_status": "actual_marlin",
+        "call_count": 1,
+    }
+
+
+def _moe_bias_smoke_row(op: str) -> dict[str, Any]:
+    if op == "w13":
+        size_m = 4
+        size_n = 256
+        size_k = 128
+        top_k = 2
+    else:
+        size_m = 8
+        size_n = 128
+        size_k = 128
+        top_k = 1
+    return {
+        "model": "synthetic",
+        "scenario": "tp1",
+        "phase": "smoke",
+        "layer_key": "model.layers.0.mlp.experts",
+        "op": op,
+        "target_op": "ops.moe_wna16_marlin_gemm",
+        "moe_block_size": 16,
+        "top_k": top_k,
+        "size_m": size_m,
+        "size_n": size_n,
+        "size_k": size_k,
+        "group_size": 128,
+        "quant_method": "gptq",
+        "quant_format": "uint4b8",
+        "has_zp": False,
+        "has_bias": True,
+        "marlin_path": "wna16_marlin",
+        "local_num_experts": 4,
+        "global_num_experts": 4,
+        "intermediate_size_per_partition": 128,
+        "call_status": "actual_marlin",
+        "call_count": 1,
+    }
+
+
+def test_model_shape_dense_bias_runtime_helper_matches_reference() -> None:
+    row = _dense_bias_smoke_row()
+    key, prepared = _make_dense_runtime_case(row)
+    args, output, reference, rtol, atol = prepared
+    assert args[3] is not None
+
+    legal_combo = next(
+        (geometry, split_k, metadata_cache)
+        for geometry, split_k, metadata_cache in iter_env_combinations()
+        if dense_env_combo_is_legal(
+            geometry,
+            split_k,
+            size_n=key.size_n,
+            size_k=key.size_k,
+        )
+    )
+    with dense_env(*legal_combo):
+        _assert_dense_env_sweep_combo_matches_reference(
+            key,
+            args,
+            output,
+            reference,
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+def test_model_shape_moe_bias_runtime_helpers_match_reference() -> None:
+    _require_moe_cuda()
+
+    stage1_row = _moe_bias_smoke_row("w13")
+    key, inputs, reference, rtol, atol = _moe_stage1_runtime_case(stage1_row)
+    assert inputs["w1_bias"] is not None
+    legal_stage1 = next(
+        (geometry, split_k, metadata_cache)
+        for geometry, split_k, metadata_cache in iter_moe_env_combinations()
+        if moe_stage_env_combo_is_legal(
+            geometry,
+            size_n=2 * key.intermediate,
+            size_k=key.hidden,
+        )
+    )
+    with moe_env(*legal_stage1):
+        _run_moe_env_stage1_combo(
+            key,
+            inputs,
+            moe_block_size=int(stage1_row["moe_block_size"]),
+            reference=reference,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    stage2_row = _moe_bias_smoke_row("w2")
+    (
+        key,
+        inputs,
+        activation,
+        topk_weights,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        reference,
+        rtol,
+        atol,
+    ) = _moe_stage2_runtime_case(stage2_row)
+    assert inputs["w2_bias"] is not None
+    legal_stage2 = next(
+        (geometry, split_k, metadata_cache)
+        for geometry, split_k, metadata_cache in iter_moe_env_combinations()
+        if moe_stage_env_combo_is_legal(
+            geometry,
+            size_n=key.hidden,
+            size_k=key.intermediate,
+        )
+    )
+    with moe_env(*legal_stage2):
+        _run_moe_env_stage2_combo(
+            key,
+            inputs,
+            activation=activation,
+            topk_weights=topk_weights,
+            sorted_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_pad=num_tokens_post_pad,
+            moe_block_size=int(stage2_row["moe_block_size"]),
+            reference=reference,
+            rtol=rtol,
+            atol=atol,
+        )
+
+
 def _selected_env_summary(rows: list[dict[str, Any]], combos_per_row: int) -> tuple[int, int, int | None]:
     start, limit = exhaustive_start_limit()
     possible = len(rows) * combos_per_row
@@ -1027,7 +1219,8 @@ def _dense_row_progress(row: dict[str, Any], row_index: int, row_count: int) -> 
         f"[marlin-model-shapes][dense] row {row_index}/{row_count}: "
         f"scenario={row.get('scenario')} phase={row.get('phase')} op={row.get('op')} "
         f"m={row.get('size_m')} n={row.get('size_n')} k={row.get('size_k')} "
-        f"quant={row.get('quant_format')} group={row.get('group_size')}"
+        f"quant={row.get('quant_format')} group={row.get('group_size')} "
+        f"has_bias={bool(row.get('has_bias', False))}"
     )
 
 
@@ -1038,7 +1231,7 @@ def _moe_row_progress(row: dict[str, Any], row_index: int, row_count: int) -> st
         f"m={row.get('size_m')} n={row.get('size_n')} k={row.get('size_k')} "
         f"top_k={row.get('top_k')} experts={row.get('local_num_experts')} "
         f"block={row.get('moe_block_size')} quant={row.get('quant_format')} "
-        f"group={row.get('group_size')}"
+        f"group={row.get('group_size')} has_bias={bool(row.get('has_bias', False))}"
     )
 
 
@@ -1055,7 +1248,8 @@ def _moe_unsupported_row_progress(
         f"m={row.get('size_m')} n={row.get('size_n')} k={row.get('size_k')} "
         f"top_k={row.get('top_k')} experts={row.get('local_num_experts')} "
         f"block={row.get('moe_block_size')} quant={row.get('quant_format')} "
-        f"group={row.get('group_size')} reason={reason}"
+        f"group={row.get('group_size')} has_bias={bool(row.get('has_bias', False))} "
+        f"reason={reason}"
     )
 
 

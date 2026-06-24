@@ -375,13 +375,14 @@ using Sm70MoeU4B8GemmTraits =
         Sm70MoeU4B8GemmSpec<UseMetadataVectorWords>, CtaM, CtaN, CtaK,
         Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>;
 
-template <bool UseMetadataVectorWords = true>
+template <bool HasBias, bool UseMetadataVectorWords = true>
 struct Sm70MoeU4B8Launcher {
   torch::Tensor& a;
   torch::Tensor& c;
   torch::Tensor& b_q_weight;
   torch::Tensor& b_scales;
   torch::Tensor& b_zeros;
+  torch::Tensor& b_bias;
   torch::Tensor& global_scale;
   torch::Tensor& sorted_token_ids;
   torch::Tensor& expert_ids;
@@ -401,8 +402,8 @@ struct Sm70MoeU4B8Launcher {
     using Traits = Sm70MoeU4B8GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
                                          WarpN, WarpK, GroupSize, PackedMacroN,
                                          UseMetadataVectorWords>;
-    return launch_sm70_marlin_moe_gemm<Traits>(
-        a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
+    return launch_sm70_marlin_moe_gemm<Traits, HasBias>(
+        a, c, b_q_weight, b_scales, b_zeros, b_bias, global_scale, sorted_token_ids,
         expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
         top_k, mul_topk_weights, size_m, size_n, size_k, requested_split_k);
   }
@@ -410,9 +411,11 @@ struct Sm70MoeU4B8Launcher {
 
 }  // namespace
 
+template <bool HasBias>
 torch::Tensor sm70_marlin_u4b8_gemm(
     torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, torch::Tensor& sorted_token_ids,
+    torch::Tensor& b_scales, torch::Tensor& b_bias,
+    torch::Tensor& sorted_token_ids,
     torch::Tensor& expert_ids, torch::Tensor& num_tokens_past_padded,
     torch::Tensor& topk_weights, int64_t moe_block_size, int64_t top_k,
     bool mul_topk_weights, int64_t size_m, int64_t size_n, int64_t size_k,
@@ -433,15 +436,15 @@ torch::Tensor sm70_marlin_u4b8_gemm(
   auto empty_float = torch::empty(
       {0}, torch::TensorOptions().dtype(at::kFloat).device(a.device()));
   if (params.use_metadata_vector_words) {
-    Sm70MoeU4B8Launcher<true> const launcher{
-        a, c, b_q_weight, b_scales, empty_half, empty_float, sorted_token_ids,
+    Sm70MoeU4B8Launcher<HasBias, true> const launcher{
+        a, c, b_q_weight, b_scales, empty_half, b_bias, empty_float, sorted_token_ids,
         expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
         mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
     return dispatch_sm70_marlin_moe_geometry(
         launcher, geometry, params.packed_macro_n, group_size, "uint4b8");
   }
-  Sm70MoeU4B8Launcher<false> const launcher{
-      a, c, b_q_weight, b_scales, empty_half, empty_float, sorted_token_ids,
+  Sm70MoeU4B8Launcher<HasBias, false> const launcher{
+      a, c, b_q_weight, b_scales, empty_half, b_bias, empty_float, sorted_token_ids,
       expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
       mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
   return dispatch_sm70_marlin_moe_geometry(
@@ -449,3 +452,18 @@ torch::Tensor sm70_marlin_u4b8_gemm(
 }
 
 }  // namespace marlin_moe_wna16
+
+template torch::Tensor marlin_moe_wna16::sm70_marlin_u4b8_gemm<false>(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& b_bias,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);
+template torch::Tensor marlin_moe_wna16::sm70_marlin_u4b8_gemm<true>(
+    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
+    torch::Tensor& b_scales, torch::Tensor& b_bias,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
+    int64_t size_m, int64_t size_n, int64_t size_k, int64_t group_size);

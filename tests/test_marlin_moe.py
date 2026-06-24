@@ -17,6 +17,7 @@ from tests.helpers import (
     grouped_topk,
     make_moe_model_like_inputs,
     marlin_moe_reference,
+    marlin_permute_bias,
     marlin_quantize_experts_uint4_zp_with_metadata,
     marlin_quantize_experts_uint8_zp_with_metadata,
     marlin_quantize_experts_nvfp4_with_metadata,
@@ -925,6 +926,417 @@ def _run_stage1_kernel_case(
     torch.testing.assert_close(stage1, reference_stage1, rtol=rtol, atol=atol)
 
 
+def _moe_geometry(label: str):
+    return next(geometry for geometry in SM70_MOE_GEOMETRIES if geometry.label == label)
+
+
+def _make_uint4b8_moe_bias_inputs(
+    *,
+    tokens: int = 4,
+    hidden: int = 128,
+    intermediate: int = 128,
+    experts: int = 4,
+    topk: int = 2,
+) -> dict[str, object]:
+    _require_moe_cuda()
+    torch.manual_seed(123)
+    torch.cuda.manual_seed_all(123)
+    return _make_moe_accuracy_inputs(
+        scalar_types.uint4b8,
+        repack_impl="gptq",
+        group_size=128,
+        act_order=False,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+    )
+
+
+def _make_nvfp4_moe_bias_inputs(
+    *,
+    tokens: int = 4,
+    hidden: int = 512,
+    intermediate: int = 128,
+    experts: int = 4,
+    topk: int = 2,
+) -> dict[str, object]:
+    _require_moe_cuda()
+    torch.manual_seed(321)
+    torch.cuda.manual_seed_all(321)
+    return _make_moe_accuracy_inputs(
+        scalar_types.float4_e2m1f,
+        repack_impl="gptq",
+        group_size=16,
+        act_order=False,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+    )
+
+
+def _run_moe_stage1_bias_case(
+    *,
+    tokens: int = 4,
+    hidden: int = 128,
+    intermediate: int = 128,
+    experts: int = 4,
+    topk: int = 2,
+    moe_block_size: int = 16,
+    rtol: float = 7e-2,
+    atol: float = 6e-1,
+) -> None:
+    inputs = _make_uint4b8_moe_bias_inputs(
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+    )
+    raw_bias = torch.randn(
+        (experts, 2 * intermediate), device="cuda", dtype=torch.float16
+    )
+    b_bias = marlin_permute_bias(raw_bias)
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        inputs["topk_ids"], block_size=moe_block_size, num_experts=experts
+    )
+
+    output = ops.moe_wna16_marlin_gemm(
+        inputs["hidden_states"],
+        torch.empty((tokens * topk, 2 * intermediate), device="cuda", dtype=torch.float16),
+        inputs["w1_q"],
+        b_bias,
+        inputs["w1_scales"],
+        None,
+        inputs["w1_global_scale"],
+        inputs["w1_zeros"],
+        inputs["w1_g_idx"],
+        inputs["w1_perm"],
+        None,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        inputs["topk_weights"],
+        moe_block_size,
+        topk,
+        False,
+        scalar_types.uint4b8.id,
+        tokens,
+        2 * intermediate,
+        hidden,
+        True,
+        False,
+        False,
+        False,
+        -1,
+        -1,
+        -1,
+    )
+
+    reference = _moe_stage1_reference(inputs).to(torch.float32)
+    for token_idx in range(tokens):
+        for route_idx in range(topk):
+            expert = int(inputs["topk_ids"][token_idx, route_idx].item())
+            reference[token_idx * topk + route_idx] += raw_bias[expert].to(
+                torch.float32
+            )
+    reference = reference.to(torch.float16)
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
+def test_moe_wna16_uint4b8_stage1_bias_matches_reference():
+    _run_moe_stage1_bias_case()
+
+
+def test_moe_wna16_uint4b8_split_k_stage1_bias_matches_reference():
+    with moe_env(_moe_geometry("32x128x32x4x32x32x32"), 2, "vector_words"):
+        _run_moe_stage1_bias_case(hidden=512, rtol=7e-2, atol=8e-1)
+
+
+def test_moe_wna16_uint4b8_stage2_bias_with_topk_matches_reference():
+    tokens, hidden, intermediate, experts, topk = 4, 128, 128, 4, 2
+    moe_block_size = 16
+    inputs = _make_uint4b8_moe_bias_inputs(
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+    )
+    activation = torch.randn(
+        (tokens * topk, intermediate), device="cuda", dtype=torch.float16
+    )
+    stage2_ids = inputs["topk_ids"].reshape(tokens * topk, 1).contiguous()
+    stage2_weights = inputs["topk_weights"].reshape(tokens * topk, 1).contiguous()
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        stage2_ids,
+        block_size=moe_block_size,
+        num_experts=experts,
+    )
+    raw_bias = torch.randn((experts, hidden), device="cuda", dtype=torch.float16)
+    b_bias = marlin_permute_bias(raw_bias)
+
+    output = ops.moe_wna16_marlin_gemm(
+        activation,
+        torch.empty((tokens * topk, hidden), device="cuda", dtype=torch.float16),
+        inputs["w2_q"],
+        b_bias,
+        inputs["w2_scales"],
+        None,
+        inputs["w2_global_scale"],
+        inputs["w2_zeros"],
+        inputs["w2_g_idx"],
+        inputs["w2_perm"],
+        None,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        stage2_weights,
+        moe_block_size,
+        1,
+        True,
+        scalar_types.uint4b8.id,
+        tokens * topk,
+        hidden,
+        intermediate,
+        True,
+        False,
+        False,
+        False,
+        -1,
+        -1,
+        -1,
+    )
+
+    reference_rows = []
+    for row in range(tokens * topk):
+        expert = int(stage2_ids[row, 0].item())
+        value = torch.matmul(
+            activation[row : row + 1].to(torch.float32),
+            inputs["w2_dequant"][expert].to(torch.float32),
+        )[0]
+        value = value + raw_bias[expert].to(torch.float32)
+        value = value * stage2_weights[row, 0].to(torch.float32)
+        reference_rows.append(value)
+    reference = torch.stack(reference_rows, dim=0).to(torch.float16)
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=7e-2, atol=6e-1)
+
+
+if "nvfp4" in _MOE_SUPPORTED_QUANT_NAMES:
+
+    def test_moe_wna16_nvfp4_split_k_stage1_bias_matches_reference():
+        tokens, hidden, intermediate, experts, topk = 4, 512, 128, 4, 2
+        moe_block_size = 16
+        inputs = _make_nvfp4_moe_bias_inputs(
+            tokens=tokens,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+        )
+        raw_bias = torch.randn(
+            (experts, 2 * intermediate), device="cuda", dtype=torch.float16
+        )
+        b_bias = marlin_permute_bias(raw_bias)
+        sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+            inputs["topk_ids"], block_size=moe_block_size, num_experts=experts
+        )
+
+        with moe_env(_moe_geometry("32x128x32x4x32x32x32"), 2, "vector_words"):
+            output = ops.moe_wna16_marlin_gemm(
+                inputs["hidden_states"],
+                torch.empty(
+                    (tokens * topk, 2 * intermediate),
+                    device="cuda",
+                    dtype=torch.float16,
+                ),
+                inputs["w1_q"],
+                b_bias,
+                inputs["w1_scales"],
+                None,
+                inputs["w1_global_scale"],
+                inputs["w1_zeros"],
+                inputs["w1_g_idx"],
+                inputs["w1_perm"],
+                None,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                inputs["topk_weights"],
+                moe_block_size,
+                topk,
+                False,
+                scalar_types.float4_e2m1f.id,
+                tokens,
+                2 * intermediate,
+                hidden,
+                True,
+                False,
+                False,
+                False,
+                -1,
+                -1,
+                -1,
+            )
+
+        reference = _moe_stage1_reference(inputs).to(torch.float32)
+        for token_idx in range(tokens):
+            for route_idx in range(topk):
+                expert = int(inputs["topk_ids"][token_idx, route_idx].item())
+                reference[token_idx * topk + route_idx] += raw_bias[expert].to(
+                    torch.float32
+                )
+        reference = reference.to(torch.float16)
+
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, reference, rtol=2e-1, atol=2.0)
+
+    def test_moe_wna16_nvfp4_split_k_stage2_bias_with_topk_matches_reference():
+        tokens, hidden, intermediate, experts, topk = 4, 128, 512, 4, 2
+        moe_block_size = 16
+        inputs = _make_nvfp4_moe_bias_inputs(
+            tokens=tokens,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+        )
+        activation = torch.randn(
+            (tokens * topk, intermediate), device="cuda", dtype=torch.float16
+        )
+        stage2_ids = inputs["topk_ids"].reshape(tokens * topk, 1).contiguous()
+        stage2_weights = inputs["topk_weights"].reshape(tokens * topk, 1).contiguous()
+        sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+            stage2_ids,
+            block_size=moe_block_size,
+            num_experts=experts,
+        )
+        raw_bias = torch.randn((experts, hidden), device="cuda", dtype=torch.float16)
+        b_bias = marlin_permute_bias(raw_bias)
+
+        with moe_env(_moe_geometry("32x128x32x4x32x32x32"), 2, "vector_words"):
+            output = ops.moe_wna16_marlin_gemm(
+                activation,
+                torch.empty((tokens * topk, hidden), device="cuda", dtype=torch.float16),
+                inputs["w2_q"],
+                b_bias,
+                inputs["w2_scales"],
+                None,
+                inputs["w2_global_scale"],
+                inputs["w2_zeros"],
+                inputs["w2_g_idx"],
+                inputs["w2_perm"],
+                None,
+                sorted_ids,
+                expert_ids,
+                num_tokens_post_pad,
+                stage2_weights,
+                moe_block_size,
+                1,
+                True,
+                scalar_types.float4_e2m1f.id,
+                tokens * topk,
+                hidden,
+                intermediate,
+                True,
+                False,
+                False,
+                False,
+                -1,
+                -1,
+                -1,
+            )
+
+        reference_rows = []
+        for row in range(tokens * topk):
+            expert = int(stage2_ids[row, 0].item())
+            value = torch.matmul(
+                activation[row : row + 1].to(torch.float32),
+                inputs["w2_dequant"][expert].to(torch.float32),
+            )[0]
+            bias = raw_bias[expert].to(torch.float32) * inputs["w2_global_scale"][
+                expert
+            ].to(torch.float32)
+            value = (value + bias) * stage2_weights[row, 0].to(torch.float32)
+            reference_rows.append(value)
+        reference = torch.stack(reference_rows, dim=0).to(torch.float16)
+
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, reference, rtol=2e-1, atol=2.0)
+
+
+def test_moe_wna16_bias_validation_errors():
+    inputs = _make_uint4b8_moe_bias_inputs()
+    tokens = inputs["tokens"]
+    topk = inputs["topk"]
+    experts = inputs["experts"]
+    hidden = inputs["hidden"]
+    intermediate = inputs["intermediate"]
+    size_n = 2 * intermediate
+    moe_block_size = 16
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        inputs["topk_ids"], block_size=moe_block_size, num_experts=experts
+    )
+    common_args = [
+        inputs["hidden_states"],
+        torch.empty((tokens * topk, size_n), device="cuda", dtype=torch.float16),
+        inputs["w1_q"],
+        None,
+        inputs["w1_scales"],
+        None,
+        inputs["w1_global_scale"],
+        inputs["w1_zeros"],
+        inputs["w1_g_idx"],
+        inputs["w1_perm"],
+        None,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        inputs["topk_weights"],
+        moe_block_size,
+        topk,
+        False,
+        scalar_types.uint4b8.id,
+        tokens,
+        size_n,
+        hidden,
+        True,
+        False,
+        False,
+        False,
+        -1,
+        -1,
+        -1,
+    ]
+
+    with pytest.raises(RuntimeError, match="b_bias.size\\(0\\) != num_experts"):
+        args = list(common_args)
+        args[3] = torch.zeros((experts - 1, size_n), device="cuda", dtype=torch.float16)
+        ops.moe_wna16_marlin_gemm(*args)
+
+    with pytest.raises(RuntimeError, match="b_bias.size\\(1\\) != size_n"):
+        args = list(common_args)
+        args[3] = torch.zeros((experts, size_n - 1), device="cuda", dtype=torch.float16)
+        ops.moe_wna16_marlin_gemm(*args)
+
+    with pytest.raises(RuntimeError, match="b_bias is not contiguous"):
+        args = list(common_args)
+        args[3] = torch.zeros((experts, size_n, 2), device="cuda", dtype=torch.float16)[:, :, 0]
+        ops.moe_wna16_marlin_gemm(*args)
+
+    with pytest.raises(RuntimeError, match="SM70 Marlin MoE bias must be float16"):
+        args = list(common_args)
+        args[3] = torch.zeros((experts, size_n), device="cuda", dtype=torch.float32)
+        ops.moe_wna16_marlin_gemm(*args)
+
+
 def _run_forced_fused_kernel_case(
     quant_type,
     *,
@@ -1305,16 +1717,19 @@ def _moe_stage1_reference(inputs: dict[str, object]) -> torch.Tensor:
     topk_ids = inputs["topk_ids"]
     tokens = inputs["tokens"]
     topk = inputs["topk"]
+    bias = inputs.get("w1_bias_raw")
     reference_gate_up = []
     for token_idx in range(tokens):
         for route_idx in range(topk):
             expert = int(topk_ids[token_idx, route_idx].item())
-            reference_gate_up.append(
-                torch.matmul(
-                    hidden_states[token_idx : token_idx + 1].to(torch.float32),
-                    inputs["w1_dequant"][expert].to(torch.float32),
-                )[0]
+            value = torch.matmul(
+                hidden_states[token_idx : token_idx + 1].to(torch.float32),
+                inputs["w1_dequant"][expert].to(torch.float32),
             )
+            value = value[0]
+            if bias is not None:
+                value = value + bias[expert].to(torch.float32)
+            reference_gate_up.append(value)
     return torch.stack(reference_gate_up, dim=0).to(torch.float16)
 
 
@@ -1328,6 +1743,7 @@ def _moe_stage2_inputs_and_reference(
     intermediate = inputs["intermediate"]
     experts = inputs["experts"]
     topk_ids = inputs["topk_ids"]
+    bias = inputs.get("w2_bias_raw")
     activation = torch.randn(
         (tokens * topk, intermediate), device="cuda", dtype=torch.float16
     )
@@ -1343,12 +1759,14 @@ def _moe_stage2_inputs_and_reference(
     reference_rows = []
     for row in range(tokens * topk):
         expert = int(stage2_ids[row, 0].item())
-        reference_rows.append(
-            torch.matmul(
-                activation[row : row + 1].to(torch.float32),
-                inputs["w2_dequant"][expert].to(torch.float32),
-            )[0]
+        value = torch.matmul(
+            activation[row : row + 1].to(torch.float32),
+            inputs["w2_dequant"][expert].to(torch.float32),
         )
+        value = value[0]
+        if bias is not None:
+            value = value + bias[expert].to(torch.float32)
+        reference_rows.append(value)
     reference = torch.stack(reference_rows, dim=0).to(torch.float16)
     return activation, stage2_weights, sorted_ids, expert_ids, num_tokens_post_pad, reference
 
@@ -1373,7 +1791,7 @@ def _run_moe_env_stage1_combo(
             dtype=torch.float16,
         ),
         inputs["w1_q"],
-        None,
+        inputs.get("w1_bias"),
         inputs["w1_scales"],
         None,
         inputs["w1_global_scale"],
@@ -1424,7 +1842,7 @@ def _run_moe_env_stage2_combo(
         activation,
         torch.empty((key.tokens * key.topk, key.hidden), device="cuda", dtype=torch.float16),
         inputs["w2_q"],
-        None,
+        inputs.get("w2_bias"),
         inputs["w2_scales"],
         None,
         inputs["w2_global_scale"],

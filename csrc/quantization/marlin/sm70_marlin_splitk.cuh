@@ -7,6 +7,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/functional.h"
+#include "quantization/marlin/sm70_marlin_bias.cuh"
 #include "quantization/marlin/sm70_marlin_common.cuh"
 
 namespace marlin::sm70 {
@@ -97,6 +98,141 @@ CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
       remaining_tiles, active_split_k - partition_idx, group_tiles);
   return {start_tiles * CtaK, partition_tiles * CtaK};
 }
+
+template <typename Traits>
+class Sm70BiasFp16Epilogue {
+ public:
+  using CutlassEpilogue = typename Traits::Epilogue;
+  using SharedStorage = typename CutlassEpilogue::Base::SharedStorage;
+  using AccumulatorTile = typename CutlassEpilogue::AccumulatorTile;
+  using AccumulatorFragmentIterator =
+      typename CutlassEpilogue::AccumulatorFragmentIterator;
+  using WarpTileIterator = typename CutlassEpilogue::WarpTileIterator;
+  using SharedLoadIterator = typename CutlassEpilogue::SharedLoadIterator;
+  using OutputTileIterator = typename CutlassEpilogue::OutputTileIterator;
+  using ThreadMap = typename OutputTileIterator::ThreadMap;
+
+ private:
+  WarpTileIterator warp_tile_iterator_;
+  SharedLoadIterator shared_load_iterator_;
+
+  CUTLASS_DEVICE
+  void store_fragment(OutputTileIterator const& destination_iterator,
+                      typename SharedLoadIterator::Fragment const& frag,
+                      cutlass::half_t* __restrict__ c,
+                      cutlass::half_t const* __restrict__ b_bias,
+                      int n, float output_scale) const {
+    float const* frag_ptr = reinterpret_cast<float const*>(&frag);
+    int const thread_start_row = destination_iterator.thread_start_row();
+    int const thread_start_column = destination_iterator.thread_start_column();
+    int const extent_row = destination_iterator.extent_row();
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster;
+         ++cluster) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int group = 0; group < ThreadMap::Iterations::kGroup; ++group) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int row = 0; row < ThreadMap::Iterations::kRow; ++row) {
+          int const frag_row_idx =
+              row + ThreadMap::Iterations::kRow *
+                        (group + ThreadMap::Iterations::kGroup * cluster);
+          int const row_offset =
+              row * ThreadMap::Delta::kRow +
+              group * ThreadMap::Delta::kGroup +
+              cluster * ThreadMap::Delta::kCluster;
+          int const logical_row = thread_start_row + row_offset;
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int column = 0; column < ThreadMap::Iterations::kColumn;
+               ++column) {
+            int const logical_column_base =
+                thread_start_column + column * ThreadMap::Delta::kColumn;
+            int const frag_base =
+                (frag_row_idx * ThreadMap::Iterations::kColumn + column) *
+                ThreadMap::kElementsPerAccess;
+
+            if (logical_row < extent_row) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
+                int const logical_col = logical_column_base + e;
+                int64_t const offset = int64_t(logical_row) * n + logical_col;
+                float const bias = __half2float(reinterpret_cast<half const*>(
+                    b_bias)[sm70_marlin_bias_storage_index(logical_col)]);
+                c[offset] =
+                    cutlass::half_t(frag_ptr[frag_base + e] * output_scale +
+                                    bias);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+ public:
+  CUTLASS_DEVICE
+  Sm70BiasFp16Epilogue(SharedStorage& shared_storage, int thread_idx,
+                       int warp_idx, int lane_idx)
+      : warp_tile_iterator_(shared_storage.reference(), lane_idx),
+        shared_load_iterator_(shared_storage.reference(), thread_idx) {
+    using WarpCount = typename CutlassEpilogue::WarpCount;
+    int const warp_k = warp_idx / (WarpCount::kM * WarpCount::kN);
+    int const warp_mn = warp_idx % (WarpCount::kM * WarpCount::kN);
+    int const warp_m = warp_mn % WarpCount::kM;
+    int const warp_n = warp_mn / WarpCount::kM;
+
+    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m,
+                                     warp_n};
+    warp_tile_iterator_.add_tile_offset(warp_offset);
+  }
+
+  CUTLASS_DEVICE
+  void operator()(OutputTileIterator destination_iterator,
+                  AccumulatorTile const& accumulators,
+                  cutlass::half_t* __restrict__ c,
+                  cutlass::half_t const* __restrict__ b_bias, int n,
+                  float output_scale = 1.0f) {
+    AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int iter = 0; iter < OutputTileIterator::kIterations; ++iter) {
+      __syncthreads();
+
+      typename AccumulatorFragmentIterator::Fragment accum_fragment;
+      accum_fragment_iterator.load(accum_fragment);
+      ++accum_fragment_iterator;
+      warp_tile_iterator_.store(accum_fragment);
+
+      __syncthreads();
+
+      typename SharedLoadIterator::Fragment aligned_accum_fragment;
+      shared_load_iterator_.load(aligned_accum_fragment);
+
+      if (CutlassEpilogue::kPartitionsK > 1) {
+        cutlass::plus<typename SharedLoadIterator::Fragment> add_fragments;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 1; i < CutlassEpilogue::kPartitionsK; ++i) {
+          typename SharedLoadIterator::Fragment aligned_addend_fragment;
+          shared_load_iterator_.add_pointer_offset(
+              CutlassEpilogue::kSmemPointerOffset);
+          shared_load_iterator_.load(aligned_addend_fragment);
+          aligned_accum_fragment =
+              add_fragments(aligned_accum_fragment, aligned_addend_fragment);
+        }
+
+        shared_load_iterator_.add_pointer_offset(
+            (1 - CutlassEpilogue::kPartitionsK) *
+            CutlassEpilogue::kSmemPointerOffset);
+      }
+
+      store_fragment(destination_iterator, aligned_accum_fragment, c, b_bias,
+                     n, output_scale);
+      ++destination_iterator;
+    }
+  }
+};
 
 template <typename Traits>
 class Sm70AtomicFp16Epilogue {

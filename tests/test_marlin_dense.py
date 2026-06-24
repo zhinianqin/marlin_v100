@@ -16,6 +16,7 @@ from tests.helpers import (
     marlin_dense_reference,
     marlin_make_workspace,
     marlin_make_empty_g_idx,
+    marlin_permute_bias,
     marlin_quantize,
     marlin_quantize_mxfp4,
     marlin_quantize_nvfp4,
@@ -489,6 +490,171 @@ def _run_dense_accuracy_case(
     assert not torch.all(output == 0)
     assert output.float().std().item() > 0
     torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
+def _run_dense_bias_accuracy_case(
+    quant_type,
+    *,
+    group_size: int,
+    rtol: float,
+    atol: float,
+    size_m: int = 8,
+    size_k: int = 256,
+    size_n: int = 256,
+) -> None:
+    _require_marlin_cuda()
+    torch.manual_seed(123)
+    torch.cuda.manual_seed_all(123)
+
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    raw_bias = torch.randn((size_n,), device="cuda", dtype=torch.float16)
+    b_bias = marlin_permute_bias(raw_bias)
+
+    if quant_type == scalar_types.uint4b8:
+        _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+            w,
+            quant_type,
+            group_size,
+            False,
+        )
+        b_zeros = None
+        is_zp_float = False
+        reference = marlin_dense_reference(
+            a,
+            q_w,
+            scales,
+            size_k=size_k,
+            size_n=size_n,
+            group_size=group_size,
+            quant_type=quant_type,
+            perm=sort_indices,
+        ).to(torch.float32)
+    elif quant_type == scalar_types.uint4:
+        _, q_w, scales, b_zeros, dequantized = marlin_quantize_uint4_zp(
+            w,
+            group_size,
+        )
+        g_idx = marlin_make_empty_g_idx(a.device)
+        sort_indices = torch.empty(0, dtype=torch.int, device=a.device)
+        is_zp_float = True
+        reference = torch.matmul(
+            a.to(torch.float32),
+            dequantized.to(torch.float32),
+        )
+    else:
+        raise AssertionError(f"Unsupported dense bias quant type: {quant_type}")
+
+    output = ops.marlin_gemm(
+        a,
+        None,
+        q_w,
+        b_bias,
+        scales,
+        None,
+        None,
+        b_zeros,
+        g_idx,
+        sort_indices,
+        None,
+        quant_type.id,
+        size_m,
+        size_n,
+        size_k,
+        True,
+        False,
+        False,
+        is_zp_float,
+    )
+    reference = (reference + raw_bias.to(torch.float32)).to(torch.float16)
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+
+
+def _dense_geometry(label: str):
+    return next(geometry for geometry in SM70_GEOMETRIES if geometry.label == label)
+
+
+def test_marlin_dense_uint4b8_bias_matches_reference():
+    _run_dense_bias_accuracy_case(
+        scalar_types.uint4b8,
+        group_size=128,
+        rtol=5e-2,
+        atol=5e-1,
+    )
+
+
+def test_marlin_dense_uint4_zp_bias_matches_reference():
+    _run_dense_bias_accuracy_case(
+        scalar_types.uint4,
+        group_size=128,
+        rtol=7e-2,
+        atol=6e-1,
+    )
+
+
+def test_marlin_dense_uint4b8_split_k_bias_matches_reference():
+    with dense_env(_dense_geometry("32x128x32x4x32x32x32"), 2, "vector_words"):
+        _run_dense_bias_accuracy_case(
+            scalar_types.uint4b8,
+            group_size=128,
+            size_k=512,
+            rtol=5e-2,
+            atol=5e-1,
+        )
+
+
+def test_marlin_dense_bias_validation_errors():
+    _require_marlin_cuda()
+    torch.manual_seed(123)
+    torch.cuda.manual_seed_all(123)
+
+    size_m, size_k, size_n = 8, 256, 256
+    a = torch.randn((size_m, size_k), device="cuda", dtype=torch.float16)
+    w = torch.randn((size_k, size_n), device="cuda", dtype=torch.float16)
+    _, q_w, scales, g_idx, sort_indices, _ = marlin_quantize(
+        w,
+        scalar_types.uint4b8,
+        128,
+        False,
+    )
+    common_args = (
+        a,
+        None,
+        q_w,
+        None,
+        scales,
+        None,
+        None,
+        None,
+        g_idx,
+        sort_indices,
+        None,
+        scalar_types.uint4b8.id,
+        size_m,
+        size_n,
+        size_k,
+        True,
+        False,
+        False,
+        False,
+    )
+
+    with pytest.raises(RuntimeError, match="b_bias.size\\(0\\) != size_n"):
+        args = list(common_args)
+        args[3] = torch.zeros((size_n - 1,), device="cuda", dtype=torch.float16)
+        ops.marlin_gemm(*args)
+
+    with pytest.raises(RuntimeError, match="b_bias is not contiguous"):
+        args = list(common_args)
+        args[3] = torch.zeros((size_n, 2), device="cuda", dtype=torch.float16)[:, 0]
+        ops.marlin_gemm(*args)
+
+    with pytest.raises(RuntimeError, match="SM70 Marlin bias must be float16"):
+        args = list(common_args)
+        args[3] = torch.zeros((size_n,), device="cuda", dtype=torch.float32)
+        ops.marlin_gemm(*args)
 
 
 def _run_fp8_dense_accuracy_case(
@@ -2734,28 +2900,29 @@ if "fp8" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="does not support bias"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
-                scales,
-                None,
-                None,
-                None,
-                g_idx,
-                sort_indices,
-                workspace,
-                scalar_types.float8_e4m3fn.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                True,
-                False,
-                False,
-                False,
-            )
+        bias_output = ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float8_e4m3fn.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            False,
+            False,
+        )
+        assert bias_output.shape == (a.shape[0], w.shape[1])
+        assert torch.isfinite(bias_output).all()
 
         with pytest.raises(RuntimeError, match="supports global_scale only for nvfp4 format"):
             ops.marlin_gemm(
@@ -3004,28 +3171,29 @@ if "nvfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="does not support bias"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
-                scales,
-                None,
-                global_scale,
-                None,
-                g_idx,
-                sort_indices,
-                workspace,
-                scalar_types.float4_e2m1f.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                True,
-                False,
-                False,
-                False,
-            )
+        bias_output = ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
+            scales,
+            None,
+            global_scale,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            False,
+            False,
+        )
+        assert bias_output.shape == (a.shape[0], w.shape[1])
+        assert torch.isfinite(bias_output).all()
 
         with pytest.raises(RuntimeError, match="zero-point metadata"):
             ops.marlin_gemm(
@@ -3257,28 +3425,29 @@ if "mxfp4" in _DENSE_SUPPORTED_QUANT_NAMES:
                 False,
             )
 
-        with pytest.raises(RuntimeError, match="does not support bias"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
-                scales,
-                None,
-                None,
-                None,
-                g_idx,
-                sort_indices,
-                workspace,
-                scalar_types.float4_e2m1f.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                True,
-                False,
-                False,
-                False,
-            )
+        bias_output = ops.marlin_gemm(
+            a,
+            None,
+            q_w,
+            torch.zeros(w.shape[1], device="cuda", dtype=torch.float16),
+            scales,
+            None,
+            None,
+            None,
+            g_idx,
+            sort_indices,
+            workspace,
+            scalar_types.float4_e2m1f.id,
+            a.shape[0],
+            w.shape[1],
+            w.shape[0],
+            True,
+            False,
+            False,
+            False,
+        )
+        assert bias_output.shape == (a.shape[0], w.shape[1])
+        assert torch.isfinite(bias_output).all()
 
         with pytest.raises(RuntimeError, match="zero-point metadata"):
             ops.marlin_gemm(

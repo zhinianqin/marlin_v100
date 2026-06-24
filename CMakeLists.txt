@@ -81,6 +81,7 @@ set_gencode_flags_for_srcs(
 
 set(MARLIN_SRCS
    "csrc/quantization/marlin/marlin.cu"
+   "csrc/quantization/marlin/sm70_marlin_bias.cu"
    "csrc/quantization/marlin/sm70_cutlass_matmul_probe.cu"
    "csrc/quantization/marlin/sm70_marlin_u4b8_gemm.cu"
    "csrc/quantization/marlin/sm70_marlin_u4_gemm.cu"
@@ -111,6 +112,7 @@ set_gencode_flags_for_srcs(
   CUDA_ARCHS "${CUDA_ARCHS}")
 
 set(MARLIN_MOE_OTHER_SRC
+  "csrc/quantization/marlin/sm70_marlin_bias.cu"
   "csrc/moe/marlin_moe_wna16/ops.cu"
   "csrc/moe/marlin_moe_wna16/sm70_marlin_u4_gemm.cu"
   "csrc/moe/marlin_moe_wna16/sm70_marlin_u4b8_gemm.cu"

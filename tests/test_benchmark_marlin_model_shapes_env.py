@@ -44,6 +44,7 @@ def _dense_row(**overrides: Any) -> dict[str, Any]:
         "quant_method": "awq",
         "quant_format": "uint4",
         "has_zp": True,
+        "has_bias": False,
         "marlin_path": "awq_marlin_wna16",
         "call_status": "actual_marlin",
         "call_count": 3,
@@ -66,6 +67,7 @@ def _moe_row(**overrides: Any) -> dict[str, Any]:
         "quant_method": "awq",
         "quant_format": "uint4",
         "has_zp": True,
+        "has_bias": False,
         "marlin_path": "awq_marlin_moe_wna16",
         "call_status": "actual_marlin",
         "call_count": 4,
@@ -182,6 +184,99 @@ def test_auto_dense_and_moe_runs_both_and_dedups(tmp_path: Path, monkeypatch, ca
     assert "detected_kinds=dense,moe" in out
     assert "dense_actual_rows=2" in out
     assert "dense_unique_actual_rows=1" in out
+
+
+def test_has_bias_is_written_to_csv(tmp_path: Path, monkeypatch) -> None:
+    model_dir = _model_dir(tmp_path)
+    payload = _payload(model_dir, dense=[_dense_row(has_bias=True)], moe=[])
+
+    rows, csv_text, _runtime_kinds = _run(
+        tmp_path,
+        monkeypatch,
+        payload,
+        "--kind",
+        "dense",
+    )
+
+    assert "has_bias" in csv_text.splitlines()[0].split(",")
+    assert {row["has_bias"] for row in rows} == {"true"}
+
+
+def test_has_bias_participates_in_unique_row_dedup(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    model_dir = _model_dir(tmp_path)
+    payload = _payload(
+        model_dir,
+        dense=[
+            _dense_row(layer_key="model.layers.0.mlp.gate_up_proj"),
+            _dense_row(layer_key="model.layers.1.mlp.gate_up_proj", has_bias=True),
+        ],
+        moe=[
+            _moe_row(layer_key="model.layers.0.mlp.experts"),
+            _moe_row(layer_key="model.layers.1.mlp.experts", has_bias=True),
+        ],
+    )
+
+    rows, _csv_text, _runtime_kinds = _run(tmp_path, monkeypatch, payload)
+
+    assert [row["kind"] for row in rows].count("dense") == 4
+    assert [row["kind"] for row in rows].count("moe") == 4
+    out = capsys.readouterr().out
+    assert "dense_unique_actual_rows=2" in out
+    assert "moe_unique_actual_rows=2" in out
+
+
+def test_has_bias_true_rows_reach_prepare_path(tmp_path: Path, monkeypatch) -> None:
+    model_dir = _model_dir(tmp_path)
+    payload = _payload(
+        model_dir,
+        dense=[_dense_row(has_bias=True)],
+        moe=[_moe_row(has_bias=True)],
+    )
+    captured_dense: list[dict[str, Any]] = []
+    captured_moe: list[dict[str, Any]] = []
+    _patch_common(monkeypatch, payload)
+    monkeypatch.setattr(
+        bench,
+        "_prepare_dense_runtime",
+        lambda row: (
+            captured_dense.append(row),
+            bench.DensePrepared(key=None, check=lambda: None, run=lambda: None),
+        )[1],
+    )
+    monkeypatch.setattr(
+        bench,
+        "_prepare_moe_runtime",
+        lambda row: (
+            captured_moe.append(row),
+            bench.MoePrepared(key=None, check=lambda: None, run=lambda: None),
+        )[1],
+    )
+    csv_path = tmp_path / "prepare.csv"
+    args = bench.parse_args(
+        [
+            "--model",
+            str(model_dir),
+            "--csv",
+            str(csv_path),
+            "--warmup-iters",
+            "0",
+            "--iters",
+            "1",
+            "--kind",
+            "both",
+            "--max-cases",
+            "3",
+        ]
+    )
+
+    bench.run_benchmark(args)
+
+    assert captured_dense and captured_dense[0]["has_bias"] is True
+    assert captured_moe and captured_moe[0]["has_bias"] is True
 
 
 def test_kind_auto_handles_dense_only_and_empty_payload(
