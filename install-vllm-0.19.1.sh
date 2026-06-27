@@ -163,6 +163,8 @@ dense_files=(
   csrc/quantization/marlin/marlin.cu
   csrc/quantization/marlin/marlin.cuh
   csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu
+  csrc/quantization/marlin/sm70_marlin_bias.cu
+  csrc/quantization/marlin/sm70_marlin_bias.cuh
   csrc/quantization/marlin/sm70_marlin_common.cuh
   csrc/quantization/marlin/sm70_marlin_fp8_gemm.cu
   csrc/quantization/marlin/sm70_marlin_gemm.cuh
@@ -235,6 +237,7 @@ dense_block = '''  # SM70 Marlin uses explicit production kernels from marlin_v1
        "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
        "csrc/quantization/marlin/gptq_marlin_repack.cu"
        "csrc/quantization/marlin/awq_marlin_repack.cu"
+       "csrc/quantization/marlin/sm70_marlin_bias.cu"
        "csrc/quantization/marlin/sm70_marlin_u4_gemm.cu"
        "csrc/quantization/marlin/sm70_marlin_u4b8_gemm.cu"
        "csrc/quantization/marlin/sm70_marlin_u8_gemm.cu"
@@ -266,6 +269,7 @@ moe_block = '''  # SM70 Marlin MoE uses explicit production kernels from marlin_
   cuda_archs_loose_intersection(MARLIN_MOE_SM70_ARCHS "7.0" "${CUDA_ARCHS}")
   if (MARLIN_MOE_SM70_ARCHS)
     set(MARLIN_MOE_OTHER_SRC
+       "csrc/quantization/marlin/sm70_marlin_bias.cu"
        "csrc/moe/marlin_moe_wna16/ops.cu"
        "csrc/moe/marlin_moe_wna16/sm70_marlin_u4_gemm.cu"
        "csrc/moe/marlin_moe_wna16/sm70_marlin_u4b8_gemm.cu"
