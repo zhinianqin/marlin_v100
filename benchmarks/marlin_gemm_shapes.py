@@ -859,6 +859,23 @@ def _ct_quant_for_candidate(candidate: Candidate,
     return None
 
 
+def _normalized_fp8_group_size(quant: QuantInfo) -> int | str | None:
+    if quant.group_size is not None:
+        return quant.group_size
+
+    algo = (quant.quant_algo or "").upper()
+    weight_type = str(quant.weight_args.get("type", "")).lower()
+    if quant.method == "fp8" or algo == "FP8":
+        return -1
+    if (
+        quant.method == "compressed-tensors"
+        and weight_type == "float"
+        and quant.bits == 8
+    ):
+        return -1
+    return None
+
+
 def _is_ignored(candidate: Candidate, quant: QuantInfo) -> bool:
     if not quant.ignore:
         return False
@@ -909,6 +926,7 @@ def _configured_quant_format(quant: QuantInfo,
     weight_type = str(quant.weight_args.get("type", "")).lower()
     bits = quant.bits
     fmt = (quant.format or "").lower()
+    fp8_group_size = _normalized_fp8_group_size(quant)
 
     if method in {"awq", "awq_marlin"}:
         if bits == 8:
@@ -937,7 +955,7 @@ def _configured_quant_format(quant: QuantInfo,
             "actual_marlin",
             method,
             f"fp8_{quant.format}" if quant.format else "fp8_e4m3",
-            quant.group_size or -1,
+            fp8_group_size,
             False,
             "fp8_marlin",
         )
@@ -965,7 +983,7 @@ def _configured_quant_format(quant: QuantInfo,
                 "actual_marlin",
                 method,
                 "fp8_e4m3",
-                quant.group_size,
+                fp8_group_size,
                 False,
                 "fp8_marlin",
             )
@@ -1002,7 +1020,7 @@ def _configured_quant_format(quant: QuantInfo,
                 "actual_marlin",
                 method,
                 "fp8_e4m3",
-                quant.group_size,
+                fp8_group_size,
                 False,
                 "fp8_marlin",
             )
@@ -1630,7 +1648,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             "quant_method": spec.quant.method,
             "quant_algo": spec.quant.quant_algo,
             "quant_format": _configured_quant_format(spec.quant).quant_format,
-            "group_size": spec.quant.group_size,
+            "group_size": _normalized_fp8_group_size(spec.quant),
             "zero_point": spec.quant.zero_point,
         },
         "shape_inputs": {
