@@ -672,7 +672,7 @@ torch::Tensor sm70_marlin_u4_gemm(
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params =
-      sm70_marlin_dense_auto_params("uint4", group_size, size_m, size_n,
+      sm70_marlin_dense_auto_params("uint4", group_size, HasBias, size_m, size_n,
                                     size_k);
   Sm70CtaGeometry const geometry = params.geometry;
   validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin uint4", geometry);

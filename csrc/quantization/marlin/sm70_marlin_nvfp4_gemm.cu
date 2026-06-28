@@ -610,7 +610,7 @@ torch::Tensor sm70_marlin_nvfp4_gemm(torch::Tensor& a, torch::Tensor& c,
   c10::cuda::CUDAGuard device_guard(a.device());
 
   auto const params = sm70_marlin_dense_auto_params(
-      "nvfp4", group_size, size_m, size_n, size_k);
+      "nvfp4", group_size, HasBias, size_m, size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
   validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin nvfp4", geometry);
   validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin nvfp4", geometry, size_n);
