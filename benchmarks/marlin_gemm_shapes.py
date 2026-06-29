@@ -55,11 +55,14 @@ QUANT_SUFFIXES = {
 class Scenario:
     tp_size: int
     enable_expert_parallel: bool
+    dp_size: int = 1
 
     @property
     def label(self) -> str:
-        suffix = "+ep" if self.enable_expert_parallel else ""
-        return f"tp{self.tp_size}{suffix}"
+        ep_suffix = "+ep" if self.enable_expert_parallel else ""
+        if self.dp_size > 1:
+            return f"dp{self.dp_size}+tp{self.tp_size}{ep_suffix}"
+        return f"tp{self.tp_size}{ep_suffix}"
 
 
 @dataclass
@@ -1483,7 +1486,10 @@ def enumerate_moe_rows(spec: ModelSpec, evidence: IndexEvidence,
         layer_key = _choose_layer_key(candidate, evidence)
         for scenario in scenarios:
             if scenario.enable_expert_parallel:
-                local_num_experts = spec.num_experts // scenario.tp_size
+                # ep_size = dp_size * tp_size matches vllm's
+                # FusedMoEParallelConfig.make() flatten_tp_across_dp_and_pcp logic
+                ep_size = scenario.dp_size * scenario.tp_size
+                local_num_experts = spec.num_experts // ep_size
                 intermediate = spec.moe_intermediate_size
             else:
                 local_num_experts = spec.num_experts
@@ -1586,15 +1592,21 @@ def _load_safetensors_dtypes(
     return dtypes
 
 
-def _scenarios(tp_sizes: list[int], ep_modes: list[str]) -> list[Scenario]:
+def _scenarios(tp_sizes: list[int], ep_modes: list[str],
+               dp_sizes: list[int] | None = None) -> list[Scenario]:
+    if dp_sizes is None:
+        dp_sizes = [1]
     out: list[Scenario] = []
     include_tp = "tp" in ep_modes
     include_ep = "tp_ep" in ep_modes or "ep" in ep_modes
-    for tp in tp_sizes:
-        if include_tp:
-            out.append(Scenario(tp, False))
-        if include_ep:
-            out.append(Scenario(tp, True))
+    for dp in dp_sizes:
+        for tp in tp_sizes:
+            if dp == 2 and tp == 8:
+                continue  # dp2+tp8 = 16 GPUs, skip
+            if include_tp:
+                out.append(Scenario(tp, False, dp))
+            if include_ep:
+                out.append(Scenario(tp, True, dp))
     return out
 
 
@@ -1617,6 +1629,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         _parse_int_list(args.tp_sizes, [4, 8]),
         args.ep_modes.split(",") if isinstance(args.ep_modes, str)
         else args.ep_modes,
+        _parse_int_list(args.dp_sizes, [1, 2]),
     )
     max_tokens = _parse_int_list(args.max_num_batched_tokens, [2048, 4096])
     decode_concurrency = _parse_int_list(args.decode_concurrency, [1, 32, 64])
@@ -1659,6 +1672,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "tp_size": s.tp_size,
                 "enable_expert_parallel": s.enable_expert_parallel,
+                "dp_size": s.dp_size,
             } for s in scenarios
         ],
         "dense": dense,
@@ -1735,6 +1749,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", action="append")
     parser.add_argument("--decode-concurrency", action="append")
     parser.add_argument("--tp-sizes", action="append")
+    parser.add_argument("--dp-sizes", action="append")
     parser.add_argument("--ep-modes", default="tp,tp_ep")
     parser.add_argument("--moe-backend", default="marlin")
     parser.add_argument("--dtype", default="float16")

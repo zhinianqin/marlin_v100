@@ -194,6 +194,8 @@ def load_payload(model_dir: Path) -> dict[str, Any]:
             "marlin",
             "--format",
             "json",
+            "--dp-sizes", "1",
+            "--dp-sizes", "2",
         ]
     )
     return marlin_gemm_shapes.build_payload(args)
