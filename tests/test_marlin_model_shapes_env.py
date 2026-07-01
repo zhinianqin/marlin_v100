@@ -1066,6 +1066,28 @@ def _dense_bias_smoke_row() -> dict[str, Any]:
     }
 
 
+def _dense_fp8_per_tensor_smoke_row() -> dict[str, Any]:
+    return {
+        "model": "synthetic",
+        "scenario": "tp1",
+        "phase": "smoke",
+        "layer_key": "model.layers.0.self_attn.o_proj",
+        "op": "o_proj",
+        "target_op": "ops.marlin_gemm",
+        "size_m": 4,
+        "size_n": 128,
+        "size_k": 256,
+        "group_size": 256,
+        "quant_method": "modelopt",
+        "quant_format": "fp8_e4m3",
+        "has_zp": False,
+        "has_bias": False,
+        "marlin_path": "fp8_marlin",
+        "call_status": "actual_marlin",
+        "call_count": 1,
+    }
+
+
 def _moe_bias_smoke_row(op: str) -> dict[str, Any]:
     if op == "w13":
         size_m = 4
@@ -1101,6 +1123,16 @@ def _moe_bias_smoke_row(op: str) -> dict[str, Any]:
         "call_status": "actual_marlin",
         "call_count": 1,
     }
+
+
+def test_model_shape_dense_fp8_size_k_group_maps_to_runtime_minus_one() -> None:
+    row = _dense_fp8_per_tensor_smoke_row()
+    key = _dense_key_from_row(row)
+    assert key.group_size == -1
+
+    bad_row = dict(row, group_size=None)
+    with pytest.raises(AssertionError, match="group_size"):
+        _dense_key_from_row(bad_row)
 
 
 def test_model_shape_dense_bias_runtime_helper_matches_reference() -> None:

@@ -862,11 +862,14 @@ def _ct_quant_for_candidate(candidate: Candidate,
     return None
 
 
-def _normalized_fp8_group_size(quant: QuantInfo) -> int | str | None:
+def _normalized_fp8_group_size(
+    quant: QuantInfo,
+    algo_override: str | None = None,
+) -> int | str | None:
     if quant.group_size is not None:
         return quant.group_size
 
-    algo = (quant.quant_algo or "").upper()
+    algo = (algo_override or quant.quant_algo or "").upper()
     weight_type = str(quant.weight_args.get("type", "")).lower()
     if quant.method == "fp8" or algo == "FP8":
         return -1
@@ -929,7 +932,7 @@ def _configured_quant_format(quant: QuantInfo,
     weight_type = str(quant.weight_args.get("type", "")).lower()
     bits = quant.bits
     fmt = (quant.format or "").lower()
-    fp8_group_size = _normalized_fp8_group_size(quant)
+    fp8_group_size = _normalized_fp8_group_size(quant, algo_override)
 
     if method in {"awq", "awq_marlin"}:
         if bits == 8:
@@ -1301,8 +1304,18 @@ def _dense_shape(candidate: Candidate, spec: ModelSpec,
     raise ValueError(f"Unknown dense size kind: {candidate.size_kind}")
 
 
-def _effective_group_size(group_size: int | str | None, size_k: int) -> int | str | None:
+def _effective_group_size(
+    quant_format: str,
+    group_size: int | str | None,
+    size_k: int,
+) -> int | str | None:
     if group_size == -1:
+        return size_k
+    if (
+        str(quant_format).startswith("fp8")
+        and isinstance(group_size, int)
+        and group_size > size_k
+    ):
         return size_k
     return group_size
 
@@ -1454,7 +1467,7 @@ def enumerate_dense_rows(spec: ModelSpec, evidence: IndexEvidence,
                     "size_n": size_n,
                     "size_k": size_k,
                     "group_size": _effective_group_size(
-                        decision.group_size, size_k
+                        decision.quant_format, decision.group_size, size_k
                     ),
                     "quant_method": decision.quant_method,
                     "quant_format": decision.quant_format,
@@ -1524,7 +1537,7 @@ def enumerate_moe_rows(spec: ModelSpec, evidence: IndexEvidence,
                         "size_n": size_n,
                         "size_k": size_k,
                         "group_size": _effective_group_size(
-                            decision.group_size, size_k
+                            decision.quant_format, decision.group_size, size_k
                         ),
                         "quant_method": decision.quant_method,
                         "quant_format": decision.quant_format,

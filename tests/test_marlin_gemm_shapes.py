@@ -501,6 +501,92 @@ def test_qwen_awq_moe_decode_concurrency_block_sizes(tmp_path: Path):
     assert row["size_k"] == 1024
 
 
+def test_qwen_fp8_group_size_larger_than_partition_k_maps_to_full_k(
+    tmp_path: Path,
+):
+    config = qwen_moe_config({
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "group_size": 128,
+    })
+    config["text_config"]["hidden_size"] = 2048
+    config["text_config"]["moe_intermediate_size"] = 512
+    config["text_config"]["shared_expert_intermediate_size"] = 512
+    config["text_config"]["num_attention_heads"] = 16
+    config["text_config"]["num_key_value_heads"] = 2
+    config["text_config"]["head_dim"] = 128
+    keys = [
+        "model.language_model.layers.1.self_attn.q_proj.weight",
+        "model.language_model.layers.1.self_attn.q_proj.weight_scale",
+        "model.language_model.layers.1.self_attn.k_proj.weight",
+        "model.language_model.layers.1.self_attn.k_proj.weight_scale",
+        "model.language_model.layers.1.self_attn.v_proj.weight",
+        "model.language_model.layers.1.self_attn.v_proj.weight_scale",
+        "model.language_model.layers.1.self_attn.o_proj.weight",
+        "model.language_model.layers.1.self_attn.o_proj.weight_scale",
+        "model.language_model.layers.1.mlp.shared_expert.gate_proj.weight",
+        "model.language_model.layers.1.mlp.shared_expert.gate_proj.weight_scale",
+        "model.language_model.layers.1.mlp.shared_expert.up_proj.weight",
+        "model.language_model.layers.1.mlp.shared_expert.up_proj.weight_scale",
+        "model.language_model.layers.1.mlp.shared_expert.down_proj.weight",
+        "model.language_model.layers.1.mlp.shared_expert.down_proj.weight_scale",
+        "model.language_model.layers.1.mlp.experts.0.gate_proj.weight",
+        "model.language_model.layers.1.mlp.experts.0.gate_proj.weight_scale",
+        "model.language_model.layers.1.mlp.experts.0.up_proj.weight",
+        "model.language_model.layers.1.mlp.experts.0.up_proj.weight_scale",
+        "model.language_model.layers.1.mlp.experts.0.down_proj.weight",
+        "model.language_model.layers.1.mlp.experts.0.down_proj.weight_scale",
+    ]
+    model_dir = write_model(tmp_path, config, keys)
+
+    payload = payload_for(
+        model_dir,
+        "--format",
+        "json",
+        "--tp-sizes",
+        "8",
+        "--ep-modes",
+        "tp",
+        "--max-num-batched-tokens",
+        "2048",
+        "--decode-concurrency",
+        "1",
+    )
+
+    qkv = next(r for r in payload["dense"] if r["op"] == "qkv_proj")
+    assert qkv["call_status"] == "actual_marlin"
+    assert qkv["quant_format"] == "fp8_e4m3"
+    assert qkv["size_k"] == 2048
+    assert qkv["group_size"] == 128
+
+    shared_down = next(
+        r for r in payload["dense"]
+        if r["op"] == "shared_down_proj" and r["phase"] == "prefill"
+    )
+    assert shared_down["call_status"] == "actual_marlin"
+    assert shared_down["quant_format"] == "fp8_e4m3"
+    assert shared_down["size_k"] == 64
+    assert shared_down["group_size"] == 64
+
+    moe_w13 = next(
+        r for r in payload["moe"]
+        if r["op"] == "w13" and r["phase"] == "prefill"
+    )
+    assert moe_w13["call_status"] == "actual_marlin"
+    assert moe_w13["quant_format"] == "fp8_e4m3"
+    assert moe_w13["size_k"] == 2048
+    assert moe_w13["group_size"] == 128
+
+    moe_w2 = next(
+        r for r in payload["moe"]
+        if r["op"] == "w2" and r["phase"] == "prefill"
+    )
+    assert moe_w2["call_status"] == "actual_marlin"
+    assert moe_w2["quant_format"] == "fp8_e4m3"
+    assert moe_w2["size_k"] == 64
+    assert moe_w2["group_size"] == 64
+
+
 def test_qwen3_moe_experts_are_not_dense_mlp(tmp_path: Path):
     config = {
         "model_type": "qwen3_moe",
@@ -871,6 +957,9 @@ def test_modelopt_mixed_precision_layer_map(tmp_path: Path):
             "model.language_model.layers.1.self_attn.v_proj": {
                 "quant_algo": "FP8"
             },
+            "model.language_model.layers.1.self_attn.o_proj": {
+                "quant_algo": "FP8"
+            },
             "model.language_model.layers.1.mlp.experts.0.gate_proj": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
@@ -878,7 +967,20 @@ def test_modelopt_mixed_precision_layer_map(tmp_path: Path):
         },
         "config_groups": {
             "group_0": {
-                "targets": ["Linear"],
+                "targets": [
+                    "model.language_model.layers.1.self_attn.q_proj",
+                    "model.language_model.layers.1.self_attn.k_proj",
+                    "model.language_model.layers.1.self_attn.v_proj",
+                    "model.language_model.layers.1.self_attn.o_proj",
+                ],
+                "weights": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "dynamic": False,
+                },
+            },
+            "group_1": {
+                "targets": ["FusedMoE"],
                 "weights": {
                     "num_bits": 4,
                     "type": "float",
@@ -895,6 +997,8 @@ def test_modelopt_mixed_precision_layer_map(tmp_path: Path):
         "model.language_model.layers.1.self_attn.k_proj.weight_scale",
         "model.language_model.layers.1.self_attn.v_proj.weight",
         "model.language_model.layers.1.self_attn.v_proj.weight_scale",
+        "model.language_model.layers.1.self_attn.o_proj.weight",
+        "model.language_model.layers.1.self_attn.o_proj.weight_scale",
         "model.language_model.layers.1.mlp.experts.0.gate_proj.weight",
         "model.language_model.layers.1.mlp.experts.0.gate_proj.weight_scale",
         "model.language_model.layers.1.mlp.experts.0.gate_proj.weight_scale_2",
@@ -925,6 +1029,15 @@ def test_modelopt_mixed_precision_layer_map(tmp_path: Path):
     assert qkv["call_status"] == "actual_marlin"
     assert qkv["target_op"] == "ops.marlin_gemm"
     assert qkv["quant_format"] == "fp8_e4m3"
+    assert qkv["group_size"] is not None
+    assert qkv["group_size"] == qkv["size_k"]
+
+    o_proj = next(r for r in payload["dense"] if r["op"] == "o_proj")
+    assert o_proj["call_status"] == "actual_marlin"
+    assert o_proj["target_op"] == "ops.marlin_gemm"
+    assert o_proj["quant_format"] == "fp8_e4m3"
+    assert o_proj["group_size"] is not None
+    assert o_proj["group_size"] == o_proj["size_k"]
 
     moe = next(
         r for r in payload["moe"]
@@ -935,6 +1048,7 @@ def test_modelopt_mixed_precision_layer_map(tmp_path: Path):
     assert moe["call_status"] == "actual_marlin"
     assert moe["target_op"] == "ops.moe_wna16_marlin_gemm"
     assert moe["quant_format"] == "nvfp4"
+    assert moe["group_size"] == 16
 
     unlisted_shared = [
         r for r in payload["dense"]
