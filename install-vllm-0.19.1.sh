@@ -312,6 +312,10 @@ replace("vllm/v1/attention/backends/flash_attn.py",
         "return capability >= DeviceCapability(8, 0)",
         "return capability >= DeviceCapability(7, 0)")
 
+replace("vllm/model_executor/layers/quantization/fp8.py",
+        "    def get_min_capability(cls) -> int:\n        return 75",
+        "    def get_min_capability(cls) -> int:\n        return 70")
+
 replace("vllm/vllm_flash_attn/flash_attn_interface.py",
         "if not current_platform.has_device_capability(80):",
         "if not current_platform.has_device_capability(70):")
