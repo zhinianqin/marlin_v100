@@ -102,6 +102,62 @@ PYTHONPATH=$PWD ./.venv/bin/python setup.py build_ext --inplace
 - `vllm/_C.abi3.so`
 - `vllm/_moe_C.abi3.so`
 
+## 完整 vLLM 0.19.1 安装脚本
+
+`install-vllm-0.19.1.sh` 用于在本地准备一个带 SM70 / V100 Marlin 支持的
+完整 vLLM `v0.19.1` 构建与安装环境。它会准备 vLLM、`marlin_v100` 和
+FlashAttention V100 源码，将本仓库中的 Marlin production 文件复制到 vLLM
+源码树，应用 SM70 相关 patch，构建 wheel，并安装到 vLLM 目录下的 `.venv`
+中。
+
+推荐将 `install-vllm-0.19.1.sh` 复制到单独安装目录后运行，避免完整 vLLM
+checkout、FlashAttention checkout、构建产物和日志混入当前开发仓库：
+
+```bash
+MARLIN_V100_REPO=https://github.com/zhinianqin/marlin_v100.git \
+FLASH_ATTN_REPO=https://github.com/zhinianqin/flash-attention-v100.git \
+./install-vllm-0.19.1.sh
+```
+
+脚本会在当前安装目录下创建或使用 `vllm/`、`marlin_v100/`、
+`flash-attention-v100/` 和 `logs/`；其中 `marlin_v100` 与
+`flash-attention-v100` 会从上面两个 GitHub repo 拉取。
+
+常用可覆盖变量包括：
+
+- `VLLM_DIR`：vLLM 源码、构建和虚拟环境目录，默认是 `$SCRIPT_DIR/vllm`。
+- `MARLIN_V100_DIR`：本仓库源码目录，默认是 `$SCRIPT_DIR/marlin_v100`。
+- `MARLIN_V100_REPO`：`marlin_v100` 源码仓库；推荐使用
+  `https://github.com/zhinianqin/marlin_v100.git`。
+- `FLASH_ATTN_DIR`：FlashAttention V100 源码目录，默认是
+  `$SCRIPT_DIR/flash-attention-v100`。
+- `FLASH_ATTN_REPO`：FlashAttention V100 源码仓库；推荐使用
+  `https://github.com/zhinianqin/flash-attention-v100.git`。
+- `CUDA_HOME`：CUDA 工具链目录，脚本默认使用 `/usr/local/cuda-12.6`。
+- `TORCH_CUDA_ARCH_LIST`：目标 CUDA arch，默认是 `7.0`。
+
+该脚本当前包含 vLLM `v0.19.1` 的 SM70 patch，包括 Marlin dense、Marlin MoE、
+FP8 / NVFP4 / MXFP4 相关 capability gate、FlashAttention V100 源码构建和若干
+V100 运行兼容性修正。脚本末尾会执行扩展导入、Marlin op 注册和 FlashAttention
+SM70 capability smoke 检查。
+
+以下模型已在该安装路径上测试通过，并针对 V100 / SM70 Marlin 路径做过性能调优：
+
+- `bjk110/Qwen3.5-122B-A10B-abliterated-FP8`
+- `bjk110/Qwen3.5-122B-A10B-abliterated-NVFP4`
+- `cyankiwi/MiniMax-M2.7-AWQ-4bit`
+- `cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit`
+- `cyankiwi/Qwen3.5-122B-A10B-AWQ-8bit`
+- `cyankiwi/Qwen3-Coder-Next-AWQ-8bit`
+- `lhca521/MiniMax-M2.7-abliterated-heretic-ara-AWQ`
+- `nvidia/MiniMax-M2.7-NVFP4`
+- `Qwen/Qwen3.5-122B-A10B-FP8`
+- `Qwen/Qwen3.6-27B-FP8`
+- `Qwen/Qwen3.6-35B-A3B-FP8`
+- `wangzhang/Qwen3.6-27B-abliterated`
+
+未出现在上面列表中的模型可能也可以运行，但尚未做专门的性能调优。
+
 ## 验证方法
 
 最小导入与 op 注册检查：
